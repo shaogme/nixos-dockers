@@ -31,6 +31,7 @@ let
     Subsystem sftp internal-sftp
     PermitUserEnvironment yes
     PermitEmptyPasswords yes
+    PidFile /var/run/sshd.pid
   '';
 
   pamSshd = pkgs.writeTextDir "etc/pam.d/sshd" ''
@@ -100,7 +101,8 @@ pkgs.dockerTools.buildLayeredImage {
     mkdir -p root/.ssh
     chmod 700 root/.ssh
     
-    mkdir -p var/run/sshd var/empty/sshd
+    mkdir -p run var/run/sshd var/empty/sshd
+    chmod 755 var/empty/sshd
     mkdir -p var/lock
     chmod 1777 var/lock
     mkdir -p var/tmp

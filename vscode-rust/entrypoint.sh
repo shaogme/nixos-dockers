@@ -42,7 +42,8 @@ fi
 
 # 3.1 Ensure Metadata Directories
 # In case these are mounted as tmpfs or valid directories are missing
-mkdir -p /var/lock /var/tmp
+mkdir -p /var/lock /var/tmp /run /var/run/sshd /var/empty/sshd
+chmod 755 /var/empty/sshd
 chmod 1777 /var/lock /var/tmp
 
 # 4. Export Environment for SSH Sessions
