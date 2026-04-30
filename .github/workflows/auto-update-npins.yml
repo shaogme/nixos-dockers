@@ -1,0 +1,48 @@
+name: Auto Update Npins
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # Beijing 03:00 (UTC+8) is 19:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+        with:
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@master
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Install npins
+        run: nix-env -f '<nixpkgs>' -iA npins
+
+      - name: Run Update Script
+        run: |
+          chmod +x ./update-npins.sh
+          ./update-npins.sh
+      
+      - name: Update Flake Lock
+        run: nix flake update --extra-experimental-features 'nix-command flakes'
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: update npins dependencies"
+          git push -f "https://x-access-token:${{ secrets.PAT }}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }}

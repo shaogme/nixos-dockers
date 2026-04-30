@@ -1,0 +1,79 @@
+name: Docker Publish
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "**/image.nix"
+      - "**/deps.nix"
+      - "**/*.nix"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@main
+      - id: set-matrix
+        run: |
+          # Find directories containing image.nix, remove leading ./ and format as JSON array
+          DIRS=$(find . -maxdepth 2 -name "image.nix" -printf '%h\n' | sed 's|./||' | sort -u | jq -R . | jq -s -c .)
+          echo "matrix=$DIRS" >> $GITHUB_OUTPUT
+
+  build-and-push:
+    needs: discover
+    runs-on: ubuntu-latest
+    if: ${{ needs.discover.outputs.matrix != '[]' && needs.discover.outputs.matrix != '' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@master
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build Docker image with Nix
+        run: |
+          # Build the image, passing the directory name as imageName
+          nix-build ${{ matrix.image }}/image.nix --argstr imageName ${{ matrix.image }}
+
+      - name: Load and Push Docker image
+        run: |
+          # Load the built image into docker
+          docker load < result
+          
+          # Prepare the GHCR image ID (lowercase repository and image name)
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_LOWER=$(echo "${{ matrix.image }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_ID=${{ env.REGISTRY }}/$REPO_LOWER/$IMAGE_LOWER
+          
+          echo "Pushing to $IMAGE_ID"
+          
+          # Tag and push
+          docker tag ${{ matrix.image }}:latest $IMAGE_ID:latest
+          docker tag ${{ matrix.image }}:latest $IMAGE_ID:${{ github.sha }}
+          
+          docker push $IMAGE_ID:latest
+          docker push $IMAGE_ID:${{ github.sha }}
