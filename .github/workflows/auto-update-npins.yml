@@ -31,9 +31,6 @@ jobs:
         run: |
           chmod +x ./update-npins.sh
           ./update-npins.sh
-      
-      - name: Update Flake Lock
-        run: nix flake update --extra-experimental-features 'nix-command flakes'
 
       - name: Commit and push changes
         run: |
