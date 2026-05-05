@@ -17,7 +17,7 @@ jobs:
         with:
           token: ${{ secrets.PAT }}
           fetch-depth: 0
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Install Nix
         uses: cachix/install-nix-action@master
@@ -42,4 +42,4 @@ jobs:
             exit 0
           fi
           git commit -m "chore: update npins dependencies"
-          git push -f "https://x-access-token:${{ secrets.PAT }}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }}
+          git push origin HEAD:${{ github.ref_name }}
