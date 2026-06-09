@@ -25,6 +25,13 @@ for npins_path in $FOUND_DIRS; do
     echo "Updating dependencies in: $work_dir"
     
     pushd "$work_dir" > /dev/null
+
+    if npins upgrade; then
+        echo "Upgrade successful in $work_dir"
+    else
+        echo "Upgrade failed in $work_dir"
+        exit 1
+    fi
     
     if npins update; then
         echo "Update successful in $work_dir"
