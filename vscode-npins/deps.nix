@@ -32,14 +32,38 @@ let
     cacert
     bashInteractive
 
-    # Network & Utils
+    # Modern CLI & Productivity Utilities
+    ripgrep
+    fd
+    eza
+    bat
+    jq
+    yq-go
+    htop
+    bottom
+    tree
+    less
+    zip
+    unzip
+    p7zip
+    zstd
+
+    # Network, Git & System Diagnostics
     curl
     git
+    git-lfs
+    gh
     openssh
     iproute2
     net-tools
-    procps
+    iputils
+    dnsutils
     tcpdump
+    nmap
+    procps
+    psmisc
+    strace
+    lsof
     vim
     shadow
     

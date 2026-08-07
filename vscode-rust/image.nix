@@ -18,6 +18,7 @@ let
   group = pkgs.writeTextDir "etc/group" ''
     root:x:0:
     sshd:x:74:
+    nixbld:x:30000:
   '';
 
   sshdConfig = pkgs.writeTextDir "etc/ssh/sshd_config" ''
@@ -46,6 +47,12 @@ let
     group:     files
     shadow:    files
     hosts:     files dns
+  '';
+
+  nixConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
+    build-users-group =
+    experimental-features = nix-command flakes
+    filter-syscalls = false
   '';
 
   # Extract environment logic
@@ -89,6 +96,7 @@ pkgs.dockerTools.buildLayeredImage {
     sshdConfig
     pamSshd
     nsswitchConf
+    nixConf
   ];
 
   # Use extraCommands for directory creation and sensitive file generation
@@ -160,6 +168,11 @@ pkgs.dockerTools.buildLayeredImage {
     ln -sf ${pkgs.coreutils}/bin/dirname usr/bin/dirname
     ln -sf ${pkgs.coreutils}/bin/readlink usr/bin/readlink
     ln -sf ${pkgs.coreutils}/bin/wc usr/bin/wc
+    ln -sf ${pkgs.ripgrep}/bin/rg usr/bin/rg
+    ln -sf ${pkgs.fd}/bin/fd usr/bin/fd
+    ln -sf ${pkgs.jq}/bin/jq usr/bin/jq
+    ln -sf ${pkgs.git}/bin/git usr/bin/git
+    ln -sf ${pkgs.gh}/bin/gh usr/bin/gh
   '';
 
   config = {
