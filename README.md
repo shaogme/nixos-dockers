@@ -88,6 +88,7 @@ services:
 ## ⚙️ 环境变量
 
 镜像内置了以下关键环境变量以确保环境正常运行：
+-   `NIX_PATH`: 设置为 `nixpkgs=${pkgs.path}`，确保 `nix-shell`、`import <nixpkgs>` 等工具能够直接在 Nix 搜索路径中找到 `nixpkgs`。
 -   `NIX_LD_LIBRARY_PATH`: 提供非 Nix 程序的动态链接库路径。
 -   `RUST_SRC_PATH`: Rust 源码路径（针对 `vscode-rust`）。
 -   `PATH`: 包含 `/bin`, `/usr/bin`, `/usr/local/bin`。

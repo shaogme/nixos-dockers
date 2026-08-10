@@ -70,6 +70,7 @@ let
     export LD_LIBRARY_PATH="${nixLdLibPath}:/usr/lib:/usr/lib64"
     export RUST_SRC_PATH="${rustSrc}"
     export PKG_CONFIG_PATH="${pkgConfigPath}"
+    export NIX_PATH="nixpkgs=${pkgs.path}"
     export PATH=$PATH:/usr/bin:/bin
     exec ${pkgs.bashInteractive}/bin/bash "$@"
   '';
@@ -173,6 +174,10 @@ pkgs.dockerTools.buildLayeredImage {
     ln -sf ${pkgs.jq}/bin/jq usr/bin/jq
     ln -sf ${pkgs.git}/bin/git usr/bin/git
     ln -sf ${pkgs.gh}/bin/gh usr/bin/gh
+
+    # 8. Setup Nix Search Path & Defexpr
+    mkdir -p root/.nix-defexpr
+    ln -sf ${pkgs.path} root/.nix-defexpr/nixpkgs
   '';
 
   config = {
@@ -190,6 +195,7 @@ pkgs.dockerTools.buildLayeredImage {
       "NIX_LD_LIBRARY_PATH=${nixLdLibPath}:/usr/lib:/usr/lib64"
       "NIX_LD=${nixLd}"
       "LD_LIBRARY_PATH=${nixLdLibPath}:/usr/lib:/usr/lib64"
+      "NIX_PATH=nixpkgs=${pkgs.path}"
       "PATH=/bin:/usr/bin:/usr/local/bin"
     ];
   };
