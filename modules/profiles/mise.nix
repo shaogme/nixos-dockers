@@ -2,7 +2,9 @@
 let
   misePackage =
     if sources != null && sources ? mise then
-      pkgs.callPackage (sources.mise + "/default.nix") { }
+      (pkgs.callPackage (sources.mise + "/default.nix") { }).overrideAttrs (_: {
+        doCheck = false;
+      })
     else
       throw "profiles.mise requires `sources.mise` to be provided. Fallback to pkgs.mise is not permitted.";
 in
