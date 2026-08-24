@@ -8,9 +8,9 @@ if ! command -v npins &> /dev/null; then
     exit 1
 fi
 
-# Find directories containing 'npins' subdir, excluding 'docker' folder
-echo "Searching for npins directories..."
-FOUND_DIRS=$(find . -path "./docker" -prune -o -type d -name "npins" -print)
+# Find directories containing 'npins' subdir under images/
+echo "Searching for npins directories in images/..."
+FOUND_DIRS=$(find images -type d -name "npins" -print)
 
 if [ -z "$FOUND_DIRS" ]; then
     echo "No npins directories found to update."

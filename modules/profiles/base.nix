@@ -59,7 +59,6 @@
       git
       git-lfs
       gh
-      openssh
       iproute2
       net-tools
       iputils
@@ -78,6 +77,8 @@
       nix-ld
       direnv
       nix-direnv
+    ] ++ lib.optionals config.services.openssh.enable [
+      openssh
     ];
   };
 }

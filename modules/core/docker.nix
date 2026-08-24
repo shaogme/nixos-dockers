@@ -1,6 +1,81 @@
 { config, lib, pkgs, ... }:
 let
-  defaultEntrypoint = pkgs.writeScriptBin "entrypoint.sh" (builtins.readFile ./entrypoint.sh);
+  sshEntrypointSnippet = lib.optionalString config.services.openssh.enable ''
+    # SSH Host Keys
+    if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
+        ssh-keygen -f /etc/ssh/ssh_host_rsa_key -N "" -t rsa >/dev/null 2>&1
+    fi
+    if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+        ssh-keygen -f /etc/ssh/ssh_host_ed25519_key -N "" -t ed25519 >/dev/null 2>&1
+    fi
+
+    # Setup Authorized Keys from /tmp/id_ed25519.pub
+    if [ -f "/tmp/id_ed25519.pub" ]; then
+        mkdir -p /root/.ssh
+        if [ ! -f /root/.ssh/authorized_keys ]; then
+            cp /tmp/id_ed25519.pub /root/.ssh/authorized_keys
+            chmod 700 /root/.ssh
+            chmod 600 /root/.ssh/authorized_keys
+        fi
+    fi
+
+    # Ensure SSH Directories
+    mkdir -p /var/run/sshd /var/empty/sshd
+    chmod 755 /var/empty/sshd
+
+    # Export Environment for SSH Sessions
+    env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
+    chmod 600 /root/.ssh/environment
+  '';
+
+  defaultCmd =
+    if config.services.openssh.enable then ''
+      echo "Starting SSH server..."
+      exec sshd -D -e
+    '' else ''
+      exec /bin/bash -i
+    '';
+
+  generatedEntrypoint = pkgs.writeScriptBin "entrypoint.sh" ''
+    #!/usr/bin/env bash
+    set -e
+
+    # ==========================================
+    # NixOS Development Container Entrypoint
+    # ==========================================
+
+    # Fix Permissions for Config Files (Symlink Handling)
+    for file in /etc/passwd /etc/group; do
+        if [ -L "$file" ] || [ ! -w "$file" ]; then
+            cp --remove-destination "$(readlink -f "$file")" "$file"
+            chmod 644 "$file"
+        fi
+    done
+
+    # Shadow is created via extraCommands so it should be a file, but ensuring permissions is safe.
+    if [ -L "/etc/shadow" ]; then
+        cp --remove-destination "$(readlink -f /etc/shadow)" /etc/shadow
+    fi
+    chmod 600 /etc/shadow
+
+    # Ensure Metadata Directories
+    mkdir -p /var/lock /var/tmp /run
+    chmod 1777 /var/lock /var/tmp
+
+    ${sshEntrypointSnippet}
+
+    # Execute Command or Start Default Service
+    if [ $# -gt 0 ]; then
+        exec "$@"
+    else
+        ${defaultCmd}
+    fi
+  '';
+
+  defaultExposedPorts =
+    if config.services.openssh.enable then {
+      "22/tcp" = { };
+    } else { };
 
   validVars = lib.filterAttrs (_: v: v != null) config.environment.variables;
   envList = [
@@ -59,15 +134,13 @@ in
 
     exposedPorts = lib.mkOption {
       type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
-      default = {
-        "22/tcp" = { };
-      };
+      default = defaultExposedPorts;
       description = "Exposed ports in the container config.";
     };
 
     entrypoint = lib.mkOption {
       type = lib.types.package;
-      default = defaultEntrypoint;
+      default = generatedEntrypoint;
       description = "Entrypoint package placed in /bin.";
     };
 
@@ -90,3 +163,4 @@ in
     };
   };
 }
+

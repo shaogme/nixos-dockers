@@ -2,12 +2,12 @@
 let
   passwd = pkgs.writeTextDir "etc/passwd" ''
     root:x:0:0:System Administrator:/root:/bin/bash
-    sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin
+    ${lib.optionalString config.services.openssh.enable "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin\n"}
   '';
 
   group = pkgs.writeTextDir "etc/group" ''
     root:x:0:
-    sshd:x:74:
+    ${lib.optionalString config.services.openssh.enable "sshd:x:74:\n"}
     nixbld:x:30000:
   '';
 
@@ -48,15 +48,44 @@ let
   systemConfigFiles = [
     passwd
     group
-    sshdConfig
-    pamSshd
     nsswitchConf
     nixConf
     pkgs.iana-etc
     pkgs.dockerTools.caCertificates
+  ] ++ lib.optionals config.services.openssh.enable [
+    sshdConfig
+    pamSshd
   ];
+
+  shadowContent =
+    if config.services.openssh.enable then ''
+      root::19733:0:99999:7:::
+      sshd:*:19733:0:99999:7:::
+    '' else ''
+      root::19733:0:99999:7:::
+    '';
+
+  sshExtraCommands = lib.optionalString config.services.openssh.enable ''
+    mkdir -p root/.ssh
+    chmod 700 root/.ssh
+
+    mkdir -p run var/run/sshd var/empty/sshd
+    chmod 755 var/empty/sshd
+
+    if [ -f etc/pam.d/sshd ]; then
+      cp etc/pam.d/sshd etc/pam.d/other
+    fi
+  '';
 in
 {
+  options.services.openssh = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Enable OpenSSH daemon, configuration, host keys, and port exposure.";
+    };
+  };
+
   options.system = {
     configFiles = lib.mkOption {
       type = lib.types.listOf lib.types.package;
@@ -72,27 +101,18 @@ in
       mkdir -p tmp
       chmod 1777 tmp
       
-      mkdir -p root/.ssh
-      chmod 700 root/.ssh
-      
-      mkdir -p run var/run/sshd var/empty/sshd
-      chmod 755 var/empty/sshd
-      mkdir -p var/lock
+      mkdir -p run var/lock var/tmp
       chmod 1777 var/lock
-      mkdir -p var/tmp
       chmod 1777 var/tmp
       
+      ${sshExtraCommands}
+
       # 2. Generate /etc/shadow
       cat > etc/shadow <<EOF
-      root::19733:0:99999:7:::
-      sshd:*:19733:0:99999:7:::
-      EOF
+      ${shadowContent}EOF
       chmod 600 etc/shadow
-
-      # 3. Ensure PAM Configuration
-      cp etc/pam.d/sshd etc/pam.d/other
       
-      # 4. FHS Compatibility (Required for VS Code Server, etc.)
+      # 3. FHS Compatibility (Required for VS Code Server, etc.)
       mkdir -p lib64 usr/lib64 usr/lib usr/bin usr/lib/x86_64-linux-gnu
 
       # Link Dynamic Linker (ld-linux)
@@ -106,15 +126,15 @@ in
         ln -sf /usr/lib/$lib usr/lib/x86_64-linux-gnu/$lib
       done
       
-      # 5. Bash Wrapper
+      # 4. Bash Wrapper
       rm -f bin/bash
       cp ${config.environment.bashWrapper} bin/bash
       chmod +x bin/bash
 
-      # 6. Setup /usr/bin/env
+      # 5. Setup /usr/bin/env
       ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
       
-      # 7. Common Tools Symlinks
+      # 6. Common Tools Symlinks
       ln -sf ${pkgs.procps}/bin/pgrep usr/bin/pgrep
       ln -sf ${pkgs.procps}/bin/pkill usr/bin/pkill
       ln -sf ${pkgs.procps}/bin/ps usr/bin/ps
@@ -128,9 +148,10 @@ in
       ln -sf ${pkgs.git}/bin/git usr/bin/git
       ln -sf ${pkgs.gh}/bin/gh usr/bin/gh
 
-      # 8. Setup Nix Search Path & Defexpr
+      # 7. Setup Nix Search Path & Defexpr
       mkdir -p root/.nix-defexpr
       ln -sf ${pkgs.path} root/.nix-defexpr/nixpkgs
     '';
   };
 }
+

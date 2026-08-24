@@ -1,0 +1,25 @@
+{
+  "pins": {
+    "mise": {
+      "type": "Git",
+      "repository": {
+        "type": "GitHub",
+        "owner": "jdx",
+        "repo": "mise"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "0b965ff36001b89354c22822861cf0384da3c468",
+      "url": "https://github.com/jdx/mise/archive/0b965ff36001b89354c22822861cf0384da3c468.tar.gz",
+      "hash": "sha256-Dcj1pffldv4Hw1t67pfljavLZhUeS6UoIwQNR8BbPWE="
+    },
+    "nixpkgs": {
+      "type": "Channel",
+      "name": "nixpkgs-unstable",
+      "artifact": "nixexprs.tar.xz",
+      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1059707.c8f90650c152/nixexprs.tar.xz",
+      "hash": "sha256-wS+SNrj0wobAXQONggzrpetnZ9E0FL7l0WVWDRQ77Sc="
+    }
+  },
+  "version": 8
+}

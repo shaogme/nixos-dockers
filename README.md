@@ -21,10 +21,21 @@
 
 ## 镜像列表与 Tag 规范
 
+### 1. 通用轻量镜像（无 SSH 服务，适合本地容器 / CI / CLI）
+
 | 镜像名称 | 描述 | 主要包含 | 示例 Tag |
 | :--- | :--- | :--- | :--- |
-| `vscode-npins` | 基础开发镜像 | Nix, npins, direnv, coreutils, SSH | `latest`, `0.5.0-2026.8.24` |
-| `vscode-rust` | Rust 专用开发镜像 | Rust 工具链 (cargo, rustc), rust-analyzer, clippy, gdb | `latest`, `1.97.1-2026.8.24` |
+| `npins` | 基础开发镜像 | Nix, npins, direnv, coreutils, nix-ld | `latest`, `0.5.0-2026.8.24` |
+| `rust` | Rust 专用开发镜像 | Rust 工具链 (cargo, rustc), rust-analyzer, clippy, gdb | `latest`, `1.97.1-2026.8.24` |
+| `mise` | Mise 多语言环境开发镜像 | Nix, mise (跟踪 main 分支), direnv, coreutils | `latest`, `2026.8.12-2026.8.24` |
+
+### 2. VS Code Remote 专用镜像（内置 SSH 服务与公钥自动注入）
+
+| 镜像名称 | 描述 | 主要包含 | 示例 Tag |
+| :--- | :--- | :--- | :--- |
+| `vscode-npins` | 基础开发镜像 (SSH) | Nix, npins, direnv, coreutils, SSH | `latest`, `0.5.0-2026.8.24` |
+| `vscode-rust` | Rust 专用镜像 (SSH) | Rust 工具链, rust-analyzer, clippy, gdb, SSH | `latest`, `1.97.1-2026.8.24` |
+| `vscode-mise` | Mise 开发镜像 (SSH) | Nix, mise, direnv, coreutils, SSH | `latest`, `2026.8.12-2026.8.24` |
 
 ### Tag 命名规则
 
@@ -34,7 +45,7 @@
 
 ## 快速开始
 
-### 1. 使用 Docker 直接运行
+### 1. 使用 Docker 直接运行（VS Code Remote SSH 镜像）
 
 ```bash
 docker run -d \
@@ -44,7 +55,15 @@ docker run -d \
   ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
 ```
 
-### 2. 使用 Docker Compose
+### 2. 使用 Docker 运行通用 CLI 镜像（无 SSH）
+
+```bash
+docker run -it --rm \
+  -v $(pwd):/root/workspace \
+  ghcr.io/shaogme/nixos-dockers/rust:latest
+```
+
+### 3. 使用 Docker Compose (VS Code Remote)
 
 ```yaml
 services:
@@ -57,13 +76,13 @@ services:
     restart: unless-stopped
 ```
 
-### 3. 连接到开发环境
+### 4. 连接到开发环境
 
 - **SSH**: `ssh root@localhost -p 2222` (默认空密码)
 - **VS Code**: 安装 `Remote - SSH` 扩展，添加主机 `localhost:2222` 即可。
 
 > [!TIP]
-> **注入公钥**: 将本地公钥 `id_ed25519.pub` 挂载到容器内 `/tmp/id_ed25519.pub`，镜像启动时会自动将其添加到 `/root/.ssh/authorized_keys`。
+> **注入公钥**: 将本地公钥 `id_ed25519.pub` 挂载到容器内 `/tmp/id_ed25519.pub`，SSH 镜像启动时会自动将其添加到 `/root/.ssh/authorized_keys`。
 >
 > ```yaml
 > volumes:
@@ -76,12 +95,16 @@ services:
 
 ### 注意事项：Entrypoint 机制
 
-镜像内置的 `/bin/entrypoint.sh` 负责处理以下关键初始化逻辑：
-1. **自动生成 SSH Host Key**（若缺失）。
-2. **处理 Nix Store 只读挂载与配置文件权限**（如 `/etc/passwd`, `/etc/group`, `/etc/shadow`）。
-3. **公钥注入**：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/root/.ssh/authorized_keys`。
-4. **环境变量导出**：将容器环境变量写入 `/root/.ssh/environment`，确保通过 SSH 登录时环境变量不丢失。
-5. **服务管理**：无额外参数时默认前台启动 `sshd`，带参数时执行传入命令（如 `exec "$@"`）。
+镜像内置的 `/bin/entrypoint.sh`（由 Nix 动态生成）负责处理以下关键初始化逻辑：
+1. **自动修复配置文件只读权限**（如 `/etc/passwd`, `/etc/group`, `/etc/shadow`）。
+2. **SSH 自动初始化**（当 `services.openssh.enable = true` 时）：
+   - 自动生成 SSH Host Key（若缺失）。
+   - 公钥注入：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/root/.ssh/authorized_keys`。
+   - 环境变量导出：将容器环境变量写入 `/root/.ssh/environment`，确保通过 SSH 登录时环境变量不丢失。
+3. **服务与命令分发**：
+   - 带有参数时：执行传入命令（`exec "$@"`）。
+   - 无参数且启用 SSH 时：默认前台启动 `sshd -D -e`。
+   - 无参数且未启用 SSH 时：默认启动交互式 Bash（`/bin/bash -i`）。
 
 ### 编写自定义 Dockerfile 示例
 
@@ -99,11 +122,11 @@ RUN nix-env -iA nixpkgs.bun
 # 3. 必须确保 Entrypoint 依然使用 /bin/entrypoint.sh
 ENTRYPOINT ["/bin/entrypoint.sh"]
 
-# 默认启动参数：留空则 entrypoint.sh 默认启动 sshd 服务；也可以指定自定义命令
+# 默认启动参数：留空则根据镜像类型自适应启动
 CMD []
 ```
 
-如果你需要编写自定义的初始化脚本（例如 `custom-init.sh`），请在自定义脚本末尾通过 `exec /bin/entrypoint.sh "$@"` 将控制权移交给原入口脚本：
+如果需要编写自定义的前置初始化脚本（例如 `custom-init.sh`），请在自定义脚本末尾通过 `exec /bin/entrypoint.sh "$@"` 将控制权移交给原入口脚本：
 
 ```bash
 #!/usr/bin/env bash
@@ -112,7 +135,7 @@ set -e
 # 执行你的前置初始化操作
 echo "Running custom setup..."
 
-# 移交给内置的 entrypoint.sh 启动 SSHD 或执行后续命令
+# 移交给内置的 entrypoint.sh
 exec /bin/entrypoint.sh "$@"
 ```
 
@@ -128,20 +151,26 @@ exec /bin/entrypoint.sh "$@"
 
 - `nix-ld`: 动态链接器封装，自动为非 Nix 二进制程序寻找所需的 `.so` 文件。
 - `direnv`: 进入目录时自动加载 `shell.nix` 或 `flake.nix` 环境。
-- `bash-wrapper`: 确保在通过 SSH 登录时，`LD_LIBRARY_PATH` 等环境变量不会丢失。
+- `bash-wrapper`: 确保在通过 SSH 登录或交互终端时，`LD_LIBRARY_PATH` 等环境变量不会丢失。
 
 ## 项目结构
 
 ```text
 .
+├── images/                # Docker 镜像定义目录
+│   ├── npins/             # 基础通用镜像 (无 SSH)
+│   ├── rust/              # Rust 通用镜像 (无 SSH)
+│   ├── mise/              # Mise 通用镜像 (无 SSH)
+│   ├── vscode-npins/      # VS Code 基础开发镜像 (含 SSH)
+│   ├── vscode-rust/       # VS Code Rust 专用镜像 (含 SSH)
+│   └── vscode-mise/       # VS Code Mise 专用镜像 (含 SSH)
 ├── modules/               # 统一 NixOS 模块系统
-│   ├── core/              # 核心构建器、系统配置与 entrypoint
-│   └── profiles/          # 语言与工具特性 Profile (base, rust, npins)
-├── vscode-npins/          # 基础开发镜像定义
-├── vscode-rust/           # Rust 专用开发镜像定义
+│   ├── core/              # 核心构建器、系统配置与动态 entrypoint
+│   └── profiles/          # 语言与工具特性 Profile (base, rust, npins, mise)
 ├── update-npins.sh        # 依赖自动更新脚本
 └── .github/workflows/     # CI/CD 自动化构建发布工作流
 ```
+
 
 ## 环境变量
 

@@ -1,12 +1,12 @@
 { sources ? import ./npins
 , system ? builtins.currentSystem
 , pkgs ? import sources.nixpkgs { inherit system; config.allowUnfree = true; }
-, imageName ? "vscode-rust"
+, imageName ? "rust"
 }:
 let
-  builder = import ../modules { inherit pkgs sources system; };
+  builder = import ../../modules { inherit pkgs sources system; };
 in
-builder.buildVscodeImage {
+builder.buildImage {
   modules = [
     {
       docker.name = imageName;

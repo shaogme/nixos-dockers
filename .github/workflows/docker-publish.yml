@@ -23,8 +23,8 @@ jobs:
       - uses: actions/checkout@main
       - id: set-matrix
         run: |
-          # Find directories containing image.nix, remove leading ./ and format as JSON array
-          DIRS=$(find . -maxdepth 2 -name "image.nix" -printf '%h\n' | sed 's|./||' | sort -u | jq -R . | jq -s -c .)
+          # Find directories containing image.nix under images/, format as JSON array
+          DIRS=$(find images -maxdepth 2 -name "image.nix" -printf '%h\n' | sort -u | jq -R . | jq -s -c .)
           echo "matrix=$DIRS" >> $GITHUB_OUTPUT
 
   build-and-push:
@@ -57,21 +57,23 @@ jobs:
 
       - name: Build Docker image with Nix
         run: |
-          # Build the image, passing the directory name as imageName
-          nix-build ${{ matrix.image }}/image.nix --argstr imageName ${{ matrix.image }}
+          IMAGE_NAME=$(basename "${{ matrix.image }}")
+          # Build the image, passing the image basename as imageName
+          nix-build ${{ matrix.image }}/image.nix --argstr imageName "$IMAGE_NAME"
 
       - name: Load and Push Docker image
         run: |
           # Load the built image into docker
           docker load < result
           
+          IMAGE_NAME=$(basename "${{ matrix.image }}")
           # Prepare the GHCR image ID (lowercase repository and image name)
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE_LOWER=$(echo "${{ matrix.image }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
           IMAGE_ID=${{ env.REGISTRY }}/$REPO_LOWER/$IMAGE_LOWER
           
           # Extract component version from Nix metadata
-          VERSION=$(nix-instantiate --eval --raw ${{ matrix.image }}/image.nix -A imageVersion --argstr imageName ${{ matrix.image }} 2>/dev/null || echo "latest")
+          VERSION=$(nix-instantiate --eval --raw ${{ matrix.image }}/image.nix -A imageVersion --argstr imageName "$IMAGE_NAME" 2>/dev/null || echo "latest")
           
           # Format date as YYYY.M.D (e.g., 2026.8.24)
           DATE=$(date +'%Y.%-m.%-d')
@@ -81,8 +83,8 @@ jobs:
           echo "Publishing version tag: $VERSION_TAG"
           
           # Tag images
-          docker tag ${{ matrix.image }}:latest $IMAGE_ID:latest
-          docker tag ${{ matrix.image }}:latest $IMAGE_ID:${VERSION_TAG}
+          docker tag $IMAGE_NAME:latest $IMAGE_ID:latest
+          docker tag $IMAGE_NAME:latest $IMAGE_ID:${VERSION_TAG}
           
           # Push to GHCR (Docker registry protocol overwrites existing tags on push)
           docker push $IMAGE_ID:latest

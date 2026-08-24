@@ -12,6 +12,7 @@ let
     ./profiles/base.nix
     ./profiles/rust.nix
     ./profiles/npins.nix
+    ./profiles/mise.nix
   ];
 
   evalContainer = { modules ? [ ], specialArgs ? { } }:
@@ -20,9 +21,26 @@ let
       specialArgs = { inherit pkgs sources system; } // specialArgs;
     };
 
-  buildVscodeImage = args:
-    (evalContainer args).config.docker.build;
+  buildImage = { modules ? [ ], specialArgs ? { } }:
+    (evalContainer {
+      inherit specialArgs;
+      modules = [
+        {
+          services.openssh.enable = lib.mkDefault false;
+        }
+      ] ++ modules;
+    }).config.docker.build;
+
+  buildVscodeImage = { modules ? [ ], specialArgs ? { } }:
+    (evalContainer {
+      inherit specialArgs;
+      modules = [
+        {
+          services.openssh.enable = lib.mkDefault true;
+        }
+      ] ++ modules;
+    }).config.docker.build;
 in
 {
-  inherit coreModules evalContainer buildVscodeImage;
+  inherit coreModules evalContainer buildImage buildVscodeImage;
 }
