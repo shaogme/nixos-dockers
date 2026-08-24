@@ -23,9 +23,17 @@ jobs:
       - uses: actions/checkout@main
       - id: set-matrix
         run: |
-          # Find directories containing image.nix under images/, format as JSON array
-          DIRS=$(find images -maxdepth 2 -name "image.nix" -printf '%h\n' | sort -u | jq -R . | jq -s -c .)
-          echo "matrix=$DIRS" >> $GITHUB_OUTPUT
+          # Find directories containing image.nix under images/, format as matrix items with CLI and vscode variants
+          MATRIX=$(find images -maxdepth 2 -name "image.nix" | sort | jq -R . | jq -s -c '
+            map(
+              capture("images/(?<name>[^/]+)/image.nix") |
+              [
+                { file: "images/\(.name)/image.nix", attr: .name, name: .name },
+                { file: "images/\(.name)/image.nix", attr: "vscode-\(.name)", name: "vscode-\(.name)" }
+              ]
+            ) | flatten
+          ')
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   build-and-push:
     needs: discover
@@ -37,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJson(needs.discover.outputs.matrix) }}
+        target: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
@@ -57,23 +65,22 @@ jobs:
 
       - name: Build Docker image with Nix
         run: |
-          IMAGE_NAME=$(basename "${{ matrix.image }}")
-          # Build the image, passing the image basename as imageName
-          nix-build ${{ matrix.image }}/image.nix --argstr imageName "$IMAGE_NAME"
+          # Build the target derivation attribute from image.nix
+          nix-build ${{ matrix.target.file }} -A ${{ matrix.target.attr }}
 
       - name: Load and Push Docker image
         run: |
           # Load the built image into docker
           docker load < result
           
-          IMAGE_NAME=$(basename "${{ matrix.image }}")
+          IMAGE_NAME="${{ matrix.target.name }}"
           # Prepare the GHCR image ID (lowercase repository and image name)
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           IMAGE_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
           IMAGE_ID=${{ env.REGISTRY }}/$REPO_LOWER/$IMAGE_LOWER
           
           # Extract component version from Nix metadata
-          VERSION=$(nix-instantiate --eval --raw ${{ matrix.image }}/image.nix -A imageVersion --argstr imageName "$IMAGE_NAME" 2>/dev/null || echo "latest")
+          VERSION=$(nix-instantiate --eval --raw ${{ matrix.target.file }} -A "${{ matrix.target.attr }}.imageVersion" 2>/dev/null || echo "latest")
           
           # Format date as YYYY.M.D (e.g., 2026.8.24)
           DATE=$(date +'%Y.%-m.%-d')
@@ -89,3 +96,4 @@ jobs:
           # Push to GHCR (Docker registry protocol overwrites existing tags on push)
           docker push $IMAGE_ID:latest
           docker push $IMAGE_ID:${VERSION_TAG}
+

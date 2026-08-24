@@ -40,7 +40,26 @@ let
         }
       ] ++ modules;
     }).config.docker.build;
+
+  buildImages = { name, modules ? [ ], specialArgs ? { } }: {
+    ${name} = buildImage {
+      inherit specialArgs;
+      modules = [
+        {
+          docker.name = lib.mkDefault name;
+        }
+      ] ++ modules;
+    };
+    "vscode-${name}" = buildVscodeImage {
+      inherit specialArgs;
+      modules = [
+        {
+          docker.name = lib.mkDefault "vscode-${name}";
+        }
+      ] ++ modules;
+    };
+  };
 in
 {
-  inherit coreModules evalContainer buildImage buildVscodeImage;
+  inherit coreModules evalContainer buildImage buildVscodeImage buildImages;
 }

@@ -153,17 +153,31 @@ exec /bin/entrypoint.sh "$@"
 - `direnv`: 进入目录时自动加载 `shell.nix` 或 `flake.nix` 环境。
 - `bash-wrapper`: 确保在通过 SSH 登录或交互终端时，`LD_LIBRARY_PATH` 等环境变量不会丢失。
 
+## 本地构建镜像
+
+每个镜像目录（如 `images/rust`）均同时支持构建标准 CLI 镜像与 VS Code Remote 镜像：
+
+```bash
+# 1. 构建 Rust 通用 CLI 镜像
+nix-build images/rust/image.nix -A rust
+
+# 2. 构建 VS Code Remote Rust 镜像 (含 SSH)
+nix-build images/rust/image.nix -A vscode-rust
+
+# 3. 构建该目录下所有镜像变体
+nix-build images/rust/image.nix
+```
+
+构建完成后，使用 `docker load < result` 即可将镜像导入本地 Docker。
+
 ## 项目结构
 
 ```text
 .
-├── images/                # Docker 镜像定义目录
-│   ├── npins/             # 基础通用镜像 (无 SSH)
-│   ├── rust/              # Rust 通用镜像 (无 SSH)
-│   ├── mise/              # Mise 通用镜像 (无 SSH)
-│   ├── vscode-npins/      # VS Code 基础开发镜像 (含 SSH)
-│   ├── vscode-rust/       # VS Code Rust 专用镜像 (含 SSH)
-│   └── vscode-mise/       # VS Code Mise 专用镜像 (含 SSH)
+├── images/                # Docker 镜像定义目录 (每个定义同时产出 CLI 与 VS Code 镜像)
+│   ├── npins/             # 基础通用镜像 (npins, vscode-npins)
+│   ├── rust/              # Rust 专用镜像 (rust, vscode-rust)
+│   └── mise/              # Mise 专用镜像 (mise, vscode-mise)
 ├── modules/               # 统一 NixOS 模块系统
 │   ├── core/              # 核心构建器、系统配置与动态 entrypoint
 │   └── profiles/          # 语言与工具特性 Profile (base, rust, npins, mise)

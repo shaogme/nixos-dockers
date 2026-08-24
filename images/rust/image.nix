@@ -1,16 +1,17 @@
 { sources ? import ./npins
 , system ? builtins.currentSystem
 , pkgs ? import sources.nixpkgs { inherit system; config.allowUnfree = true; }
-, imageName ? "rust"
+, name ? "rust"
 }:
 let
   builder = import ../../modules { inherit pkgs sources system; };
 in
-builder.buildImage {
+builder.buildImages {
+  inherit name;
   modules = [
     {
-      docker.name = imageName;
       profiles.rust.enable = true;
     }
   ];
 }
+
