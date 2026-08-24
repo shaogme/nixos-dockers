@@ -9,6 +9,8 @@
   };
 
   config = lib.mkIf config.profiles.rust.enable {
+    docker.version = lib.mkDefault pkgs.rustc.version;
+
     environment.systemPackages = with pkgs; [
       # Debugging
       gdb

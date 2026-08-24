@@ -10,7 +10,7 @@ let
     "PATH=/bin:/usr/bin:/usr/local/bin"
   ] ++ (lib.mapAttrsToList (name: value: "${name}=${toString value}") validVars);
 
-  layeredImage = pkgs.dockerTools.buildLayeredImage {
+  layeredImage = (pkgs.dockerTools.buildLayeredImage {
     name = config.docker.name;
     tag = config.docker.tag;
     includeNixDB = true;
@@ -25,6 +25,11 @@ let
       ExposedPorts = config.docker.exposedPorts;
       Env = envList;
     };
+  }) // {
+    imageVersion = config.docker.version;
+    passthru = {
+      imageVersion = config.docker.version;
+    };
   };
 in
 {
@@ -38,6 +43,12 @@ in
       type = lib.types.str;
       default = "latest";
       description = "Docker image tag.";
+    };
+
+    version = lib.mkOption {
+      type = lib.types.str;
+      default = "latest";
+      description = "Component version for semantic tagging.";
     };
 
     workingDir = lib.mkOption {

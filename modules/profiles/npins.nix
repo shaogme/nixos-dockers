@@ -9,6 +9,8 @@
   };
 
   config = lib.mkIf config.profiles.npins.enable {
+    docker.version = lib.mkDefault pkgs.npins.version;
+
     environment.systemPackages = with pkgs; [
       npins
     ];

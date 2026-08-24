@@ -19,12 +19,18 @@
   - **每日更新**: 每天凌晨 3:00 (北京时间) 自动同步 `npins` 依赖。
   - **持续交付**: 每次代码推送自动构建并发布至 GHCR。
 
-## 镜像列表
+## 镜像列表与 Tag 规范
 
-| 镜像名称 | 描述 | 主要包含 |
-| :--- | :--- | :--- |
-| `vscode-npins` | 基础开发镜像 | Nix, npins, direnv, coreutils, SSH |
-| `vscode-rust` | Rust 专用开发镜像 | Rust 工具链 (cargo, rustc), rust-analyzer, clippy, gdb |
+| 镜像名称 | 描述 | 主要包含 | 示例 Tag |
+| :--- | :--- | :--- | :--- |
+| `vscode-npins` | 基础开发镜像 | Nix, npins, direnv, coreutils, SSH | `latest`, `0.5.0-2026.8.24` |
+| `vscode-rust` | Rust 专用开发镜像 | Rust 工具链 (cargo, rustc), rust-analyzer, clippy, gdb | `latest`, `1.97.1-2026.8.24` |
+
+### Tag 命名规则
+
+每次 CI 构建都会发布两个 Tag：
+1. **`latest`**: 指向最新一次构建的镜像。
+2. **`<组件版本>-<发布日期>`**: 格式为 `版本-年.月.日`（如 `1.97.1-2026.8.24`）。若同一天内重新触发构建，将自动覆盖并更新当天的 Tag。
 
 ## 快速开始
 

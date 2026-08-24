@@ -70,11 +70,20 @@ jobs:
           IMAGE_LOWER=$(echo "${{ matrix.image }}" | tr '[:upper:]' '[:lower:]')
           IMAGE_ID=${{ env.REGISTRY }}/$REPO_LOWER/$IMAGE_LOWER
           
-          echo "Pushing to $IMAGE_ID"
+          # Extract component version from Nix metadata
+          VERSION=$(nix-instantiate --eval --raw ${{ matrix.image }}/image.nix -A imageVersion --argstr imageName ${{ matrix.image }} 2>/dev/null || echo "latest")
           
-          # Tag and push
+          # Format date as YYYY.M.D (e.g., 2026.8.24)
+          DATE=$(date +'%Y.%-m.%-d')
+          VERSION_TAG="${VERSION}-${DATE}"
+          
+          echo "Target Image: $IMAGE_ID"
+          echo "Publishing version tag: $VERSION_TAG"
+          
+          # Tag images
           docker tag ${{ matrix.image }}:latest $IMAGE_ID:latest
-          docker tag ${{ matrix.image }}:latest $IMAGE_ID:${{ github.sha }}
+          docker tag ${{ matrix.image }}:latest $IMAGE_ID:${VERSION_TAG}
           
+          # Push to GHCR (Docker registry protocol overwrites existing tags on push)
           docker push $IMAGE_ID:latest
-          docker push $IMAGE_ID:${{ github.sha }}
+          docker push $IMAGE_ID:${VERSION_TAG}
