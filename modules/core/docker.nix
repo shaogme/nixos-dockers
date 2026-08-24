@@ -31,7 +31,7 @@ let
   defaultCmd =
     if config.services.openssh.enable then ''
       echo "Starting SSH server..."
-      exec sshd -D -e
+      exec /bin/sshd -D -e
     '' else ''
       exec /bin/bash -i
     '';
