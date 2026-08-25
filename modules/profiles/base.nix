@@ -15,8 +15,6 @@
       openssl
       icu
       libsecret
-      glib
-      libkrb5
       util-linux
     ];
 
@@ -36,19 +34,11 @@
       which
       xz
       cacert
-      bashInteractive
 
       # Modern CLI & Productivity Utilities
       ripgrep
       fd
-      eza
-      bat
       jq
-      yq-go
-      htop
-      bottom
-      tree
-      less
       zip
       unzip
       p7zip
@@ -56,21 +46,13 @@
 
       # Network, Git & System Diagnostics
       curl
-      git
-      git-lfs
-      gh
       iproute2
-      net-tools
       iputils
       dnsutils
-      tcpdump
-      nmap
       procps
-      psmisc
       strace
       lsof
       vim
-      shadow
 
       # Nix Ecosystem Utilities
       nix

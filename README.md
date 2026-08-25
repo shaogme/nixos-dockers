@@ -27,7 +27,7 @@
 | :--- | :--- | :--- | :--- |
 | `npins` | 基础开发镜像 | Nix, npins, direnv, coreutils, nix-ld | `latest`, `0.5.0-2026.8.24` |
 | `rust` | Rust 专用开发镜像 | Rust 工具链 (cargo, rustc), rust-analyzer, clippy, gdb | `latest`, `1.97.1-2026.8.24` |
-| `mise` | Mise 多语言环境开发镜像 | Nix, mise (跟踪 main 分支), direnv, coreutils | `latest`, `2026.8.12-2026.8.24` |
+| [`mise`](images/mise/README.md) | Mise 多语言环境开发镜像 | Nix, mise (跟踪 main 分支), direnv, coreutils | `latest`, `2026.8.12-2026.8.24` |
 
 ### 2. VS Code Remote 专用镜像（内置 SSH 服务与公钥自动注入）
 
@@ -35,7 +35,7 @@
 | :--- | :--- | :--- | :--- |
 | `vscode-npins` | 基础开发镜像 (SSH) | Nix, npins, direnv, coreutils, SSH | `latest`, `0.5.0-2026.8.24` |
 | `vscode-rust` | Rust 专用镜像 (SSH) | Rust 工具链, rust-analyzer, clippy, gdb, SSH | `latest`, `1.97.1-2026.8.24` |
-| `vscode-mise` | Mise 开发镜像 (SSH) | Nix, mise, direnv, coreutils, SSH | `latest`, `2026.8.12-2026.8.24` |
+| [`vscode-mise`](images/mise/README.md) | Mise 开发镜像 (SSH) | Nix, mise, direnv, coreutils, SSH | `latest`, `2026.8.12-2026.8.24` |
 
 ### Tag 命名规则
 
@@ -139,6 +139,9 @@ echo "Running custom setup..."
 exec /bin/entrypoint.sh "$@"
 ```
 
+> [!TIP]
+> 完整的派生开发容器最佳实践（包含 BuildKit 缓存加速、构建期多语言工具预装与 Docker Compose 配置），请参考 [Mise 镜像与 Example 详细文档](images/mise/README.md)。
+
 ## 技术细节
 
 ### 为什么选择 Nix 构建镜像？
@@ -177,7 +180,8 @@ nix-build images/rust/image.nix
 ├── images/                # Docker 镜像定义目录 (每个定义同时产出 CLI 与 VS Code 镜像)
 │   ├── npins/             # 基础通用镜像 (npins, vscode-npins)
 │   ├── rust/              # Rust 专用镜像 (rust, vscode-rust)
-│   └── mise/              # Mise 专用镜像 (mise, vscode-mise)
+│   └── mise/              # Mise 专用镜像 (mise, vscode-mise) -> 详见 [Mise 文档](images/mise/README.md)
+│       └── example/       # 生产级派生开发容器示例 (Dockerfile, compose, entrypoint)
 ├── modules/               # 统一 NixOS 模块系统
 │   ├── core/              # 核心构建器、系统配置与动态 entrypoint
 │   └── profiles/          # 语言与工具特性 Profile (base, rust, npins, mise)

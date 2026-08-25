@@ -1,0 +1,36 @@
+services:
+  # Base configuration for the application
+  app-base: &app-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - ROOT_PASSWORD=root # Set your secure password here
+      - MISE_YES=1 # Non-interactive mode for mise
+    security_opt:
+      - seccomp:unconfined # Required for some low-level operations
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - NET_ADMIN
+    tty: true
+
+  # Develop mode: Mounts local directory for hot-reloading (Default)
+  dev:
+    <<: *app-base
+    container_name: mise-dev
+    volumes:
+      - .:/root/workspace
+      - codex-config:/root/.codex
+
+  # Standalone mode: Uses code copied into the image (No host mounting)
+  standalone:
+    <<: *app-base
+    container_name: mise-standalone
+    volumes:
+      - codex-config:/root/.codex
+    profiles:
+      - standalone
+
+volumes:
+  codex-config:
