@@ -8,18 +8,19 @@ if ! command -v npins &> /dev/null; then
     exit 1
 fi
 
-# Find directories containing 'npins' subdir under images/
+# Find all sources.json files under images/ (inside npins directories)
 echo "Searching for npins directories in images/..."
-FOUND_DIRS=$(find images -type d -name "npins" -print)
+FOUND_SOURCES=$(find images -type f -path "*/npins/sources.json" -print | sort)
 
-if [ -z "$FOUND_DIRS" ]; then
-    echo "No npins directories found to update."
+if [ -z "$FOUND_SOURCES" ]; then
+    echo "No npins dependencies found to update."
     exit 0
 fi
 
-for npins_path in $FOUND_DIRS; do
-    # Go to the parent directory of the npins folder
-    work_dir=$(dirname "$npins_path")
+for sources_path in $FOUND_SOURCES; do
+    # Go to the directory containing the 'npins' folder
+    npins_dir=$(dirname "$sources_path")
+    work_dir=$(dirname "$npins_dir")
     
     echo "------------------------------------------------"
     echo "Updating dependencies in: $work_dir"
