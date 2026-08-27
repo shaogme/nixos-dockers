@@ -53,6 +53,8 @@
       strace
       lsof
       vim
+      nano
+      ncurses
 
       # Nix Ecosystem Utilities
       nix
