@@ -20,6 +20,7 @@
 
     environment.systemPackages = with pkgs; [
       # Core Tools & Build Essentials
+      bashInteractive
       gcc
       glibc
       glibc.bin # Contains ldd, required for version checks
