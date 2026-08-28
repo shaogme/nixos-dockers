@@ -35,82 +35,70 @@ jobs:
           ')
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
-  build-and-push-arch:
+  build-amd64:
     needs: discover
     if: ${{ needs.discover.outputs.matrix != '[]' && needs.discover.outputs.matrix != '' }}
-    permissions:
-      contents: read
-      packages: write
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.discover.outputs.matrix) }}
-        arch:
-          - name: amd64
-            runner: ubuntu-latest
-            system: x86_64-linux
-          - name: arm64
-            runner: ubuntu-24.04-arm
-            system: aarch64-linux
-    runs-on: ${{ matrix.arch.runner }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@main
-
-      - name: Log in to the Container registry
-        uses: docker/login-action@master
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Nix
         uses: cachix/install-nix-action@master
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Build Docker image with Nix
+      - name: Build AMD64 Docker image with Nix
         run: |
-          # Build the target derivation attribute from image.nix for target architecture
           nix-build ${{ matrix.target.file }} \
             -A ${{ matrix.target.attr }} \
-            --argstr system ${{ matrix.arch.system }}
+            --argstr system x86_64-linux \
+            -o result-amd64
 
-      - name: Load and Push Arch Docker image
+      - name: Upload AMD64 image artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: image-${{ matrix.target.name }}-amd64
+          path: result-amd64
+          if-no-files-found: error
+
+  build-arm64:
+    needs: discover
+    if: ${{ needs.discover.outputs.matrix != '[]' && needs.discover.outputs.matrix != '' }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@master
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build ARM64 Docker image with Nix
         run: |
-          # Load the built image into docker
-          docker load < result
-          
-          IMAGE_NAME="${{ matrix.target.name }}"
-          # Prepare the GHCR image ID (lowercase repository and image name)
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
-          IMAGE_ID=${{ env.REGISTRY }}/$REPO_LOWER/$IMAGE_LOWER
-          
-          # Extract component version from Nix metadata
-          VERSION=$(nix-instantiate --eval --raw ${{ matrix.target.file }} \
-            -A "${{ matrix.target.attr }}.imageVersion" \
-            --argstr system ${{ matrix.arch.system }} 2>/dev/null || echo "latest")
-          
-          # Format date as YYYY.M.D (e.g., 2026.8.24)
-          DATE=$(date +'%Y.%-m.%-d')
-          VERSION_TAG="${VERSION}-${DATE}"
-          ARCH="${{ matrix.arch.name }}"
-          
-          echo "Target Image: $IMAGE_ID"
-          echo "Publishing arch tag: ${VERSION_TAG}-${ARCH}"
-          
-          # Tag architecture specific images
-          docker tag $IMAGE_NAME:latest $IMAGE_ID:latest-${ARCH}
-          docker tag $IMAGE_NAME:latest $IMAGE_ID:${VERSION_TAG}-${ARCH}
-          
-          # Push arch images to GHCR
-          docker push $IMAGE_ID:latest-${ARCH}
-          docker push $IMAGE_ID:${VERSION_TAG}-${ARCH}
+          nix-build ${{ matrix.target.file }} \
+            -A ${{ matrix.target.attr }} \
+            --argstr system aarch64-linux \
+            -o result-arm64
 
-  create-manifest:
-    needs: [discover, build-and-push-arch]
+      - name: Upload ARM64 image artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: image-${{ matrix.target.name }}-arm64
+          path: result-arm64
+          if-no-files-found: error
+
+  publish:
+    needs: [discover, build-amd64, build-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -130,12 +118,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Download AMD64 artifact
+        uses: actions/download-artifact@main
+        with:
+          name: image-${{ matrix.target.name }}-amd64
+          path: ./artifacts/amd64
+
+      - name: Download ARM64 artifact
+        uses: actions/download-artifact@main
+        with:
+          name: image-${{ matrix.target.name }}-arm64
+          path: ./artifacts/arm64
+
       - name: Install Nix
         uses: cachix/install-nix-action@master
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Create and Push Multi-Arch Manifest
+      - name: Load, Push and Create Manifests
         run: |
           IMAGE_NAME="${{ matrix.target.name }}"
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
@@ -148,15 +148,36 @@ jobs:
           DATE=$(date +'%Y.%-m.%-d')
           VERSION_TAG="${VERSION}-${DATE}"
           
-          echo "Creating manifest for $IMAGE_ID:latest and $IMAGE_ID:$VERSION_TAG"
-          
-          # 1. Create and push latest multi-arch manifest
+          echo "Target Image: $IMAGE_ID"
+          echo "Publishing version tag: $VERSION_TAG"
+
+          # 1. Load, tag and push AMD64 image
+          echo "Loading AMD64 image..."
+          docker load -i ./artifacts/amd64/result-amd64
+          docker tag $IMAGE_NAME:latest $IMAGE_ID:latest-amd64
+          docker tag $IMAGE_NAME:latest $IMAGE_ID:${VERSION_TAG}-amd64
+          docker push $IMAGE_ID:latest-amd64
+          docker push $IMAGE_ID:${VERSION_TAG}-amd64
+          docker rmi $IMAGE_NAME:latest
+
+          # 2. Load, tag and push ARM64 image
+          echo "Loading ARM64 image..."
+          docker load -i ./artifacts/arm64/result-arm64
+          docker tag $IMAGE_NAME:latest $IMAGE_ID:latest-arm64
+          docker tag $IMAGE_NAME:latest $IMAGE_ID:${VERSION_TAG}-arm64
+          docker push $IMAGE_ID:latest-arm64
+          docker push $IMAGE_ID:${VERSION_TAG}-arm64
+          docker rmi $IMAGE_NAME:latest
+
+          # 3. Create and push Multi-Arch Manifest Lists
+          echo "Creating and pushing Multi-Arch Manifests..."
+          docker manifest rm $IMAGE_ID:latest 2>/dev/null || true
           docker manifest create $IMAGE_ID:latest \
             --amend $IMAGE_ID:latest-amd64 \
             --amend $IMAGE_ID:latest-arm64
           docker manifest push $IMAGE_ID:latest
           
-          # 2. Create and push versioned multi-arch manifest
+          docker manifest rm $IMAGE_ID:${VERSION_TAG} 2>/dev/null || true
           docker manifest create $IMAGE_ID:${VERSION_TAG} \
             --amend $IMAGE_ID:${VERSION_TAG}-amd64 \
             --amend $IMAGE_ID:${VERSION_TAG}-arm64
