@@ -65,6 +65,9 @@ in
     environment.variables = {
       NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       NIX_PATH = "nixpkgs=${pkgs.path}";
+      NIX_LD = nixLd;
+      NIX_LD_LIBRARY_PATH = "${nixLdLibPath}:/usr/lib:/usr/lib64";
+      LD_LIBRARY_PATH = "${nixLdLibPath}:/usr/lib:/usr/lib64";
     };
   };
 }

@@ -45,11 +45,21 @@ let
     filter-syscalls = false
   '';
 
+  etcEnvironment = pkgs.writeTextDir "etc/environment" ''
+    NIX_LD=${config.environment.nixLd}
+    NIX_LD_LIBRARY_PATH=${config.environment.nixLdLibPath}:/usr/lib:/usr/lib64
+    LD_LIBRARY_PATH=${config.environment.nixLdLibPath}:/usr/lib:/usr/lib64
+    NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+    NIX_PATH=nixpkgs=${pkgs.path}
+    PATH=/bin:/usr/bin:/usr/local/bin
+  '';
+
   systemConfigFiles = [
     passwd
     group
     nsswitchConf
     nixConf
+    etcEnvironment
     pkgs.iana-etc
     pkgs.dockerTools.caCertificates
   ] ++ lib.optionals config.services.openssh.enable [
@@ -112,18 +122,27 @@ in
       ${shadowContent}EOF
       chmod 600 etc/shadow
       
-      # 3. FHS Compatibility (Required for VS Code Server, etc.)
-      mkdir -p lib64 usr/lib64 usr/lib usr/bin usr/lib/x86_64-linux-gnu
+      # 3. FHS Compatibility (Required for VS Code Server, Mise unpatched binaries, etc.)
+      mkdir -p lib lib64 usr/lib64 usr/lib usr/bin usr/lib/x86_64-linux-gnu usr/lib/aarch64-linux-gnu
 
-      # Link Dynamic Linker (ld-linux)
-      ln -sf ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
+      # Link Dynamic Linker (ld-linux) to nix-ld for unpatched FHS binary support (AMD64 & ARM64)
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld lib64/ld-linux-x86-64.so.2
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld lib/ld-linux-x86-64.so.2
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld usr/lib64/ld-linux-x86-64.so.2
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld usr/lib/ld-linux-x86-64.so.2
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld lib64/ld-linux-aarch64.so.1
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld lib/ld-linux-aarch64.so.1
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld usr/lib64/ld-linux-aarch64.so.1
+      ln -sf ${pkgs.nix-ld}/libexec/nix-ld usr/lib/ld-linux-aarch64.so.1
       
       # Link Core Libraries (libstdc++, libgcc_s)
       for lib in libstdc++.so.6 libgcc_s.so.1; do
         cp -L ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib/$lib
         cp -L ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib64/$lib
         ln -sf /usr/lib/$lib lib64/$lib
+        ln -sf /usr/lib/$lib lib/$lib
         ln -sf /usr/lib/$lib usr/lib/x86_64-linux-gnu/$lib
+        ln -sf /usr/lib/$lib usr/lib/aarch64-linux-gnu/$lib
       done
       
       # 4. Bash Wrapper

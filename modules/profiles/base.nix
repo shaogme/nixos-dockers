@@ -10,19 +10,22 @@
 
   config = lib.mkIf config.profiles.base.enable {
     environment.runtimeLibraries = with pkgs; [
+      glibc
       stdenv.cc.cc.lib
       zlib
       openssl
       icu
       libsecret
       util-linux
+      libxml2
+      libuv
+      curl
     ];
 
     environment.systemPackages = with pkgs; [
       # Core Tools & Build Essentials
       bashInteractive
       gcc
-      glibc
       glibc.bin # Contains ldd, required for version checks
       coreutils
       findutils

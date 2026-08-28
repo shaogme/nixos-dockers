@@ -79,9 +79,6 @@ let
 
   validVars = lib.filterAttrs (_: v: v != null) config.environment.variables;
   envList = [
-    "NIX_LD_LIBRARY_PATH=${config.environment.nixLdLibPath}:/usr/lib:/usr/lib64"
-    "NIX_LD=${config.environment.nixLd}"
-    "LD_LIBRARY_PATH=${config.environment.nixLdLibPath}:/usr/lib:/usr/lib64"
     "PATH=/bin:/usr/bin:/usr/local/bin"
   ] ++ (lib.mapAttrsToList (name: value: "${name}=${toString value}") validVars);
 
@@ -89,10 +86,12 @@ let
     name = config.docker.name;
     tag = config.docker.tag;
     includeNixDB = true;
-    contents = config.environment.systemPackages
+    contents = lib.unique (
+      config.environment.systemPackages
       ++ config.environment.runtimeLibraries
       ++ config.docker.extraContents
-      ++ [ config.docker.entrypoint ];
+      ++ [ config.docker.entrypoint ]
+    );
     extraCommands = config.docker.extraCommands;
     config = {
       Cmd = [ "/bin/entrypoint.sh" ];
