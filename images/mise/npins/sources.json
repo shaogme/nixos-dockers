@@ -9,9 +9,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "e2cca3ce51c492342795af556fd36d655bb35e5d",
-      "url": "https://github.com/jdx/mise/archive/e2cca3ce51c492342795af556fd36d655bb35e5d.tar.gz",
-      "hash": "sha256-Ztj9PhXcRRGiI+pf6IkQ8RC4Y2pRKuQgki/tKtZP05g="
+      "revision": "d9f932f0aeb449a64ccf74e643f1188510ba2646",
+      "url": "https://github.com/jdx/mise/archive/d9f932f0aeb449a64ccf74e643f1188510ba2646.tar.gz",
+      "hash": "sha256-JDX6OIb6efOH7Gm5rurQa8hic6AFvSkd2BJ7woEQVdE="
     },
     "nixpkgs": {
       "type": "Channel",
