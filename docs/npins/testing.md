@@ -7,13 +7,16 @@
 项目测试通常分为以下三个层次：
 
 ### 1.1 静态检查 (Static/Evaluation Check)
+
 **目的**：验证 Nix 表达式是否能正确评估，以及模块的选项是否按预期应用到了 `config` 中。
 **特点**：速度极快，不涉及实际编译，仅检查配置逻辑。
 **实现方式**：
+
 - 使用 `lib.evalConfig` 评估系统。
 - 在 `runCommand` 中使用 `builtins.trace` 或 shell 断言检查 `config` 属性。
 
 **代码示例** (`tests/static.nix`):
+
 ```nix
 let
   eval = import (pkgs.path + "/nixos/lib/eval-config.nix") {
@@ -31,11 +34,13 @@ pkgs.runCommand "static-check" {} ''
 ```
 
 ### 1.2 构建测试 (Build Test)
+
 **目的**：确保所有的依赖包都能正确下载，且系统组件（如 `toplevel`）能够成功构建。
 **特点**：耗时较长，会触发实际的包下载和编译。
 **实现方式**：直接引用 `testSystem.config.system.build.toplevel`。
 
 ### 1.3 虚拟机测试 (VM Test / vmtest)
+
 **目的**：在真实的虚拟机环境中运行配置，验证内核启动、驱动加载、服务运行状态等。
 **特点**：最全面的检查，能捕捉到运行时错误（如内核 Panic、服务启动失败）。
 **实现方式**：使用 `pkgs.testers.nixosTest`。
@@ -47,10 +52,12 @@ pkgs.runCommand "static-check" {} ''
 VM Test 是基于 NixOS 测试框架实现的。它会启动一个或多个 QEMU 虚拟机并运行 Python 脚本进行自动化交互。
 
 ### 核心组件
+
 1. **`nodes`**: 定义虚拟机的配置。你可以像写 `configuration.nix` 一样定义它。
 2. **`testScript`**: 一个 Python 脚本，用于控制虚拟机并检查状态。
 
 ### 示例代码 (`tests/vmtest.nix`)
+
 ```nix
 pkgs.testers.nixosTest {
   name = "my-feature-test";
@@ -80,17 +87,23 @@ pkgs.testers.nixosTest {
 测试任务通常在各模块的 `tests/default.nix` 中聚合。
 
 ### 运行特定模块的所有测试
+
 在对应的测试目录下运行：
+
 ```bash
 nix-build
 ```
+
 或者在项目根目录下，通过指定属性路径（如果 `default.nix` 已暴露）：
+
 ```bash
 nix-build -A kernel.cachyos.tests
 ```
 
 ### 交互式调试 VM Test
+
 如果你想进入虚拟机手动调试，可以使用：
+
 ```bash
 nix-build tests/vmtest.nix -A driver
 ./result/bin/nixos-test-driver
@@ -109,6 +122,7 @@ nix-build tests/vmtest.nix -A driver
 2. **环境变量覆盖**：在本地开发测试时，可以配合 `NPINS_OVERRIDE_<NAME>` 环境变量，直接测试本地尚未提交的依赖代码。
 
 例如，在运行 `vmtest` 时测试本地的 `disko` 修改：
+
 ```bash
 export NPINS_OVERRIDE_disko=/path/to/local/disko
 nix-build hardware/disk/btrfs/tests/default.nix

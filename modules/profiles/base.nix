@@ -29,6 +29,7 @@
       glibc.bin # Contains ldd, required for version checks
       coreutils
       findutils
+      file
       gnugrep
       gnused
       gawk

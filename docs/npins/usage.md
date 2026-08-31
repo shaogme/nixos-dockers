@@ -20,6 +20,7 @@ in
 `npins` 生成的每个依赖项（Pin）都可以直接作为**路径字符串**使用。这是因为它实现了 `outPath` 属性。
 
 ### 示例：导入 NixOS 模块
+
 如果你的依赖项（如 `disko`）是一个包含 NixOS 模块的仓库，你可以这样导入它：
 
 ```nix
@@ -31,6 +32,7 @@ in
 ```
 
 ### 示例：作为包 (Package) 使用
+
 你也可以直接引用其路径，例如在 `environment.systemPackages` 中：
 
 ```nix
@@ -70,6 +72,7 @@ in
 **环境变量格式**：`NPINS_OVERRIDE_<NAME>`
 
 ### 示例
+
 如果你想将 `disko` 覆盖为本地路径 `/home/user/src/disko`：
 
 ```bash
@@ -131,11 +134,13 @@ in
 ### 声明对比
 
 **Flake (`flake.nix`):**
+
 ```nix
 inputs.my-repo.url = "github:user/repo/revision";
 ```
 
 **npins (`sources.json` 内部等效逻辑):**
+
 ```json
 "my-repo": {
   "type": "Git",

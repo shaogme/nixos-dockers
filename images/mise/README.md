@@ -25,6 +25,7 @@
 [Mise-en-place (mise)](https://github.com/jdx/mise) 是一个现代化的多语言开发环境与工具链管理工具（类似 asdf、nvm、pyenv、rustup 的统一替代品），同时内置环境变量管理与任务编排能力。
 
 本镜像将 **Nix 的声明式系统底座** 与 **Mise 的灵活多语言管理** 相结合，镜像具有以下优势：
+
 1. **源码级追踪最新 Mise**：通过 `npins` 直接拉取跟踪 `jdx/mise` 主分支源码编译，保持特性最新。
 2. **极速多语言环境搭建**：开发者仅需编写一份 `mise.toml`，即可在秒级拉取并使用 Node.js、Python、Rust、Go、Java 等工具链。
 3. **完美解决动态链接问题**：容器内置 `nix-ld` 与完整的基础 FHS 运行库，彻底解决 Mise 下载的非 Nix 预编译二进制文件（ELF binaries）在 NixOS 环境下动态链接器（`ld-linux`）缺失的报错。
@@ -99,14 +100,17 @@ images/mise/example/
 
 1. **基础镜像继承**：以 `ghcr.io/shaogme/nixos-dockers/mise:latest` 为底座。
 2. **BuildKit 缓存加速 Nix 安装**：
+
    ```dockerfile
    RUN --mount=type=cache,target=/root/.cache/nix \
        --mount=type=cache,target=/tmp \
        echo "sandbox = false" >> /etc/nix/nix.conf && \
        nix-env --option sandbox false -iA nixpkgs.bubblewrap nixpkgs.firefox nixpkgs.geckodriver
    ```
+
    通过 `--mount=type=cache` 缓存 Nix 下载与编译产物，无需重复拉取。
 3. **构建期自动预装 Mise 工具**：
+
    ```dockerfile
    RUN --mount=type=cache,target=/root/.cache/mise \
        set -e; \
@@ -116,6 +120,7 @@ images/mise/example/
            mise install; \
        fi
    ```
+
    在 `docker build` 阶段智能探测工作区配置并提前安装 `mise.toml` 中定义的工具链，配合 Mise 缓存挂载，使首次容器启动无需等待漫长的下载过程。
 4. **自定义 Entrypoint 与链式交接**：
    将入口设置为自定义的 `/usr/local/bin/mise-entrypoint.sh`，CMD 保持空数组以便接收默认启动逻辑。
@@ -132,9 +137,11 @@ images/mise/example/
    - 运行 `mise install` 确保运行时新挂载的配置依赖已安装。
    - 执行 `eval "$(mise env -s bash)"`，将 mise 导出的环境变量立即注入当前进程，确保后续子命令能直接访问。
 5. **平滑链式交接**：
+
    ```bash
    exec /bin/entrypoint.sh "$@"
    ```
+
    最终通过 `exec` 交接给底座 NixOS 镜像的入口脚本，完成 SSH 密钥生成、公钥自动注入及进程拉起。
 
 ### 4. docker-compose.yml 运行模式

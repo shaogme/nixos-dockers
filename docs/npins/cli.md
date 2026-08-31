@@ -25,11 +25,13 @@ npins [选项] <命令>
 初始化 npins 目录。多次运行此命令会还原或升级 `default.nix`，但绝不会触动你的 `sources.json`。
 
 **用法：**
+
 ```bash
 npins init [选项]
 ```
 
 **选项：**
+
 - `--bare`: 不添加初始的 `nixpkgs` 条目。
 
 ---
@@ -39,16 +41,18 @@ npins init [选项]
 向项目中添加一个新的 Pin。
 
 **用法：**
+
 ```bash
 npins add [选项] <子命令>
 ```
 
 **通用选项：**
+
 - `--name <NAME>`: 使用自定义名称添加。如果名称已存在，则会覆盖。
 - `--frozen`: 以“冻结”状态添加。被冻结的依赖在执行 `npins update` 时默认会被忽略。
 - `-n, --dry-run`: 预览更改，但不实际执行。
 
-#### `add` 子命令：
+#### `add` 子命令
 
 - **`channel`**: 追踪一个 Nix Channel。
   - `npins add channel [选项] <CHANNEL_NAME>`
@@ -92,6 +96,7 @@ npins add [选项] <子命令>
 列出当前所有的 Pin 条目。
 
 **用法：**
+
 ```bash
 npins show
 ```
@@ -103,14 +108,17 @@ npins show
 将所有或指定的 Pin 更新到最新版本。
 
 **用法：**
+
 ```bash
 npins update [选项] [NAMES]...
 ```
 
 **参数：**
+
 - `[NAMES]...`: 仅更新指定的 Pin。
 
 **选项：**
+
 - `-p, --partial`: 不更新版本，仅重新获取哈希值 (Hash)。
 - `-f, --full`: 即使版本未变也重新获取哈希值。
 - `-n, --dry-run`: 打印差异 (diff)，但不写入更改。
@@ -124,6 +132,7 @@ npins update [选项] [NAMES]...
 验证所有或指定的 Pin 哈希值是否正确。这类似于执行 `update --partial --dry-run` 并检查差异是否为空。
 
 **用法：**
+
 ```bash
 npins verify [选项] [NAMES]...
 ```
@@ -144,6 +153,7 @@ npins verify [选项] [NAMES]...
 移除一个 Pin 条目。
 
 **用法：**
+
 ```bash
 npins remove <NAME>
 ```
@@ -155,6 +165,7 @@ npins remove <NAME>
 计算 Pin 在 Nix Store 中的路径，必要时会进行获取。
 
 **用法：**
+
 ```bash
 npins get-path <NAME>
 ```
@@ -175,6 +186,7 @@ npins get-path <NAME>
 将 `sources.json` 和 `default.nix` 升级到最新的格式版本。这可能会偶尔导致 Nix 求值中断，请谨慎使用。
 
 **用法：**
+
 ```bash
 npins upgrade
 ```
