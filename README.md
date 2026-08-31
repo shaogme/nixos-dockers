@@ -40,6 +40,7 @@
 ### Tag 命名规则
 
 每次 CI 构建都会发布两个 Tag：
+
 1. **`latest`**: 指向最新一次构建的镜像。
 2. **`<组件版本>-<发布日期>`**: 格式为 `版本-年.月.日`（如 `1.97.1-2026.8.24`）。若同一天内重新触发构建，将自动覆盖并更新当天的 Tag。
 
@@ -96,6 +97,7 @@ services:
 ### 注意事项：Entrypoint 机制
 
 镜像内置的 `/bin/entrypoint.sh`（由 Nix 动态生成）负责处理以下关键初始化逻辑：
+
 1. **自动修复配置文件只读权限**（如 `/etc/passwd`, `/etc/group`, `/etc/shadow`）。
 2. **SSH 自动初始化**（当 `services.openssh.enable = true` 时）：
    - 自动生成 SSH Host Key（若缺失）。
@@ -189,10 +191,10 @@ nix-build images/rust/image.nix
 └── .github/workflows/     # CI/CD 自动化构建发布工作流
 ```
 
-
 ## 环境变量
 
 镜像内置了以下关键环境变量以确保环境正常运行：
+
 - `NIX_PATH`: 设置为 `nixpkgs=${pkgs.path}`，确保 `nix-shell`、`import <nixpkgs>` 等工具能够直接在 Nix 搜索路径中找到 `nixpkgs`。
 - `NIX_LD_LIBRARY_PATH`: 提供非 Nix 程序的动态链接库路径。
 - `RUST_SRC_PATH`: Rust 源码路径（针对 `vscode-rust`）。
