@@ -67,15 +67,13 @@ let
     # NixOS Development Container Entrypoint
     # ==========================================
 
-    # Fix Permissions for Config Files (Symlink Handling)
-    for file in /etc/passwd /etc/group /etc/shadow /etc/subuid /etc/subgid; do
+    # Fix Permissions for Config Files (Symlink Handling for dynamic user mapping)
+    for file in /etc/passwd /etc/group; do
         if [ -f "$file" ] && { [ -L "$file" ] || [ ! -w "$file" ]; }; then
             cp --remove-destination "$(readlink -f "$file")" "$file"
         fi
     done
     chmod 644 /etc/passwd /etc/group 2>/dev/null || true
-    chmod 600 /etc/shadow 2>/dev/null || true
-    chmod 644 /etc/subuid /etc/subgid 2>/dev/null || true
 
     # Ensure Metadata Directories & Directory Permissions
     mkdir -p /var/lock /var/tmp /run /workspace /run/containers /var/lib/containers
@@ -132,11 +130,7 @@ let
         # 1. Ensure target GID exists in /etc/group
         EXISTING_GROUP=$(awk -F: -v gid="$TARGET_GID" '$3 == gid {print $1; exit}' /etc/group)
         if [ -z "$EXISTING_GROUP" ]; then
-            if grep -q "^''${DEFAULT_USER}:" /etc/group; then
-                sed -i "s|^''${DEFAULT_USER}:x:[0-9]*:|''${DEFAULT_USER}:x:''${TARGET_GID}:|" /etc/group
-            else
-                echo "''${DEFAULT_USER}:x:''${TARGET_GID}:" >> /etc/group
-            fi
+            sed -i "s|^''${DEFAULT_USER}:x:[0-9]*:|''${DEFAULT_USER}:x:''${TARGET_GID}:|" /etc/group
             TARGET_GROUP="''${DEFAULT_USER}"
         else
             TARGET_GROUP="$EXISTING_GROUP"
@@ -148,35 +142,13 @@ let
             TARGET_USER="$EXISTING_USER"
             sed -i "s|^''${TARGET_USER}:x:''${TARGET_UID}:[0-9]*:|''${TARGET_USER}:x:''${TARGET_UID}:''${TARGET_GID}:|" /etc/passwd
         else
-            if grep -q "^''${DEFAULT_USER}:" /etc/passwd; then
-                sed -i "s|^''${DEFAULT_USER}:x:[0-9]*:[0-9]*:|''${DEFAULT_USER}:x:''${TARGET_UID}:''${TARGET_GID}:|" /etc/passwd
-            else
-                echo "''${DEFAULT_USER}:x:''${TARGET_UID}:''${TARGET_GID}:Developer:/home/''${DEFAULT_USER}:/bin/bash" >> /etc/passwd
-            fi
+            sed -i "s|^''${DEFAULT_USER}:x:[0-9]*:[0-9]*:|''${DEFAULT_USER}:x:''${TARGET_UID}:''${TARGET_GID}:|" /etc/passwd
             TARGET_USER="''${DEFAULT_USER}"
         fi
 
-        # Ensure user is in shadow
-        if ! grep -q "^''${TARGET_USER}:" /etc/shadow 2>/dev/null; then
-            echo "''${TARGET_USER}::19733:0:99999:7:::" >> /etc/shadow
-        fi
-
-        # Ensure target user has subuid and subgid entries
-        if [ -f /etc/subuid ] && ! grep -q "^''${TARGET_USER}:" /etc/subuid 2>/dev/null; then
-            echo "''${TARGET_USER}:100000:65536" >> /etc/subuid
-        fi
-        if [ -f /etc/subgid ] && ! grep -q "^''${TARGET_USER}:" /etc/subgid 2>/dev/null; then
-            echo "''${TARGET_USER}:100000:65536" >> /etc/subgid
-        fi
-
-        # 3. Setup User Home Directory & Nix Defexpr
+        # 3. Setup User Home Directory & Nix Defexpr Permissions
         USER_HOME=$(awk -F: -v u="$TARGET_USER" '$1 == u {print $6}' /etc/passwd)
         USER_HOME="''${USER_HOME:-/home/$TARGET_USER}"
-        mkdir -p "$USER_HOME"
-        if [ ! -d "$USER_HOME/.nix-defexpr" ]; then
-            mkdir -p "$USER_HOME/.nix-defexpr"
-            ln -sf "${pkgs.path}" "$USER_HOME/.nix-defexpr/nixpkgs"
-        fi
         chown "$TARGET_UID:$TARGET_GID" "$USER_HOME" 2>/dev/null || true
         chown -h -R "$TARGET_UID:$TARGET_GID" "$USER_HOME/.nix-defexpr" 2>/dev/null || true
 

@@ -15,11 +15,13 @@ let
   '';
 
   subuid = pkgs.writeTextDir "etc/subuid" ''
-    ${config.system.defaultUser}:100000:65536
+    root:1001:28000
+    ${config.system.defaultUser}:31000:34000
   '';
 
   subgid = pkgs.writeTextDir "etc/subgid" ''
-    ${config.system.defaultUser}:100000:65536
+    root:1001:28000
+    ${config.system.defaultUser}:31000:34000
   '';
 
   containersPolicy = pkgs.writeTextDir "etc/containers/policy.json" ''
