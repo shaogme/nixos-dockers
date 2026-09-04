@@ -31,6 +31,16 @@ jobs:
         uses: cachix/install-nix-action@master
         with:
           nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
+
+      - name: Setup NixCache for mise
+        if: contains(inputs.name, 'mise')
+        uses: shaogme/nixcache-oci/setup@main
+        with:
+          repo: shaogme/mise-nixcache
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build AMD64 Docker image with Nix
         run: |
@@ -56,6 +66,16 @@ jobs:
         uses: cachix/install-nix-action@master
         with:
           nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
+
+      - name: Setup NixCache for mise
+        if: contains(inputs.name, 'mise')
+        uses: shaogme/nixcache-oci/setup@main
+        with:
+          repo: shaogme/mise-nixcache
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ARM64 Docker image with Nix
         run: |

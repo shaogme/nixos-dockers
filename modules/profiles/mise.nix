@@ -1,12 +1,14 @@
 { config, lib, pkgs, sources ? null, ... }:
 let
   misePackage =
-    if sources != null && sources ? mise then
+    if sources != null && sources ? mise-nixcache then
+      (import sources.mise-nixcache { inherit pkgs; }).mise
+    else if sources != null && sources ? mise then
       (pkgs.callPackage (sources.mise + "/default.nix") { }).overrideAttrs (_: {
         doCheck = false;
       })
     else
-      throw "profiles.mise requires `sources.mise` to be provided. Fallback to pkgs.mise is not permitted.";
+      throw "profiles.mise requires `sources.mise-nixcache` or `sources.mise` to be provided. Fallback to pkgs.mise is not permitted.";
 in
 {
   options.profiles.mise = {

@@ -1,17 +1,17 @@
 {
   "pins": {
-    "mise": {
+    "mise-nixcache": {
       "type": "Git",
       "repository": {
         "type": "GitHub",
-        "owner": "jdx",
-        "repo": "mise"
+        "owner": "shaogme",
+        "repo": "mise-nixcache"
       },
       "branch": "main",
       "submodules": false,
-      "revision": "b32e12449d2c0ce56ac161dec555ab46734b13cb",
-      "url": "https://github.com/jdx/mise/archive/b32e12449d2c0ce56ac161dec555ab46734b13cb.tar.gz",
-      "hash": "sha256-nytinyfKMvVu7DRnJ1VikkU6I/4+b6AYivTq5kQlj0E="
+      "revision": "2c16dbde4c2fc708e1b13ff939134b6589de4436",
+      "url": "https://github.com/shaogme/mise-nixcache/archive/2c16dbde4c2fc708e1b13ff939134b6589de4436.tar.gz",
+      "hash": "sha256-lBe+JG2bHCId/k+03j8Dya9K3dOY6vnG0CIcctMCy/o="
     },
     "nixpkgs": {
       "type": "Channel",
