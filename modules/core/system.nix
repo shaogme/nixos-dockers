@@ -14,12 +14,12 @@ let
     wheel:x:998:${config.system.defaultUser}
   '';
 
-  subuid = pkgs.writeTextDir "etc/subuid" ''
+  subuidContent = ''
     root:1001:28000
     ${config.system.defaultUser}:31000:34000
   '';
 
-  subgid = pkgs.writeTextDir "etc/subgid" ''
+  subgidContent = ''
     root:1001:28000
     ${config.system.defaultUser}:31000:34000
   '';
@@ -99,8 +99,6 @@ let
   systemConfigFiles = [
     passwd
     group
-    subuid
-    subgid
     containersPolicy
     containersStorage
     containersRegistries
@@ -186,7 +184,7 @@ in
       
       ${sshExtraCommands}
 
-      # 2. Generate /etc/shadow and /etc/sudoers
+      # 2. Generate /etc/shadow, /etc/sudoers, /etc/subuid, and /etc/subgid
       cat > etc/shadow <<EOF
       ${shadowContent}EOF
       chmod 600 etc/shadow
@@ -197,6 +195,14 @@ in
       ${config.system.defaultUser} ALL=(ALL:ALL) NOPASSWD: ALL
       EOF
       chmod 440 etc/sudoers
+
+      cat > etc/subuid <<EOF
+      ${subuidContent}EOF
+      chmod 644 etc/subuid
+
+      cat > etc/subgid <<EOF
+      ${subgidContent}EOF
+      chmod 644 etc/subgid
 
       # 3. Non-Root User Setup & Defexpr
       mkdir -p home/${config.system.defaultUser}/.nix-defexpr
