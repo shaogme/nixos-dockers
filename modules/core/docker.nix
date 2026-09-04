@@ -189,16 +189,6 @@ let
         fi
     fi
 
-    # Ensure /etc/subuid and /etc/subgid exist for root
-    if [ ! -f /etc/subuid ]; then
-        echo "root:100000:65536" > /etc/subuid
-        chmod 644 /etc/subuid
-    fi
-    if [ ! -f /etc/subgid ]; then
-        echo "root:100000:65536" > /etc/subgid
-        chmod 644 /etc/subgid
-    fi
-
     ${sshEntrypointSnippet}
 
     # Execute Command or Start Default Service

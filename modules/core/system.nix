@@ -15,12 +15,10 @@ let
   '';
 
   subuid = pkgs.writeTextDir "etc/subuid" ''
-    root:100000:65536
     ${config.system.defaultUser}:100000:65536
   '';
 
   subgid = pkgs.writeTextDir "etc/subgid" ''
-    root:100000:65536
     ${config.system.defaultUser}:100000:65536
   '';
 
