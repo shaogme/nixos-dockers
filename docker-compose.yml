@@ -8,6 +8,7 @@ services:
       - CARGO_INCREMENTAL=1 # Enable incremental compilation for Rust builds
       - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
       - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
+      - CARGO_INCREMENTAL=1 # Enable incremental compilation for Rust builds
     security_opt:
       - seccomp:unconfined # Required for some low-level operations
     cap_add:
@@ -30,11 +31,8 @@ services:
       - cargo-git:${CONTAINER_HOME:-/home/dev}/.cargo/git
       # Persist direnv data
       - direnv-data:${CONTAINER_HOME:-/home/dev}/.local/share/direnv
-      # Persist codex configuration
-      - codex-config:${CONTAINER_HOME:-/home/dev}/.codex
-      - gemini-config:${CONTAINER_HOME:-/home/dev}/.gemini
-      - opencode-config:${CONTAINER_HOME:-/home/dev}/.config/opencode
-      - claude-config:${CONTAINER_HOME:-/home/dev}/.claude
+      # Persist unified AI credentials and tool configurations
+      - coding-config:/data/coding-config
 
 volumes:
   rust-target:
@@ -42,7 +40,4 @@ volumes:
   cargo-git:
   mise-cache:
   direnv-data:
-  codex-config:
-  gemini-config:
-  opencode-config:
-  claude-config:
+  coding-config:
