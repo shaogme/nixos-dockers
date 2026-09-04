@@ -218,6 +218,7 @@ let
       ++ [ config.docker.entrypoint ]
     );
     extraCommands = config.docker.extraCommands;
+    fakeRootCommands = config.docker.fakeRootCommands;
     config = {
       Cmd = [ "/bin/entrypoint.sh" ];
       WorkingDir = config.docker.workingDir;
@@ -289,7 +290,13 @@ in
     extraCommands = lib.mkOption {
       type = lib.types.lines;
       default = "";
-      description = "Shell commands executed during layer construction in fakeroot.";
+      description = "Shell commands executed during layer construction.";
+    };
+
+    fakeRootCommands = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = "Shell commands executed inside fakeroot during layer construction.";
     };
 
     build = lib.mkOption {

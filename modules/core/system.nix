@@ -158,7 +158,6 @@ in
       # 3. Non-Root User Setup & Defexpr
       mkdir -p home/${config.system.defaultUser}/.nix-defexpr
       ln -sf ${pkgs.path} home/${config.system.defaultUser}/.nix-defexpr/nixpkgs
-      chown -R ${toString config.system.defaultUid}:${toString config.system.defaultGid} home/${config.system.defaultUser}
       mkdir -p root
       chmod 700 root
       # Backward compatibility symlink
@@ -218,6 +217,16 @@ in
       # 9. Setup Nix Search Path & Defexpr for root
       mkdir -p root/.nix-defexpr
       ln -sf ${pkgs.path} root/.nix-defexpr/nixpkgs
+    '';
+
+    docker.fakeRootCommands = ''
+      target_home="home/${config.system.defaultUser}"
+      if [ ! -d "$target_home" ] && [ -d "/$target_home" ]; then
+        target_home="/$target_home"
+      fi
+      if [ -d "$target_home" ]; then
+        chown -R ${toString config.system.defaultUid}:${toString config.system.defaultGid} "$target_home"
+      fi
     '';
   };
 }
