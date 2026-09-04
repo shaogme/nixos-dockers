@@ -76,6 +76,10 @@ in
   config = {
     environment.systemPackages = [
       pkgs.gosu
+      pkgs.shadow
+      pkgs.fuse-overlayfs
+      pkgs.slirp4netns
+      pkgs.iptables
     ];
     environment.variables = {
       NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";

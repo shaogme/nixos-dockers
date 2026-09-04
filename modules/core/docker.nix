@@ -68,17 +68,18 @@ let
     # ==========================================
 
     # Fix Permissions for Config Files (Symlink Handling)
-    for file in /etc/passwd /etc/group /etc/shadow; do
-        if [ -L "$file" ] || [ ! -w "$file" ]; then
+    for file in /etc/passwd /etc/group /etc/shadow /etc/subuid /etc/subgid; do
+        if [ -f "$file" ] && { [ -L "$file" ] || [ ! -w "$file" ]; }; then
             cp --remove-destination "$(readlink -f "$file")" "$file"
         fi
     done
-    chmod 644 /etc/passwd /etc/group
-    chmod 600 /etc/shadow
+    chmod 644 /etc/passwd /etc/group 2>/dev/null || true
+    chmod 600 /etc/shadow 2>/dev/null || true
+    chmod 644 /etc/subuid /etc/subgid 2>/dev/null || true
 
     # Ensure Metadata Directories & Directory Permissions
-    mkdir -p /var/lock /var/tmp /run /workspace
-    chmod 1777 /var/lock /var/tmp /run
+    mkdir -p /var/lock /var/tmp /run /workspace /run/containers /var/lib/containers
+    chmod 1777 /var/lock /var/tmp /run /run/containers
     chmod 700 /root 2>/dev/null || true
 
     # ==========================================
@@ -160,6 +161,14 @@ let
             echo "''${TARGET_USER}::19733:0:99999:7:::" >> /etc/shadow
         fi
 
+        # Ensure target user has subuid and subgid entries
+        if [ -f /etc/subuid ] && ! grep -q "^''${TARGET_USER}:" /etc/subuid 2>/dev/null; then
+            echo "''${TARGET_USER}:100000:65536" >> /etc/subuid
+        fi
+        if [ -f /etc/subgid ] && ! grep -q "^''${TARGET_USER}:" /etc/subgid 2>/dev/null; then
+            echo "''${TARGET_USER}:100000:65536" >> /etc/subgid
+        fi
+
         # 3. Setup User Home Directory & Nix Defexpr
         USER_HOME=$(awk -F: -v u="$TARGET_USER" '$1 == u {print $6}' /etc/passwd)
         USER_HOME="''${USER_HOME:-/home/$TARGET_USER}"
@@ -178,6 +187,16 @@ let
         if [ -d /nix/var/nix ]; then
             chown -R "$TARGET_UID:$TARGET_GID" /nix/var/nix 2>/dev/null || true
         fi
+    fi
+
+    # Ensure /etc/subuid and /etc/subgid exist for root
+    if [ ! -f /etc/subuid ]; then
+        echo "root:100000:65536" > /etc/subuid
+        chmod 644 /etc/subuid
+    fi
+    if [ ! -f /etc/subgid ]; then
+        echo "root:100000:65536" > /etc/subgid
+        chmod 644 /etc/subgid
     fi
 
     ${sshEntrypointSnippet}

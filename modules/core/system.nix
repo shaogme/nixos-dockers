@@ -14,6 +14,43 @@ let
     wheel:x:998:${config.system.defaultUser}
   '';
 
+  subuid = pkgs.writeTextDir "etc/subuid" ''
+    root:100000:65536
+    ${config.system.defaultUser}:100000:65536
+  '';
+
+  subgid = pkgs.writeTextDir "etc/subgid" ''
+    root:100000:65536
+    ${config.system.defaultUser}:100000:65536
+  '';
+
+  containersPolicy = pkgs.writeTextDir "etc/containers/policy.json" ''
+    {
+      "default": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ]
+    }
+  '';
+
+  containersStorage = pkgs.writeTextDir "etc/containers/storage.conf" ''
+    [storage]
+    driver = "overlay"
+    runroot = "/run/containers/storage"
+    graphroot = "/var/lib/containers/storage"
+
+    [storage.options]
+    pull_options = { enable_partial_images = "true", use_hard_links = "false", ostree_repos="" }
+
+    [storage.options.overlay]
+    mount_program = "/usr/bin/fuse-overlayfs"
+    mountopt = "nodev,metacopy=on"
+  '';
+
+  containersRegistries = pkgs.writeTextDir "etc/containers/registries.conf" ''
+    unqualified-search-registries = ["docker.io", "quay.io"]
+  '';
 
   sshdConfig = pkgs.writeTextDir "etc/ssh/sshd_config" ''
     PermitRootLogin yes
@@ -62,6 +99,11 @@ let
   systemConfigFiles = [
     passwd
     group
+    subuid
+    subgid
+    containersPolicy
+    containersStorage
+    containersRegistries
     nsswitchConf
     nixConf
     etcEnvironment
@@ -137,9 +179,10 @@ in
       chmod 1777 tmp
       chmod 777 workspace
       
-      mkdir -p run var/lock var/tmp
+      mkdir -p run var/lock var/tmp run/containers var/lib/containers
       chmod 1777 var/lock
       chmod 1777 var/tmp
+      chmod 1777 run/containers
       
       ${sshExtraCommands}
 
@@ -215,6 +258,17 @@ in
       # 9. Setup Nix Search Path & Defexpr for root
       mkdir -p root/.nix-defexpr
       ln -sf ${pkgs.path} root/.nix-defexpr/nixpkgs
+
+      # 10. Container & UID Mapping Tools (Podman support)
+      # Copy binaries so SUID bit can be applied in fakeRootCommands
+      cp -L ${pkgs.shadow}/bin/newuidmap usr/bin/newuidmap
+      cp -L ${pkgs.shadow}/bin/newgidmap usr/bin/newgidmap
+      ln -sf /usr/bin/newuidmap bin/newuidmap
+      ln -sf /usr/bin/newgidmap bin/newgidmap
+      ln -sf ${pkgs.fuse-overlayfs}/bin/fuse-overlayfs usr/bin/fuse-overlayfs
+      ln -sf ${pkgs.fuse-overlayfs}/bin/fuse-overlayfs bin/fuse-overlayfs
+      ln -sf ${pkgs.slirp4netns}/bin/slirp4netns usr/bin/slirp4netns
+      ln -sf ${pkgs.slirp4netns}/bin/slirp4netns bin/slirp4netns
     '';
 
     docker.fakeRootCommands = ''
@@ -224,6 +278,14 @@ in
       fi
       if [ -d "$target_home" ]; then
         chown -R ${toString config.system.defaultUid}:${toString config.system.defaultGid} "$target_home"
+      fi
+
+      # Set SUID bit on newuidmap and newgidmap for rootless container execution
+      if [ -f usr/bin/newuidmap ]; then
+        chmod 4755 usr/bin/newuidmap
+      fi
+      if [ -f usr/bin/newgidmap ]; then
+        chmod 4755 usr/bin/newgidmap
       fi
     '';
   };
