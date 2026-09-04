@@ -26,7 +26,8 @@ services:
       # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
       - rust-target:/workspace/target
       # Persist Cargo dependencies, crate index, and git checkouts
-      - cargo-cache:${CONTAINER_HOME:-/home/dev}/.cargo
+      - cargo-registry:${CONTAINER_HOME:-/home/dev}/.cargo/registry
+      - cargo-git:${CONTAINER_HOME:-/home/dev}/.cargo/git
       # Persist direnv data
       - direnv-data:${CONTAINER_HOME:-/home/dev}/.local/share/direnv
       # Persist codex configuration
@@ -37,7 +38,8 @@ services:
 
 volumes:
   rust-target:
-  cargo-cache:
+  cargo-registry:
+  cargo-git:
   mise-cache:
   direnv-data:
   codex-config:
