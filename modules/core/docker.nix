@@ -53,7 +53,7 @@ let
       if [ "$TARGET_USER" != "root" ]; then
           export HOME="$USER_HOME"
           export USER="$TARGET_USER"
-          exec ${pkgs.gosu}/bin/gosu "$TARGET_USER" /bin/bash -i
+          exec ${pkgs.su-exec}/bin/su-exec "$TARGET_USER" /bin/bash -i
       else
           exec /bin/bash -i
       fi
@@ -198,7 +198,7 @@ let
         elif [ "$TARGET_USER" != "root" ]; then
             export HOME="$USER_HOME"
             export USER="$TARGET_USER"
-            exec ${pkgs.gosu}/bin/gosu "$TARGET_USER" "$@"
+            exec ${pkgs.su-exec}/bin/su-exec "$TARGET_USER" "$@"
         else
             exec "$@"
         fi

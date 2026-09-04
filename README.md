@@ -11,7 +11,7 @@
 - **VS Code 优化**:
   - 内置 `nix-ld` 支持，完美运行 VS Code Server 及其各类扩展（如 Copilot）。
   - 遵循 FHS 标准的软链接，解决非 Nix 二进制程序的依赖问题。
-- **自适应 UID/GID 映射**: 挂载宿主机目录时自动探测或支持通过 `HOST_UID:HOST_GID` 动态匹配宿主机用户权限，使用 `gosu` 切换至匹配的本地普通用户（`dev`），彻底解决容器构建产物与宿主机权限冲突问题。
+- **自适应 UID/GID 映射**: 挂载宿主机目录时自动探测或支持通过 `HOST_UID:HOST_GID` 动态匹配宿主机用户权限，使用 `su-exec` 切换至匹配的本地普通用户（`dev`），彻底解决容器构建产物与宿主机权限冲突问题。
 - **开箱即用**:
   - 内置 SSH 服务，支持远程连接。
   - 包含 `direnv` 和 `nix-direnv`，实现项目环境自动切换。
@@ -120,7 +120,7 @@ services:
 2. **自适应 UID/GID 探测与映射**：
    - **环境变量输入**：支持通过 `HOST_UID:HOST_GID`（例如 `-e HOST_UID=$(id -u):$(id -g)`）或分别传入 `HOST_UID`、`HOST_GID`。
    - **运行时智能探测**：若未显式指定 `HOST_UID`，启动时自动检测挂载工作区（`/workspace`）的所有者 UID/GID。若属于非 root 宿主机用户，将自动匹配其 UID/GID。
-   - **动态调整本地普通用户**：启动时动态调整容器内普通用户（默认 `dev`）的 UID/GID，自动创建与配置 `$HOME`、`~/.nix-defexpr` 与 Nix 状态目录权限，并通过 `gosu` 切换至该用户执行后续操作，确保生成的构建产物权限与宿主机保持完全一致。
+   - **动态调整本地普通用户**：启动时动态调整容器内普通用户（默认 `dev`）的 UID/GID，自动创建与配置 `$HOME`、`~/.nix-defexpr` 与 Nix 状态目录权限，并通过 `su-exec` 切换至该用户执行后续操作，确保生成的构建产物权限与宿主机保持完全一致。
    - **root 权限安全封闭**：`/root` 目录默认保持严格的 `700` 私有权限，敏感文件对普通用户完全隔离不可见。
    - **root 运行控制**：若需要以 root 权限运行，传入 `HOST_UID=0` 或 `RUN_AS_ROOT=1` 即可。
 3. **SSH 自动初始化**（当 `services.openssh.enable = true` 时）：
@@ -128,9 +128,9 @@ services:
    - 公钥注入：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/root/.ssh/authorized_keys` 与 `/home/dev/.ssh/authorized_keys`。
    - 环境变量导出：将容器环境变量写入 `/root/.ssh/environment` 与普通用户对应目录，确保通过 SSH 登录时环境变量不丢失。
 4. **服务与命令分发**：
-   - 带有参数时：非 root 用户通过 `gosu` 切换权限执行传入命令（`exec gosu $TARGET_USER "$@"`，若显式启动 sshd 则保持 root 权限）。
+   - 带有参数时：非 root 用户通过 `su-exec` 切换权限执行传入命令（`exec su-exec $TARGET_USER "$@"`，若显式启动 sshd 则保持 root 权限）。
    - 无参数且启用 SSH 时：默认前台以 root 启动 `sshd -D -e`（支持多用户登录）。
-   - 无参数且未启用 SSH 时：默认启动交互式 Bash（非 root 用户通过 `gosu` 切换至对应本地用户）。
+   - 无参数且未启用 SSH 时：默认启动交互式 Bash（非 root 用户通过 `su-exec` 切换至对应本地用户）。
 
 ### 编写自定义 Dockerfile 示例
 

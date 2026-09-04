@@ -234,10 +234,10 @@ in
       cp ${config.environment.bashWrapper} bin/bash
       chmod +x bin/bash
 
-      # 7. Setup /usr/bin/env & Gosu
+      # 7. Setup /usr/bin/env & su-exec
       ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
-      ln -sf ${pkgs.gosu}/bin/gosu usr/bin/gosu
-      ln -sf ${pkgs.gosu}/bin/gosu bin/gosu
+      ln -sf ${pkgs.su-exec}/bin/su-exec usr/bin/su-exec
+      ln -sf ${pkgs.su-exec}/bin/su-exec bin/su-exec
       
       # 8. Common Tools Symlinks
       ln -sf ${pkgs.procps}/bin/pgrep usr/bin/pgrep

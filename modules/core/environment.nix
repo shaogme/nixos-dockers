@@ -75,7 +75,7 @@ in
 
   config = {
     environment.systemPackages = [
-      pkgs.gosu
+      pkgs.su-exec
       pkgs.shadow
       pkgs.fuse-overlayfs
       pkgs.slirp4netns
