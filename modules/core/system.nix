@@ -160,8 +160,6 @@ in
       ln -sf ${pkgs.path} home/${config.system.defaultUser}/.nix-defexpr/nixpkgs
       mkdir -p root
       chmod 700 root
-      # Backward compatibility symlink
-      ln -sf /workspace root/workspace
 
       # 4. Multi-user / Non-root Nix profile directories
       mkdir -p nix/var/nix/profiles/per-user nix/var/nix/gcroots/per-user
