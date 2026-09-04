@@ -2,13 +2,22 @@
 let
   passwd = pkgs.writeTextDir "etc/passwd" ''
     root:x:0:0:System Administrator:/root:/bin/bash
+    ${config.system.defaultUser}:x:${toString config.system.defaultUid}:${toString config.system.defaultGid}:Developer:/home/${config.system.defaultUser}:/bin/bash
     ${lib.optionalString config.services.openssh.enable "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin\n"}
   '';
 
   group = pkgs.writeTextDir "etc/group" ''
     root:x:0:
+    ${config.system.defaultUser}:x:${toString config.system.defaultGid}:
     ${lib.optionalString config.services.openssh.enable "sshd:x:74:\n"}
     nixbld:x:30000:
+    wheel:x:998:${config.system.defaultUser}
+  '';
+
+  sudoers = pkgs.writeTextDir "etc/sudoers" ''
+    root ALL=(ALL:ALL) ALL
+    %wheel ALL=(ALL:ALL) NOPASSWD: ALL
+    ${config.system.defaultUser} ALL=(ALL:ALL) NOPASSWD: ALL
   '';
 
   sshdConfig = pkgs.writeTextDir "etc/ssh/sshd_config" ''
@@ -43,6 +52,7 @@ let
     build-users-group =
     experimental-features = nix-command flakes
     filter-syscalls = false
+    trusted-users = root ${config.system.defaultUser}
   '';
 
   etcEnvironment = pkgs.writeTextDir "etc/environment" ''
@@ -57,6 +67,7 @@ let
   systemConfigFiles = [
     passwd
     group
+    sudoers
     nsswitchConf
     nixConf
     etcEnvironment
@@ -70,9 +81,11 @@ let
   shadowContent =
     if config.services.openssh.enable then ''
       root::19733:0:99999:7:::
+      ${config.system.defaultUser}::19733:0:99999:7:::
       sshd:*:19733:0:99999:7:::
     '' else ''
       root::19733:0:99999:7:::
+      ${config.system.defaultUser}::19733:0:99999:7:::
     '';
 
   sshExtraCommands = lib.optionalString config.services.openssh.enable ''
@@ -97,6 +110,24 @@ in
   };
 
   options.system = {
+    defaultUser = lib.mkOption {
+      type = lib.types.str;
+      default = "dev";
+      description = "Default non-root user name for container operations.";
+    };
+
+    defaultUid = lib.mkOption {
+      type = lib.types.int;
+      default = 1000;
+      description = "Default UID for the non-root user.";
+    };
+
+    defaultGid = lib.mkOption {
+      type = lib.types.int;
+      default = 1000;
+      description = "Default GID for the non-root user.";
+    };
+
     configFiles = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = systemConfigFiles;
@@ -108,8 +139,9 @@ in
     docker.extraContents = config.system.configFiles;
     docker.extraCommands = ''
       # 1. Base System Directories
-      mkdir -p tmp
+      mkdir -p tmp workspace
       chmod 1777 tmp
+      chmod 777 workspace
       
       mkdir -p run var/lock var/tmp
       chmod 1777 var/lock
@@ -117,12 +149,28 @@ in
       
       ${sshExtraCommands}
 
-      # 2. Generate /etc/shadow
+      # 2. Generate /etc/shadow and /etc/sudoers
       cat > etc/shadow <<EOF
       ${shadowContent}EOF
       chmod 600 etc/shadow
-      
-      # 3. FHS Compatibility (Required for VS Code Server, Mise unpatched binaries, etc.)
+
+      if [ -f etc/sudoers ]; then
+        chmod 440 etc/sudoers
+      fi
+
+      # 3. Non-Root User Setup & Defexpr
+      mkdir -p home/${config.system.defaultUser}/.nix-defexpr
+      ln -sf ${pkgs.path} home/${config.system.defaultUser}/.nix-defexpr/nixpkgs
+      chown -R ${toString config.system.defaultUid}:${toString config.system.defaultGid} home/${config.system.defaultUser}
+      chmod 700 root
+      # Backward compatibility symlink
+      ln -sf /workspace root/workspace
+
+      # 4. Multi-user / Non-root Nix profile directories
+      mkdir -p nix/var/nix/profiles/per-user nix/var/nix/gcroots/per-user
+      chmod 1777 nix/var/nix/profiles/per-user nix/var/nix/gcroots/per-user
+
+      # 5. FHS Compatibility (Required for VS Code Server, Mise unpatched binaries, etc.)
       mkdir -p lib lib64 usr/lib64 usr/lib usr/bin usr/lib/x86_64-linux-gnu usr/lib/aarch64-linux-gnu
 
       # Link Dynamic Linker (ld-linux) to nix-ld for unpatched FHS binary support (AMD64 & ARM64)
@@ -145,15 +193,17 @@ in
         ln -sf /usr/lib/$lib usr/lib/aarch64-linux-gnu/$lib
       done
       
-      # 4. Bash Wrapper
+      # 6. Bash Wrapper
       rm -f bin/bash
       cp ${config.environment.bashWrapper} bin/bash
       chmod +x bin/bash
 
-      # 5. Setup /usr/bin/env
+      # 7. Setup /usr/bin/env & Gosu
       ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
+      ln -sf ${pkgs.gosu}/bin/gosu usr/bin/gosu
+      ln -sf ${pkgs.gosu}/bin/gosu bin/gosu
       
-      # 6. Common Tools Symlinks
+      # 8. Common Tools Symlinks
       ln -sf ${pkgs.procps}/bin/pgrep usr/bin/pgrep
       ln -sf ${pkgs.procps}/bin/pkill usr/bin/pkill
       ln -sf ${pkgs.procps}/bin/ps usr/bin/ps
@@ -167,7 +217,7 @@ in
       ln -sf ${pkgs.git}/bin/git usr/bin/git
       ln -sf ${pkgs.gh}/bin/gh usr/bin/gh
 
-      # 7. Setup Nix Search Path & Defexpr
+      # 9. Setup Nix Search Path & Defexpr for root
       mkdir -p root/.nix-defexpr
       ln -sf ${pkgs.path} root/.nix-defexpr/nixpkgs
     '';

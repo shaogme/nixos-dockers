@@ -14,7 +14,13 @@ let
     export NIX_LD_LIBRARY_PATH="${nixLdLibPath}:/usr/lib:/usr/lib64"
     export NIX_LD="${nixLd}"
     export LD_LIBRARY_PATH="${nixLdLibPath}:/usr/lib:/usr/lib64"
-    export PATH=$PATH:/usr/bin:/bin
+    export PATH=$PATH:/usr/local/bin:/usr/bin:/bin
+    if [ -n "$HOME" ] && [ -d "$HOME/.nix-profile/bin" ]; then
+      export PATH="$HOME/.nix-profile/bin:$PATH"
+    fi
+    if [ -z "$USER" ]; then
+      export USER="$(id -un 2>/dev/null || echo "dev")"
+    fi
     ${exportLines}
     exec ${pkgs.bashInteractive}/bin/bash "$@"
   '';
@@ -62,6 +68,9 @@ in
   };
 
   config = {
+    environment.systemPackages = [
+      pkgs.gosu
+    ];
     environment.variables = {
       NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       NIX_PATH = "nixpkgs=${pkgs.path}";

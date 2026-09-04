@@ -129,9 +129,9 @@ images/mise/example/
 
 参考 [`entrypoint.sh`](file:///d:/Documents/GitHub/nixos-dockers/images/mise/example/entrypoint.sh)：
 
-1. **工作区目录探测**：自动定位到 `/root/workspace`。
+1. **工作区目录探测**：自动定位到 `/workspace`。
 2. **多层级配置探测**：按优先级依次检测 `mise.local.toml`、`mise.toml`、`mise/config.toml`、`.mise/config.toml`、`.mise/conf.d/*.toml`、`.config/mise.toml`、`.config/mise/config.toml`、`.config/mise/conf.d/*.toml`。
-3. **Shell Hook 自动注入**：向 `/root/.bashrc` 写入 `eval "$(mise activate bash)"`，使得进入终端或 VS Code 新建终端会话时自动激活当前目录的 mise 工具与环境变量。
+3. **Shell Hook 自动注入**：向 `/root/.bashrc` 与 `/home/*/.bashrc` 写入 `eval "$(mise activate bash)"`，使得进入终端或 VS Code 新建终端会话时自动激活当前目录的 mise 工具与环境变量。
 4. **动态环境初始化与环境变量同步**：
    - 自动执行 `mise trust --all` 授权配置。
    - 运行 `mise install` 确保运行时新挂载的配置依赖已安装。
@@ -152,7 +152,7 @@ images/mise/example/
   - `MISE_YES=1`：全局非交互模式，避免 CLI 提示阻塞。
   - `security_opt: [seccomp:unconfined]` 与 `cap_add: [SYS_ADMIN, SYS_PTRACE, NET_ADMIN]`：为系统调试（如 gdb/lldb/strace）、网络工具与容器内沙箱（bubblewrap）提供必需的内核能力。
 - **开发模式 (`dev`)**：
-  - 挂载本地代码：`.:/root/workspace`，代码修改即时生效。
+  - 挂载本地代码：`.:/workspace`，代码修改即时生效。
   - 默认启动项：直接运行 `docker compose up -d` 即可进入开发。
 - **独立模式 (`standalone`)**：
   - 使用镜像内 `COPY` 的文件运行，无需主机挂载，适合离线分发或自动化测试验证。

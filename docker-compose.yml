@@ -6,6 +6,8 @@ services:
       - ROOT_PASSWORD=root # Set your secure password here
       - MISE_YES=1 # Non-interactive mode for mise
       - CARGO_INCREMENTAL=1 # Enable incremental compilation for Rust builds
+      - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
+      - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
     security_opt:
       - seccomp:unconfined # Required for some low-level operations
     cap_add:
@@ -20,18 +22,18 @@ services:
     container_name: nixos-dockers-dev
     volumes:
       # Mount host source code
-      - .:/root/workspace
+      - .:/workspace
       # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
-      - rust-target:/root/workspace/target
+      - rust-target:/workspace/target
       # Persist Cargo dependencies, crate index, and git checkouts
-      - cargo-cache:/root/.cargo
+      - cargo-cache:${CONTAINER_HOME:-/home/dev}/.cargo
       # Persist direnv data
-      - direnv-data:/root/.local/share/direnv
+      - direnv-data:${CONTAINER_HOME:-/home/dev}/.local/share/direnv
       # Persist codex configuration
-      - codex-config:/root/.codex
-      - gemini-config:/root/.gemini
-      - opencode-config:/root/.config/opencode
-      - claude-config:/root/.claude
+      - codex-config:${CONTAINER_HOME:-/home/dev}/.codex
+      - gemini-config:${CONTAINER_HOME:-/home/dev}/.gemini
+      - opencode-config:${CONTAINER_HOME:-/home/dev}/.config/opencode
+      - claude-config:${CONTAINER_HOME:-/home/dev}/.claude
 
 volumes:
   rust-target:

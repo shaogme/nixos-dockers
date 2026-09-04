@@ -1,7 +1,7 @@
 ARG BASE_IMAGE=ghcr.io/shaogme/nixos-dockers/mise:latest
 FROM ${BASE_IMAGE}
 
-WORKDIR /root/workspace
+WORKDIR /workspace
 
 # Copy custom entrypoint for automatic mise environment loading
 COPY entrypoint.sh /usr/local/bin/mise-entrypoint.sh
@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/root/.cache/nix \
 ENV PATH=/root/.nix-profile/bin:$PATH
 
 # Copy workspace / config files into container for pre-installation
-COPY . /root/workspace/
+COPY . /workspace/
 
 # Detect mise configuration at build time and pre-install tools with cache mount
 RUN --mount=type=cache,target=/root/.cache/mise \

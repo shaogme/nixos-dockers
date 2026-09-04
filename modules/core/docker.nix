@@ -17,6 +17,15 @@ let
             chmod 700 /root/.ssh
             chmod 600 /root/.ssh/authorized_keys
         fi
+        if [ "$TARGET_USER" != "root" ] && [ -n "$USER_HOME" ]; then
+            mkdir -p "$USER_HOME/.ssh"
+            if [ ! -f "$USER_HOME/.ssh/authorized_keys" ]; then
+                cp /tmp/id_ed25519.pub "$USER_HOME/.ssh/authorized_keys"
+                chmod 700 "$USER_HOME/.ssh"
+                chmod 600 "$USER_HOME/.ssh/authorized_keys"
+            fi
+            chown -R "$TARGET_UID:$TARGET_GID" "$USER_HOME/.ssh"
+        fi
     fi
 
     # Ensure SSH Directories
@@ -24,8 +33,16 @@ let
     chmod 755 /var/empty/sshd
 
     # Export Environment for SSH Sessions
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
     env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
     chmod 600 /root/.ssh/environment
+    if [ "$TARGET_USER" != "root" ] && [ -n "$USER_HOME" ]; then
+        mkdir -p "$USER_HOME/.ssh"
+        cp /root/.ssh/environment "$USER_HOME/.ssh/environment" 2>/dev/null || true
+        chmod 600 "$USER_HOME/.ssh/environment" 2>/dev/null || true
+        chown -R "$TARGET_UID:$TARGET_GID" "$USER_HOME/.ssh" 2>/dev/null || true
+    fi
   '';
 
   defaultCmd =
@@ -33,7 +50,13 @@ let
       echo "Starting SSH server..."
       exec /bin/sshd -D -e
     '' else ''
-      exec /bin/bash -i
+      if [ "$TARGET_USER" != "root" ]; then
+          export HOME="$USER_HOME"
+          export USER="$TARGET_USER"
+          exec ${pkgs.gosu}/bin/gosu "$TARGET_USER" /bin/bash -i
+      else
+          exec /bin/bash -i
+      fi
     '';
 
   generatedEntrypoint = pkgs.writeScriptBin "entrypoint.sh" ''
@@ -45,28 +68,130 @@ let
     # ==========================================
 
     # Fix Permissions for Config Files (Symlink Handling)
-    for file in /etc/passwd /etc/group; do
+    for file in /etc/passwd /etc/group /etc/shadow; do
         if [ -L "$file" ] || [ ! -w "$file" ]; then
             cp --remove-destination "$(readlink -f "$file")" "$file"
-            chmod 644 "$file"
         fi
     done
-
-    # Shadow is created via extraCommands so it should be a file, but ensuring permissions is safe.
-    if [ -L "/etc/shadow" ]; then
-        cp --remove-destination "$(readlink -f /etc/shadow)" /etc/shadow
-    fi
+    chmod 644 /etc/passwd /etc/group
     chmod 600 /etc/shadow
 
-    # Ensure Metadata Directories
-    mkdir -p /var/lock /var/tmp /run
-    chmod 1777 /var/lock /var/tmp
+    # Ensure Metadata Directories & Directory Permissions
+    mkdir -p /var/lock /var/tmp /run /workspace
+    chmod 1777 /var/lock /var/tmp /run
+    chmod 700 /root 2>/dev/null || true
+
+    # ==========================================
+    # Adaptive UID/GID Resolution
+    # ==========================================
+    TARGET_UID=""
+    TARGET_GID=""
+
+    # 1. Parse from HOST_UID / HOST_GID environment variables
+    # Supports formats:
+    #   HOST_UID="1000:1000"
+    #   HOST_UID="1000" HOST_GID="1000"
+    if [ -n "$HOST_UID" ]; then
+        if [[ "$HOST_UID" == *:* ]]; then
+            TARGET_UID="''${HOST_UID%%:*}"
+            TARGET_GID="''${HOST_UID##*:}"
+        else
+            TARGET_UID="$HOST_UID"
+            TARGET_GID="''${HOST_GID:-$HOST_UID}"
+        fi
+    elif [ -n "$HOST_GID" ]; then
+        TARGET_GID="$HOST_GID"
+    fi
+
+    # 2. Runtime user mapping probe from workspace directory if not explicitly set
+    WORKSPACE_DIR="''${WORKSPACE:-''${WORKSPACE_DIR:-${config.docker.workingDir}}}"
+    if [ -z "$TARGET_UID" ] && [ "${if config.docker.autoUserMapping then "1" else "0"}" = "1" ] && [ "$RUN_AS_ROOT" != "1" ]; then
+        if [ -d "$WORKSPACE_DIR" ]; then
+            PROBED_UID=$(stat -c '%u' "$WORKSPACE_DIR" 2>/dev/null || echo 0)
+            PROBED_GID=$(stat -c '%g' "$WORKSPACE_DIR" 2>/dev/null || echo 0)
+            if [ "$PROBED_UID" -gt 0 ] 2>/dev/null; then
+                TARGET_UID="$PROBED_UID"
+                TARGET_GID="''${TARGET_GID:-$PROBED_GID}"
+            fi
+        fi
+    fi
+
+    # Fallback to 0 (root) if still undetermined or RUN_AS_ROOT=1
+    TARGET_UID="''${TARGET_UID:-0}"
+    TARGET_GID="''${TARGET_GID:-$TARGET_UID}"
+
+    # ==========================================
+    # User & Group Mapping Adjustment
+    # ==========================================
+    DEFAULT_USER="${config.docker.defaultUser}"
+    TARGET_USER="root"
+    USER_HOME="/root"
+
+    if [ "$TARGET_UID" -ne 0 ]; then
+        # 1. Ensure target GID exists in /etc/group
+        EXISTING_GROUP=$(awk -F: -v gid="$TARGET_GID" '$3 == gid {print $1; exit}' /etc/group)
+        if [ -z "$EXISTING_GROUP" ]; then
+            if grep -q "^''${DEFAULT_USER}:" /etc/group; then
+                sed -i "s|^''${DEFAULT_USER}:x:[0-9]*:|''${DEFAULT_USER}:x:''${TARGET_GID}:|" /etc/group
+            else
+                echo "''${DEFAULT_USER}:x:''${TARGET_GID}:" >> /etc/group
+            fi
+            TARGET_GROUP="''${DEFAULT_USER}"
+        else
+            TARGET_GROUP="$EXISTING_GROUP"
+        fi
+
+        # 2. Ensure target UID exists in /etc/passwd
+        EXISTING_USER=$(awk -F: -v uid="$TARGET_UID" '$3 == uid {print $1; exit}' /etc/passwd)
+        if [ -n "$EXISTING_USER" ]; then
+            TARGET_USER="$EXISTING_USER"
+            sed -i "s|^''${TARGET_USER}:x:''${TARGET_UID}:[0-9]*:|''${TARGET_USER}:x:''${TARGET_UID}:''${TARGET_GID}:|" /etc/passwd
+        else
+            if grep -q "^''${DEFAULT_USER}:" /etc/passwd; then
+                sed -i "s|^''${DEFAULT_USER}:x:[0-9]*:[0-9]*:|''${DEFAULT_USER}:x:''${TARGET_UID}:''${TARGET_GID}:|" /etc/passwd
+            else
+                echo "''${DEFAULT_USER}:x:''${TARGET_UID}:''${TARGET_GID}:Developer:/home/''${DEFAULT_USER}:/bin/bash" >> /etc/passwd
+            fi
+            TARGET_USER="''${DEFAULT_USER}"
+        fi
+
+        # Ensure user is in shadow
+        if ! grep -q "^''${TARGET_USER}:" /etc/shadow 2>/dev/null; then
+            echo "''${TARGET_USER}::19733:0:99999:7:::" >> /etc/shadow
+        fi
+
+        # 3. Setup User Home Directory & Nix Defexpr
+        USER_HOME=$(awk -F: -v u="$TARGET_USER" '$1 == u {print $6}' /etc/passwd)
+        USER_HOME="''${USER_HOME:-/home/$TARGET_USER}"
+        mkdir -p "$USER_HOME"
+        if [ ! -d "$USER_HOME/.nix-defexpr" ]; then
+            mkdir -p "$USER_HOME/.nix-defexpr"
+            ln -sf "${pkgs.path}" "$USER_HOME/.nix-defexpr/nixpkgs"
+        fi
+        chown -R "$TARGET_UID:$TARGET_GID" "$USER_HOME"
+
+        # 4. Fix Workspace & Nix State Permissions for Non-Root User
+        if [ -d /workspace ]; then
+            chown "$TARGET_UID:$TARGET_GID" /workspace 2>/dev/null || true
+        fi
+        if [ -d /nix/var/nix ]; then
+            chown -R "$TARGET_UID:$TARGET_GID" /nix/var/nix 2>/dev/null || true
+        fi
+    fi
 
     ${sshEntrypointSnippet}
 
     # Execute Command or Start Default Service
     if [ $# -gt 0 ]; then
-        exec "$@"
+        if [ "$1" = "/bin/sshd" ] || [ "$1" = "sshd" ]; then
+            exec "$@"
+        elif [ "$TARGET_USER" != "root" ]; then
+            export HOME="$USER_HOME"
+            export USER="$TARGET_USER"
+            exec ${pkgs.gosu}/bin/gosu "$TARGET_USER" "$@"
+        else
+            exec "$@"
+        fi
     else
         ${defaultCmd}
     fi
@@ -127,8 +252,20 @@ in
 
     workingDir = lib.mkOption {
       type = lib.types.str;
-      default = "/root/workspace";
+      default = "/workspace";
       description = "Default working directory inside the container.";
+    };
+
+    defaultUser = lib.mkOption {
+      type = lib.types.str;
+      default = config.system.defaultUser;
+      description = "Default non-root user name for container operations.";
+    };
+
+    autoUserMapping = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Enable adaptive UID/GID mapping in entrypoint.sh based on HOST_UID/HOST_GID or mounted workspace permissions.";
     };
 
     exposedPorts = lib.mkOption {

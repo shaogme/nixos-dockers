@@ -7,6 +7,8 @@ services:
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
       - MISE_YES=1 # Non-interactive mode for mise
+      - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping
+      - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
     security_opt:
       - seccomp:unconfined # Required for some low-level operations
     cap_add:
@@ -20,15 +22,15 @@ services:
     <<: *app-base
     container_name: mise-dev
     volumes:
-      - .:/root/workspace
-      - codex-config:/root/.codex
+      - .:/workspace
+      - codex-config:${CONTAINER_HOME:-/home/dev}/.codex
 
   # Standalone mode: Uses code copied into the image (No host mounting)
   standalone:
     <<: *app-base
     container_name: mise-standalone
     volumes:
-      - codex-config:/root/.codex
+      - codex-config:${CONTAINER_HOME:-/home/dev}/.codex
     profiles:
       - standalone
 

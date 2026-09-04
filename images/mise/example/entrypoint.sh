@@ -5,7 +5,7 @@ set -e
 # Mise Development Container Entrypoint
 # ==========================================
 
-WORKSPACE="${WORKSPACE_DIR:-/root/workspace}"
+WORKSPACE="${WORKSPACE_DIR:-/workspace}"
 
 if [ -d "$WORKSPACE" ]; then
     cd "$WORKSPACE"
@@ -57,6 +57,13 @@ export MISE_YES=1
 if [ ! -f /root/.bashrc ] || ! grep -q "mise activate" /root/.bashrc; then
     echo 'eval "$(mise activate bash)"' >> /root/.bashrc
 fi
+for home_dir in /home/*; do
+    if [ -d "$home_dir" ]; then
+        if [ ! -f "$home_dir/.bashrc" ] || ! grep -q "mise activate" "$home_dir/.bashrc"; then
+            echo 'eval "$(mise activate bash)"' >> "$home_dir/.bashrc"
+        fi
+    fi
+done
 
 if [ $CONFIG_FOUND -eq 1 ]; then
     echo "[mise-entrypoint] Found mise config ($FOUND_PATH). Initializing environment..."
