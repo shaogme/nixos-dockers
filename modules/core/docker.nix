@@ -168,7 +168,8 @@ let
             mkdir -p "$USER_HOME/.nix-defexpr"
             ln -sf "${pkgs.path}" "$USER_HOME/.nix-defexpr/nixpkgs"
         fi
-        chown -R "$TARGET_UID:$TARGET_GID" "$USER_HOME"
+        chown "$TARGET_UID:$TARGET_GID" "$USER_HOME" 2>/dev/null || true
+        chown -h -R "$TARGET_UID:$TARGET_GID" "$USER_HOME/.nix-defexpr" 2>/dev/null || true
 
         # 4. Fix Workspace & Nix State Permissions for Non-Root User
         if [ -d /workspace ]; then
@@ -204,7 +205,7 @@ let
 
   validVars = lib.filterAttrs (_: v: v != null) config.environment.variables;
   envList = [
-    "PATH=/bin:/usr/bin:/usr/local/bin"
+    "PATH=/nix/var/nix/profiles/default/bin:/bin:/usr/bin:/usr/local/bin"
   ] ++ (lib.mapAttrsToList (name: value: "${name}=${toString value}") validVars);
 
   layeredImage = (pkgs.dockerTools.buildLayeredImage {
