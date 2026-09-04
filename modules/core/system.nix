@@ -14,11 +14,6 @@ let
     wheel:x:998:${config.system.defaultUser}
   '';
 
-  sudoers = pkgs.writeTextDir "etc/sudoers" ''
-    root ALL=(ALL:ALL) ALL
-    %wheel ALL=(ALL:ALL) NOPASSWD: ALL
-    ${config.system.defaultUser} ALL=(ALL:ALL) NOPASSWD: ALL
-  '';
 
   sshdConfig = pkgs.writeTextDir "etc/ssh/sshd_config" ''
     PermitRootLogin yes
@@ -67,7 +62,6 @@ let
   systemConfigFiles = [
     passwd
     group
-    sudoers
     nsswitchConf
     nixConf
     etcEnvironment
@@ -154,14 +148,18 @@ in
       ${shadowContent}EOF
       chmod 600 etc/shadow
 
-      if [ -f etc/sudoers ]; then
-        chmod 440 etc/sudoers
-      fi
+      cat > etc/sudoers <<EOF
+      root ALL=(ALL:ALL) ALL
+      %wheel ALL=(ALL:ALL) NOPASSWD: ALL
+      ${config.system.defaultUser} ALL=(ALL:ALL) NOPASSWD: ALL
+      EOF
+      chmod 440 etc/sudoers
 
       # 3. Non-Root User Setup & Defexpr
       mkdir -p home/${config.system.defaultUser}/.nix-defexpr
       ln -sf ${pkgs.path} home/${config.system.defaultUser}/.nix-defexpr/nixpkgs
       chown -R ${toString config.system.defaultUid}:${toString config.system.defaultGid} home/${config.system.defaultUser}
+      mkdir -p root
       chmod 700 root
       # Backward compatibility symlink
       ln -sf /workspace root/workspace
