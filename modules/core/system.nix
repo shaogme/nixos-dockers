@@ -56,6 +56,7 @@ let
     PermitRootLogin yes
     PasswordAuthentication yes
     PubkeyAuthentication yes
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
     UsePAM yes
     Port 22
     HostKey /etc/ssh/ssh_host_rsa_key
@@ -70,6 +71,7 @@ let
     auth       sufficient   pam_permit.so
     account    sufficient   pam_permit.so
     password   sufficient   pam_permit.so
+    session    required     pam_env.so
     session    sufficient   pam_permit.so
   '';
 
@@ -135,8 +137,8 @@ let
     mkdir -p root/.ssh
     chmod 700 root/.ssh
 
-    mkdir -p run var/run/sshd var/empty/sshd
-    chmod 755 var/empty/sshd
+    mkdir -p run var/run/sshd var/empty/sshd etc/ssh/authorized_keys
+    chmod 755 var/empty/sshd etc/ssh/authorized_keys
 
     if [ -f etc/pam.d/sshd ]; then
       cp etc/pam.d/sshd etc/pam.d/other

@@ -102,7 +102,7 @@ services:
 - **VS Code**: 安装 `Remote - SSH` 扩展，添加主机 `localhost:2222` 即可。
 
 > [!TIP]
-> **注入公钥**: 将本地公钥 `id_ed25519.pub` 挂载到容器内 `/tmp/id_ed25519.pub`，SSH 镜像启动时会自动将其添加到 `/root/.ssh/authorized_keys` 与 `/home/dev/.ssh/authorized_keys`。
+> **注入公钥**: 将本地公钥 `id_ed25519.pub` 挂载到容器内 `/tmp/id_ed25519.pub`，SSH 镜像启动时会自动将其配置为 `/etc/ssh/authorized_keys/%u`（同时支持 `root` 与 `dev` 等普通用户登录），无需污染与操作用户家目录。
 >
 > ```yaml
 > volumes:
@@ -126,8 +126,8 @@ services:
    - **root 运行控制**：若需要以 root 权限运行，传入 `HOST_UID=0` 或 `RUN_AS_ROOT=1` 即可。
 3. **SSH 自动初始化**（当 `services.openssh.enable = true` 时）：
    - 自动生成 SSH Host Key（若缺失）。
-   - 公钥注入：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/root/.ssh/authorized_keys` 与 `/home/dev/.ssh/authorized_keys`。
-   - 环境变量导出：将容器环境变量写入 `/root/.ssh/environment` 与普通用户对应目录，确保通过 SSH 登录时环境变量不丢失。
+   - 公钥注入：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/etc/ssh/authorized_keys/%u`，彻底解耦用户家目录与挂载卷。
+   - 环境变量导出：将容器环境变量写入 `/etc/environment`，确保通过 SSH 登录时系统环境变量不丢失，且无需写入用户家目录。
 4. **服务与命令分发**：
    - 带有参数时：非 root 用户通过 `su-exec` 切换权限执行传入命令（`exec su-exec $TARGET_USER "$@"`，若显式启动 sshd 则保持 root 权限）。
    - 无参数且启用 SSH 时：默认前台以 root 启动 `sshd -D -e`（支持多用户登录）。

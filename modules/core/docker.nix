@@ -11,38 +11,33 @@ let
 
     # Setup Authorized Keys from /tmp/id_ed25519.pub
     if [ -f "/tmp/id_ed25519.pub" ]; then
-        mkdir -p /root/.ssh
-        if [ ! -f /root/.ssh/authorized_keys ]; then
-            cp /tmp/id_ed25519.pub /root/.ssh/authorized_keys
-            chmod 700 /root/.ssh
-            chmod 600 /root/.ssh/authorized_keys
+        mkdir -p /etc/ssh/authorized_keys
+        chmod 755 /etc/ssh/authorized_keys
+        if [ ! -f /etc/ssh/authorized_keys/root ]; then
+            cp /tmp/id_ed25519.pub /etc/ssh/authorized_keys/root
+            chmod 644 /etc/ssh/authorized_keys/root
         fi
-        if [ "$TARGET_USER" != "root" ] && [ -n "$USER_HOME" ]; then
-            mkdir -p "$USER_HOME/.ssh"
-            if [ ! -f "$USER_HOME/.ssh/authorized_keys" ]; then
-                cp /tmp/id_ed25519.pub "$USER_HOME/.ssh/authorized_keys"
-                chmod 700 "$USER_HOME/.ssh"
-                chmod 600 "$USER_HOME/.ssh/authorized_keys"
+        if [ "$TARGET_USER" != "root" ]; then
+            if [ ! -f "/etc/ssh/authorized_keys/$TARGET_USER" ]; then
+                cp /tmp/id_ed25519.pub "/etc/ssh/authorized_keys/$TARGET_USER"
+                chmod 644 "/etc/ssh/authorized_keys/$TARGET_USER"
             fi
-            chown -R "$TARGET_UID:$TARGET_GID" "$USER_HOME/.ssh"
+        fi
+        if [ -n "$DEFAULT_USER" ] && [ "$DEFAULT_USER" != "$TARGET_USER" ]; then
+            if [ ! -f "/etc/ssh/authorized_keys/$DEFAULT_USER" ]; then
+                cp /tmp/id_ed25519.pub "/etc/ssh/authorized_keys/$DEFAULT_USER"
+                chmod 644 "/etc/ssh/authorized_keys/$DEFAULT_USER"
+            fi
         fi
     fi
 
     # Ensure SSH Directories
-    mkdir -p /var/run/sshd /var/empty/sshd
-    chmod 755 /var/empty/sshd
+    mkdir -p /var/run/sshd /var/empty/sshd /etc/ssh/authorized_keys
+    chmod 755 /var/empty/sshd /etc/ssh/authorized_keys
 
     # Export Environment for SSH Sessions
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
-    chmod 600 /root/.ssh/environment
-    if [ "$TARGET_USER" != "root" ] && [ -n "$USER_HOME" ]; then
-        mkdir -p "$USER_HOME/.ssh"
-        cp /root/.ssh/environment "$USER_HOME/.ssh/environment" 2>/dev/null || true
-        chmod 600 "$USER_HOME/.ssh/environment" 2>/dev/null || true
-        chown -R "$TARGET_UID:$TARGET_GID" "$USER_HOME/.ssh" 2>/dev/null || true
-    fi
+    env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /etc/environment || true
+    chmod 644 /etc/environment
   '';
 
   defaultCmd =
@@ -68,12 +63,12 @@ let
     # ==========================================
 
     # Fix Permissions for Config Files (Symlink Handling for dynamic user mapping)
-    for file in /etc/passwd /etc/group; do
+    for file in /etc/passwd /etc/group /etc/environment; do
         if [ -f "$file" ] && { [ -L "$file" ] || [ ! -w "$file" ]; }; then
             cp --remove-destination "$(readlink -f "$file")" "$file"
         fi
     done
-    chmod 644 /etc/passwd /etc/group 2>/dev/null || true
+    chmod 644 /etc/passwd /etc/group /etc/environment 2>/dev/null || true
 
     # Ensure Metadata Directories & Directory Permissions
     mkdir -p /var/lock /var/tmp /run /workspace /run/containers /var/lib/containers
