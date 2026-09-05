@@ -14,6 +14,7 @@
 - **自适应 UID/GID 映射**: 挂载宿主机目录时自动探测或支持通过 `HOST_UID:HOST_GID` 动态匹配宿主机用户权限，使用 `su-exec` 切换至匹配的本地普通用户（`dev`），彻底解决容器构建产物与宿主机权限冲突问题。
 - **开箱即用**:
   - 内置 SSH 服务，支持远程连接。
+  - 系统级 Git 安全目录：镜像制作时自动写入 `/etc/gitconfig`（默认将工作区 `/workspace` 设为 `safe.directory`），彻底解决宿主机挂载或跨用户操作时的 Git `dubious ownership` 权限告警。
   - 包含 `direnv` 和 `nix-direnv`，实现项目环境自动切换。
   - 集成常用开发工具（gcc, git, curl, vim 等）。
 - **自动化运维**:
@@ -181,6 +182,7 @@ exec /bin/entrypoint.sh "$@"
 - `nix-ld`: 动态链接器封装，自动为非 Nix 二进制程序寻找所需的 `.so` 文件。
 - `direnv`: 进入目录时自动加载 `shell.nix` 或 `flake.nix` 环境。
 - `bash-wrapper`: 确保在通过 SSH 登录或交互终端时，`LD_LIBRARY_PATH` 等环境变量不会丢失。
+- `/etc/gitconfig`: 构建期声明 Git `safe.directory`，保障容器工作区跨 UID/GID 权限时正常执行 Git 操作。
 
 ## 本地构建镜像
 

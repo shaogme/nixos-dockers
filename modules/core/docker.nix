@@ -239,6 +239,12 @@ in
       description = "Default working directory inside the container.";
     };
 
+    gitSafeDirectories = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ config.docker.workingDir ];
+      description = "List of directories to mark as Git safe directories in /etc/gitconfig.";
+    };
+
     defaultUser = lib.mkOption {
       type = lib.types.str;
       default = config.system.defaultUser;

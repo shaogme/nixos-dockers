@@ -96,6 +96,14 @@ let
     PATH=/bin:/usr/bin:/usr/local/bin
   '';
 
+  gitConfigContent =
+    if config.system.gitSafeDirectories != [ ] then
+      "[safe]\n" + (lib.concatMapStrings (dir: "\tdirectory = ${dir}\n") config.system.gitSafeDirectories)
+    else
+      "";
+
+  gitConfig = pkgs.writeTextDir "etc/gitconfig" gitConfigContent;
+
   systemConfigFiles = [
     passwd
     group
@@ -105,6 +113,7 @@ let
     nsswitchConf
     nixConf
     etcEnvironment
+    gitConfig
     pkgs.iana-etc
     pkgs.dockerTools.caCertificates
   ] ++ lib.optionals config.services.openssh.enable [
@@ -160,6 +169,12 @@ in
       type = lib.types.int;
       default = 1000;
       description = "Default GID for the non-root user.";
+    };
+
+    gitSafeDirectories = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = lib.unique ([ "/workspace" ] ++ config.docker.gitSafeDirectories);
+      description = "List of directories configured as safe.directory in /etc/gitconfig.";
     };
 
     configFiles = lib.mkOption {
