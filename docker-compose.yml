@@ -5,10 +5,8 @@ services:
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
       - MISE_YES=1 # Non-interactive mode for mise
-      - CARGO_INCREMENTAL=1 # Enable incremental compilation for Rust builds
       - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
       - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
-      - CARGO_INCREMENTAL=1 # Enable incremental compilation for Rust builds
     security_opt:
       - seccomp:unconfined # Required for some low-level operations
     cap_add:
@@ -24,20 +22,12 @@ services:
     volumes:
       # Mount host source code
       - .:/workspace
-      # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
-      - rust-target:/workspace/target
-      # Persist Cargo dependencies, crate index, and git checkouts
-      - cargo-registry:${CONTAINER_HOME:-/home/dev}/.cargo/registry
-      - cargo-git:${CONTAINER_HOME:-/home/dev}/.cargo/git
+      - /workspace/.git
       # Persist direnv data
       - direnv-data:/data/direnv
       # Persist unified AI credentials and tool configurations
       - coding-config:/data/coding-config
 
 volumes:
-  rust-target:
-  cargo-registry:
-  cargo-git:
-  mise-cache:
   direnv-data:
   coding-config:

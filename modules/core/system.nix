@@ -56,6 +56,7 @@ let
     PermitRootLogin yes
     PasswordAuthentication yes
     PubkeyAuthentication yes
+    AuthorizedKeysFile /etc/ssh/authorized_keys/%u
     UsePAM yes
     Port 22
     HostKey /etc/ssh/ssh_host_rsa_key
@@ -70,6 +71,7 @@ let
     auth       sufficient   pam_permit.so
     account    sufficient   pam_permit.so
     password   sufficient   pam_permit.so
+    session    required     pam_env.so
     session    sufficient   pam_permit.so
   '';
 
@@ -96,6 +98,14 @@ let
     PATH=/bin:/usr/bin:/usr/local/bin
   '';
 
+  gitConfigContent =
+    if config.system.gitSafeDirectories != [ ] then
+      "[safe]\n" + (lib.concatMapStrings (dir: "\tdirectory = ${dir}\n") config.system.gitSafeDirectories)
+    else
+      "";
+
+  gitConfig = pkgs.writeTextDir "etc/gitconfig" gitConfigContent;
+
   systemConfigFiles = [
     passwd
     group
@@ -105,6 +115,7 @@ let
     nsswitchConf
     nixConf
     etcEnvironment
+    gitConfig
     pkgs.iana-etc
     pkgs.dockerTools.caCertificates
   ] ++ lib.optionals config.services.openssh.enable [
@@ -126,8 +137,8 @@ let
     mkdir -p root/.ssh
     chmod 700 root/.ssh
 
-    mkdir -p run var/run/sshd var/empty/sshd
-    chmod 755 var/empty/sshd
+    mkdir -p run var/run/sshd var/empty/sshd etc/ssh/authorized_keys
+    chmod 755 var/empty/sshd etc/ssh/authorized_keys
 
     if [ -f etc/pam.d/sshd ]; then
       cp etc/pam.d/sshd etc/pam.d/other
@@ -160,6 +171,12 @@ in
       type = lib.types.int;
       default = 1000;
       description = "Default GID for the non-root user.";
+    };
+
+    gitSafeDirectories = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = lib.unique ([ "/workspace" ] ++ config.docker.gitSafeDirectories);
+      description = "List of directories configured as safe.directory in /etc/gitconfig.";
     };
 
     configFiles = lib.mkOption {

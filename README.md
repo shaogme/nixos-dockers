@@ -14,6 +14,7 @@
 - **自适应 UID/GID 映射**: 挂载宿主机目录时自动探测或支持通过 `HOST_UID:HOST_GID` 动态匹配宿主机用户权限，使用 `su-exec` 切换至匹配的本地普通用户（`dev`），彻底解决容器构建产物与宿主机权限冲突问题。
 - **开箱即用**:
   - 内置 SSH 服务，支持远程连接。
+  - 系统级 Git 安全目录：镜像制作时自动写入 `/etc/gitconfig`（默认将工作区 `/workspace` 设为 `safe.directory`），彻底解决宿主机挂载或跨用户操作时的 Git `dubious ownership` 权限告警。
   - 包含 `direnv` 和 `nix-direnv`，实现项目环境自动切换。
   - 集成常用开发工具（gcc, git, curl, vim 等）。
 - **自动化运维**:
@@ -101,7 +102,7 @@ services:
 - **VS Code**: 安装 `Remote - SSH` 扩展，添加主机 `localhost:2222` 即可。
 
 > [!TIP]
-> **注入公钥**: 将本地公钥 `id_ed25519.pub` 挂载到容器内 `/tmp/id_ed25519.pub`，SSH 镜像启动时会自动将其添加到 `/root/.ssh/authorized_keys` 与 `/home/dev/.ssh/authorized_keys`。
+> **注入公钥**: 将本地公钥 `id_ed25519.pub` 挂载到容器内 `/tmp/id_ed25519.pub`，SSH 镜像启动时会自动将其配置为 `/etc/ssh/authorized_keys/%u`（同时支持 `root` 与 `dev` 等普通用户登录），无需污染与操作用户家目录。
 >
 > ```yaml
 > volumes:
@@ -125,8 +126,8 @@ services:
    - **root 运行控制**：若需要以 root 权限运行，传入 `HOST_UID=0` 或 `RUN_AS_ROOT=1` 即可。
 3. **SSH 自动初始化**（当 `services.openssh.enable = true` 时）：
    - 自动生成 SSH Host Key（若缺失）。
-   - 公钥注入：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/root/.ssh/authorized_keys` 与 `/home/dev/.ssh/authorized_keys`。
-   - 环境变量导出：将容器环境变量写入 `/root/.ssh/environment` 与普通用户对应目录，确保通过 SSH 登录时环境变量不丢失。
+   - 公钥注入：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/etc/ssh/authorized_keys/%u`，彻底解耦用户家目录与挂载卷。
+   - 环境变量导出：将容器环境变量写入 `/etc/environment`，确保通过 SSH 登录时系统环境变量不丢失，且无需写入用户家目录。
 4. **服务与命令分发**：
    - 带有参数时：非 root 用户通过 `su-exec` 切换权限执行传入命令（`exec su-exec $TARGET_USER "$@"`，若显式启动 sshd 则保持 root 权限）。
    - 无参数且启用 SSH 时：默认前台以 root 启动 `sshd -D -e`（支持多用户登录）。
@@ -181,6 +182,7 @@ exec /bin/entrypoint.sh "$@"
 - `nix-ld`: 动态链接器封装，自动为非 Nix 二进制程序寻找所需的 `.so` 文件。
 - `direnv`: 进入目录时自动加载 `shell.nix` 或 `flake.nix` 环境。
 - `bash-wrapper`: 确保在通过 SSH 登录或交互终端时，`LD_LIBRARY_PATH` 等环境变量不会丢失。
+- `/etc/gitconfig`: 构建期声明 Git `safe.directory`，保障容器工作区跨 UID/GID 权限时正常执行 Git 操作。
 
 ## 本地构建镜像
 
