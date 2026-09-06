@@ -4,7 +4,7 @@ services:
     image: ghcr.io/shaogme/coding-images/npins-common:latest
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
-      - MISE_YES=1 # Non-interactive mode for mise
+      - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
       - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
       - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
     security_opt:
@@ -23,11 +23,11 @@ services:
       # Mount host source code
       - .:/workspace
       - /workspace/.git
-      # Persist direnv data
-      - direnv-data:/data/direnv
+      # Persist devbox data
+      - devbox-data:/data/devbox
       # Persist unified AI credentials and tool configurations
       - coding-config:/data/coding-config
 
 volumes:
-  direnv-data:
+  devbox-data:
   coding-config:
