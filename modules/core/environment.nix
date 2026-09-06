@@ -25,8 +25,8 @@ let
       export USER="$(id -un 2>/dev/null || echo "dev")"
     fi
     ${exportLines}
-    if [ -f /etc/bash.bashrc ]; then
-      . /etc/bash.bashrc
+    if [ -f /etc/bashrc ]; then
+      . /etc/bashrc
     fi
     exec ${pkgs.bashInteractive}/bin/bash "$@"
   '';
