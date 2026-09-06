@@ -148,7 +148,9 @@ let
         chown -h -R "$TARGET_UID:$TARGET_GID" "$USER_HOME/.nix-defexpr" 2>/dev/null || true
 
         # 4. Fix Workspace & Nix State Permissions for Non-Root User
-        if [ -d /workspace ]; then
+        # NOTE: Do NOT chown /workspace by default to avoid corrupting host directory permissions
+        # (especially in rootless Podman / Docker user namespaces where container UID != host UID).
+        if [ "''${CHOWN_WORKSPACE:-0}" = "1" ] && [ -d /workspace ]; then
             chown "$TARGET_UID:$TARGET_GID" /workspace 2>/dev/null || true
         fi
         if [ -d /nix/var/nix ]; then

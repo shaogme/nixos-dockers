@@ -1,20 +1,20 @@
-services:
-  # Base configuration for the application
-  app-base: &app-base
-    image: ghcr.io/shaogme/coding-images/npins-common:latest
-    environment:
-      - ROOT_PASSWORD=root # Set your secure password here
-      - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
-      - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
-      - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
-    security_opt:
-      - seccomp:unconfined # Required for some low-level operations
-    cap_add:
-      - SYS_ADMIN
-      - SYS_PTRACE
-      - NET_ADMIN
-    tty: true
+# Base configuration for the application
+x-app-base: &app-base
+  image: ghcr.io/shaogme/coding-images/npins-common:latest
+  environment:
+    - ROOT_PASSWORD=root # Set your secure password here
+    - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
+    - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
+    - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
+  security_opt:
+    - seccomp:unconfined # Required for some low-level operations
+  cap_add:
+    - SYS_ADMIN
+    - SYS_PTRACE
+    - NET_ADMIN
+  tty: true
 
+services:
   # Develop mode: Mounts local directory for hot-reloading (Default)
   dev:
     <<: *app-base
