@@ -39,6 +39,7 @@
       which
       xz
       cacert
+      less
 
       # Modern CLI & Productivity Utilities
       ripgrep
