@@ -40,6 +40,7 @@
       xz
       cacert
       less
+      diffutils
 
       # Modern CLI & Productivity Utilities
       ripgrep
