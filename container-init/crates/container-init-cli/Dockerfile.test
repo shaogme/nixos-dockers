@@ -1,0 +1,7 @@
+FROM rust:1.85-bookworm
+
+WORKDIR /workspace/nixos-dockers/container-init
+COPY . .
+
+RUN cargo test --locked -p container-init-cli --test docker --no-run
+CMD ["cargo", "test", "--locked", "-p", "container-init-cli", "--test", "docker", "--", "--nocapture"]

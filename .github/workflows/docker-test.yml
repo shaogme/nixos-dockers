@@ -1,0 +1,54 @@
+name: Docker Image Tests
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "container-init/**"
+      - "dev-env/**"
+      - "images/**"
+      - "modules/**"
+      - "tests/**"
+      - ".github/workflows/docker-test.yml"
+  pull_request:
+    paths:
+      - "container-init/**"
+      - "dev-env/**"
+      - "images/**"
+      - "modules/**"
+      - "tests/**"
+      - ".github/workflows/docker-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [mise, npins, rust]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@master
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
+
+      - name: Setup NixCache for mise
+        if: matrix.image == 'mise'
+        uses: shaogme/nixcache-oci/setup@main
+        with:
+          repo: shaogme/mise-nixcache
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and test Docker images
+        run: bash "images/${{ matrix.image }}/tests/docker.sh"

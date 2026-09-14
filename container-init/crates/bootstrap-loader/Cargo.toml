@@ -1,0 +1,12 @@
+[package]
+name = "bootstrap-loader"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Profile graph loader and trust-aware merger for the container-init Bootstrap DSL"
+license = "MIT"
+
+[dependencies]
+bootstrap-model = { path = "../bootstrap-model" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"

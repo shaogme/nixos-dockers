@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/dev-env-model",
+    "crates/dev-env-loader",
+    "crates/dev-env-core",
+    "crates/dev-env-provider",
+    "crates/dev-env-shell",
+    "crates/dev-env-cli",
+]
+resolver = "2"
+
+[profile.release]
+debug = 1

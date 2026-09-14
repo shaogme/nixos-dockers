@@ -254,17 +254,12 @@ in
         ln -sf /usr/lib/$lib usr/lib/aarch64-linux-gnu/$lib
       done
       
-      # 6. Bash Wrapper
-      rm -f bin/bash
-      cp ${config.environment.bashWrapper} bin/bash
-      chmod +x bin/bash
-
-      # 7. Setup /usr/bin/env & su-exec
+      # 6. Setup /usr/bin/env & su-exec
       ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
       ln -sf ${pkgs.su-exec}/bin/su-exec usr/bin/su-exec
       ln -sf ${pkgs.su-exec}/bin/su-exec bin/su-exec
       
-      # 8. Common Tools Symlinks
+      # 7. Common Tools Symlinks
       ln -sf ${pkgs.procps}/bin/pgrep usr/bin/pgrep
       ln -sf ${pkgs.procps}/bin/pkill usr/bin/pkill
       ln -sf ${pkgs.procps}/bin/ps usr/bin/ps
@@ -278,11 +273,11 @@ in
       ln -sf ${pkgs.git}/bin/git usr/bin/git
       ln -sf ${pkgs.gh}/bin/gh usr/bin/gh
 
-      # 9. Setup Nix Search Path & Defexpr for root
+      # 8. Setup Nix Search Path & Defexpr for root
       mkdir -p root/.nix-defexpr
       ln -sf ${pkgs.path} root/.nix-defexpr/nixpkgs
 
-      # 10. Container & UID Mapping Tools (Podman support)
+      # 9. Container & UID Mapping Tools (Podman support)
       # Copy binaries so SUID bit can be applied in fakeRootCommands
       cp -L ${pkgs.shadow}/bin/newuidmap usr/bin/newuidmap
       cp -L ${pkgs.shadow}/bin/newgidmap usr/bin/newgidmap
@@ -313,4 +308,3 @@ in
     '';
   };
 }
-

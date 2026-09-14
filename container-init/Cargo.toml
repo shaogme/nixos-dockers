@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/bootstrap-model",
+    "crates/bootstrap-loader",
+    "crates/container-init-posix",
+    "crates/container-init-core",
+    "crates/container-init-cli",
+]
+resolver = "2"

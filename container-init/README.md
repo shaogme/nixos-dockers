@@ -1,0 +1,225 @@
+# container-init
+
+`container-init` 是一个独立的 Rust 容器基础引导程序。它读取 profile 中的
+`[bootstrap]` 命名空间，解析运行时身份，生成可审计的 action plan，执行有限的
+POSIX 基础设施操作，然后把当前进程交给 profile 指定的 runtime。
+
+它解决的是“容器启动前需要准备什么”，例如：
+
+- 根据挂载 workspace 的属主或 `HOST_UID`/`HOST_GID` 选择目标 UID、GID、用户名和 HOME；
+- 创建 HOME、缓存目录、配置目录以及声明的软链接；
+- 必要时更新 passwd/group 和登录 shell；
+- 按声明准备可选的 OpenSSH host key、authorized keys 和运行目录；
+- 以结构化 argv 方式 handoff 到 `dev-env` 或其他 runtime。
+
+它不执行 shell 脚本，不运行 `mise`、Devbox、sccache 或 provider，也不负责开发环境变量的物化。环境 DSL 与 Bootstrap DSL 可以存在于同一个 profile，但由不同程序分别读取。
+
+Compose 注入的开发环境变量会随进程环境保留到 handoff runtime；例如
+`CARGO_INCREMENTAL`、`SCCACHE_DIR` 和 `SCCACHE_DISABLE` 的解析属于 handoff
+后的 `dev-env` environment DSL。`container-init` 不解析这些变量，也不会因为
+`SCCACHE_DISABLE=1` 修改 `RUSTC_WRAPPER`。
+
+> 本 README 以当前 `container-init` 源码为准。仓库顶层的设计提案包含一些尚未进入当前 CLI 的扩展设想；实现状态和边界见[实现状态与边界](#实现状态与边界)。
+
+## 文档导航
+
+- [DSL 完整参考](docs/dsl.md)：profile 结构、输入、action、插值和条件表达式。
+- [配置与部署](docs/configuration.md)：profile 文件布局、继承、来源、覆盖和容器配置。
+- [运行时与 CLI](docs/runtime.md)：`run`、`plan`、`doctor`、环境变量、锁和 receipt。
+- [安全模型](docs/security.md)：信任边界、路径检查、权限阶段、SSH 和错误码。
+- [开发与测试](docs/development.md)：crate 分层、构建、单元测试和 Docker 测试。
+
+## 快速开始
+
+### 1. 准备 profile
+
+profile 文件名不必与 profile id 相同，加载器使用 TOML 中的 `id`。下面的例子创建一个 root 容器：启动时创建 `/workspace/.state` 和一个固定内容文件，然后以 `/bin/sh -c` 接收最终命令。
+
+```toml
+schema = 1
+id = "example"
+
+[bootstrap]
+workspace_root = "/workspace"
+
+[bootstrap.identity]
+default_user = "root"
+default_uid = 0
+default_gid = 0
+auto_mapping = false
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "resolve"
+kind = "identity.resolve"
+run_as = "root"
+
+[[bootstrap.actions]]
+id = "state-dir"
+kind = "filesystem.ensure_dir"
+path = "${bootstrap.workspace_root}/.state"
+mode = "0750"
+owner = "root"
+run_as = "root"
+depends_on = ["resolve"]
+
+[[bootstrap.actions]]
+id = "marker"
+kind = "filesystem.ensure_file"
+path = "${bootstrap.workspace_root}/.state/initialized"
+content = "created by container-init\n"
+mode = "0640"
+owner = "root"
+run_as = "root"
+depends_on = ["state-dir"]
+```
+
+把文件放到例如 `/etc/dev-env/profiles.d/example.toml`，并让默认 profile 文件包含单独一行的 `example`：
+
+```text
+example
+```
+
+默认路径和覆盖方式见[配置与部署](docs/configuration.md)。
+
+### 2. 先检查，再执行
+
+```bash
+# 只构建并打印静态计划，不修改文件、账户或锁
+container-init --profile example plan
+
+# 输出机器可读 JSON；action 的 content 不会出现在计划中
+container-init --profile example plan --json
+
+# 检查 workspace、身份、runtime 和 SSH capability，不执行 action
+container-init --profile example doctor
+
+# 执行引导，然后把当前进程替换为 runtime
+container-init --profile example run -- 'printf "ready\n"'
+```
+
+推荐在镜像中使用：
+
+```dockerfile
+ENTRYPOINT ["/usr/bin/container-init", "run"]
+```
+
+如果需要把 `run` 的命令参数传给 handoff runtime，使用 `--` 结束 `container-init` 自身的选项。没有显式命令时使用 `shell_prefix`；有显式命令时使用 `exec_prefix`。程序始终以 argv 调用，不把参数拼成 shell 字符串。
+
+### 3. 用运行时输入映射宿主身份
+
+profile 先声明输入，CLI 或环境变量才可以设置它：
+
+```toml
+[bootstrap.identity]
+default_user = "dev"
+default_uid = 1000
+default_gid = 1000
+auto_mapping = true
+uid_input = "HOST_UID"
+gid_input = "HOST_GID"
+home_input = "CONTAINER_HOME"
+
+[bootstrap.inputs.HOST_UID]
+target = "identity.uid"
+type = "uid_pair"
+aliases = ["UID_GID"]
+runtime = true
+format = "uid[:gid]"
+
+[bootstrap.inputs.HOST_GID]
+target = "identity.gid"
+type = "gid"
+runtime = true
+
+[bootstrap.inputs.CONTAINER_HOME]
+target = "identity.home"
+type = "path"
+runtime = true
+allow_outside_workspace = false
+```
+
+运行时可以使用环境变量，也可以使用 CLI 覆盖：
+
+```bash
+HOST_UID=1001:1001 HOST_GID=1001 \
+  container-init --profile example run
+
+container-init --profile example \
+  --input HOST_UID=1001:1001 --input HOST_GID=1001 \
+  run
+```
+
+对 `runtime = true` 的输入，优先级是 CLI `--input`/`--set`，其次是环境变量，最后是 profile 的 `default`。CLI 同名输入优先于环境变量；输入必须在 profile 中声明，未声明的 `--input` 直接以配置错误退出。
+
+## 工作方式
+
+一次 `run` 的逻辑可以概括为：
+
+```text
+读取 profile 目录
+    ↓
+选择 profile，递归加载 extends
+    ↓
+仅投影并合并 bootstrap 命名空间
+    ↓
+校验 schema、来源、信任、字段和 action 依赖
+    ↓
+解析输入和目标身份
+    ↓
+获取非阻塞 bootstrap lock
+    ↓
+按静态 plan 执行 action
+    ↓
+写入可选 receipt
+    ↓
+设置 HOME/USER/LOGNAME，并 exec handoff runtime
+```
+
+计划由 `bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。`plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统。
+
+执行时，条件会针对实际的 workspace、输入、环境和目标身份求值。条件为假时 action 被跳过；依赖未成功完成时，依赖它的 action 也会跳过。`failure = "warn"` 或 `"ignore"` 允许当前 action 记录失败并继续处理无关 action，但不会让依赖该 action 的后续 action 执行。
+
+## 实现状态与边界
+
+当前已经实现：
+
+- TOML profile 读取、`extends` 继承、父子冲突诊断和显式 override；
+- `identity.resolve`、`identity.map_user`、`identity.ensure_home`；
+- `filesystem.ensure_dir`、`ensure_file`、`ensure_symlink`、`chown`、`chmod`；
+- `process.set_user_shell`、`process.drop_privileges`、`handoff.exec`；
+- 可选 `service.ssh.prepare`，仅通过受信任的 `ssh-keygen` capability 生成 host key；
+- `plan --json`、`doctor --json`、结构化错误、非阻塞锁和原子 receipt；
+- 独立的 `bootstrap-model`、`bootstrap-loader`、`container-init-core`、`container-init-posix` 和 `container-init-cli` crate。
+
+当前 CLI/源码没有实现或不负责：
+
+- `bootstrap.extensions` 和 `container-init-action-*` 外部插件协议；
+- 读取 environment DSL、执行 provider、生成 `MaterializedEnv` 或运行 shell hook；
+- 自动启动 `sshd`；SSH action 只准备目录和 key，daemon 仍由 handoff/服务编排负责；
+- CLI 对 `feature:...` 条件的 feature 注入；当前 CLI 的运行时 feature 集合为空；
+- `non_interactive` 的交互策略执行；字段会被解析和继承，但当前执行器不进行交互；
+- 通过 CLI 加载 workspace overlay。库层支持 `SourceKind::WorkspaceOverlay`，但只能在 profile 明确允许且 action 属于安全集合时使用。
+
+## 源码地图
+
+| 层 | 目录 | 责任 |
+| --- | --- | --- |
+| 模型与计划 | [`crates/bootstrap-model`](crates/bootstrap-model) | DSL 类型、字段校验、条件 AST、路径模板、依赖图和静态计划 |
+| 加载与合并 | [`crates/bootstrap-loader`](crates/bootstrap-loader) | TOML 解析、action kind 归一化、继承、来源和信任、冲突处理 |
+| POSIX 边界 | [`crates/container-init-posix`](crates/container-init-posix) | passwd/group、UID/GID、`chown`、权限、`flock` 等系统原语 |
+| 执行核心 | [`crates/container-init-core`](crates/container-init-core) | 身份解析、条件求值、文件 action、SSH capability、receipt 和 handoff |
+| CLI | [`crates/container-init-cli`](crates/container-init-cli) | 参数解析、profile 路径发现、lock 路径、`run/plan/doctor/version` |
+
+几个关键入口：
+
+- [`bootstrap-model/src/action.rs`](crates/bootstrap-model/src/action.rs)：action 字段和内置 kind；
+- [`bootstrap-model/src/plan.rs`](crates/bootstrap-model/src/plan.rs)：阶段和稳定拓扑排序；
+- [`bootstrap-loader/src/merge.rs`](crates/bootstrap-loader/src/merge.rs)：继承合并与冲突规则；
+- [`container-init-core/src/executor.rs`](crates/container-init-core/src/executor.rs)：执行和 handoff；
+- [`container-init-core/src/filesystem.rs`](crates/container-init-core/src/filesystem.rs)：安全路径及文件操作；
+- [`container-init-core/src/identity.rs`](crates/container-init-core/src/identity.rs)：输入和身份解析。

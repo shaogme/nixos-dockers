@@ -1,0 +1,25 @@
+[package]
+name = "dev-env-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Command-line entry point for the dev-env environment DSL"
+license = "MIT"
+
+[lib]
+name = "dev_env_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dev-env"
+path = "src/main.rs"
+
+[dependencies]
+dev-env-core = { path = "../dev-env-core" }
+dev-env-loader = { path = "../dev-env-loader" }
+dev-env-model = { path = "../dev-env-model" }
+dev-env-provider = { path = "../dev-env-provider" }
+dev-env-shell = { path = "../dev-env-shell" }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -1,0 +1,13 @@
+[package]
+name = "container-init-posix"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Portable POSIX primitives for container-init"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }

@@ -8,6 +8,9 @@ on:
       - "**/deps.nix"
       - "**/*.nix"
       - "**/sources.json"
+      - "container-init/**"
+      - "dev-env/**"
+      - "tests/**"
       - ".github/workflows/docker-publish.yml"
       - ".github/workflows/build-image.yml"
   workflow_dispatch:

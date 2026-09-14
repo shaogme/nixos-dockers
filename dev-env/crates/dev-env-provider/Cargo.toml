@@ -1,0 +1,14 @@
+[package]
+name = "dev-env-provider"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Provider lifecycle runtime and external provider protocol for dev-env"
+license = "MIT"
+
+[dependencies]
+dev-env-model = { path = "../dev-env-model" }
+fs2 = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"

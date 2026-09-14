@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: $0 <image>" >&2
+    exit 2
+fi
+
+image="$1"
+case "$image" in
+    mise|npins|rust) ;;
+    *)
+        echo "unsupported image: $image" >&2
+        exit 2
+        ;;
+esac
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root_dir="$(cd -- "$script_dir/.." && pwd)"
+image_file="$root_dir/images/$image/image.nix"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/nixos-dockers-image-test.XXXXXX")"
+containers=()
+
+cleanup() {
+    local status=$?
+    for container in "${containers[@]-}"; do
+        docker rm -f "$container" >/dev/null 2>&1 || true
+    done
+    rm -rf -- "$tmp_dir"
+    exit "$status"
+}
+trap cleanup EXIT
+
+command -v docker >/dev/null
+command -v nix-build >/dev/null
+command -v nix-instantiate >/dev/null
+
+assert_contains() {
+    local value="$1"
+    local expected="$2"
+    if [[ "$value" != *"$expected"* ]]; then
+        echo "expected output to contain: $expected" >&2
+        echo "$value" >&2
+        return 1
+    fi
+}
+
+wait_for_running() {
+    local container="$1"
+    local attempt state
+    for attempt in {1..30}; do
+        state="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)"
+        if [[ "$state" == true ]]; then
+            return 0
+        fi
+        if [[ "$state" == false ]]; then
+            echo "container $container exited before becoming ready" >&2
+            docker logs "$container" >&2 || true
+            return 1
+        fi
+        sleep 1
+    done
+    echo "timed out waiting for container $container" >&2
+    docker logs "$container" >&2 || true
+    return 1
+}
+
+test_loaded_image() {
+    local attr="$1"
+    local archive="$tmp_dir/${attr//\//_}.tar.gz"
+    local plan environment handoff
+
+    echo "==> evaluating $image#$attr"
+    nix-instantiate --eval --strict "$image_file" -A "$attr.imageVersion" >/dev/null
+
+    echo "==> building $image#$attr"
+    nix-build --no-out-link "$image_file" -A "$attr" -o "$archive"
+
+    echo "==> loading $attr:latest"
+    docker load --input "$archive"
+
+    echo "==> validating configured entrypoint"
+    handoff="$(docker run --rm --env RUN_AS_ROOT=1 "$attr:latest" /bin/printf 'nixos-docker entrypoint')"
+    assert_contains "$handoff" 'nixos-docker entrypoint'
+
+    local tool_output tool
+    case "$image" in
+        mise) tool=mise ;;
+        npins) tool=npins ;;
+        rust) tool=rustc ;;
+    esac
+    echo "==> validating image tool ($tool)"
+    tool_output="$(docker run --rm --entrypoint /bin/sh "$attr:latest" -c "command -v $tool && $tool --version")"
+    assert_contains "$tool_output" "$tool"
+
+    echo "==> validating container-init plan"
+    plan="$(docker run --rm --entrypoint /usr/bin/container-init "$attr:latest" plan --json)"
+    assert_contains "$plan" '"actions"'
+    assert_contains "$plan" '"handoff"'
+
+    echo "==> validating dev-env materialization"
+    environment="$(docker run --rm --entrypoint /usr/bin/dev-env "$attr:latest" print --format json)"
+    assert_contains "$environment" '"PATH"'
+    assert_contains "$environment" '"NIX_PATH"'
+
+    echo "==> validating runtime handoff"
+    handoff="$(docker run --rm --env RUN_AS_ROOT=1 --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/printf 'nixos-docker handoff')"
+    assert_contains "$handoff" 'nixos-docker handoff'
+
+    echo "==> validating login-shell shim"
+    handoff="$(docker run --rm --entrypoint /usr/bin/dev-env-login-shell "$attr:latest" -c 'printf "nixos-docker login-shell"')"
+    assert_contains "$handoff" 'nixos-docker login-shell'
+
+    echo "==> validating non-root identity handoff"
+    handoff="$(docker run --rm --env HOST_UID=1000:1000 --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/dev && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = 1000 && test "$(id -g)" = 1000')"
+    [[ -z "$handoff" ]]
+
+    if [[ "$attr" == vscode-* ]]; then
+        local container="nixos-dockers-${image}-$$"
+        echo "==> validating default service deployment ($container)"
+        containers+=("$container")
+        docker run --detach --name "$container" --env RUN_AS_ROOT=1 "$attr:latest" >/dev/null
+        wait_for_running "$container"
+        environment="$(docker exec "$container" /usr/bin/dev-env print --format json)"
+        assert_contains "$environment" '"PATH"'
+        docker rm -f "$container" >/dev/null
+        unset 'containers[-1]'
+    fi
+}
+
+test_loaded_image "$image"
+test_loaded_image "vscode-$image"
+
+echo "Docker image tests passed: $image and vscode-$image"

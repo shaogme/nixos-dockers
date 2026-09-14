@@ -1,0 +1,22 @@
+[package]
+name = "container-init-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Command-line entry point for the container-init Bootstrap DSL runtime"
+license = "MIT"
+
+[[bin]]
+name = "container-init"
+path = "src/main.rs"
+
+[dependencies]
+bootstrap-loader = { path = "../bootstrap-loader" }
+bootstrap-model = { path = "../bootstrap-model" }
+container-init-core = { path = "../container-init-core" }
+container-init-posix = { path = "../container-init-posix" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }

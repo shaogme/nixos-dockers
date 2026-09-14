@@ -113,58 +113,27 @@ services:
 
 你可以将本仓库的镜像作为基础镜像（Base Image）构建自己的开发镜像。
 
-### 注意事项：Entrypoint 机制
+### 入口机制：container-init 与 dev-env
 
-镜像内置的 `/bin/entrypoint.sh`（由 Nix 动态生成）负责处理以下关键初始化逻辑：
+镜像的 Docker `Entrypoint` 固定为 `/usr/bin/container-init run --`。运行时分为两个独立阶段：
 
-1. **自动修复配置文件只读权限**（如 `/etc/passwd`, `/etc/group`, `/etc/shadow`）。
-2. **自适应 UID/GID 探测与映射**：
-   - **环境变量输入**：支持通过 `HOST_UID:HOST_GID`（例如 `-e HOST_UID=$(id -u):$(id -g)`）或分别传入 `HOST_UID`、`HOST_GID`。
-   - **运行时智能探测**：若未显式指定 `HOST_UID`，启动时自动检测挂载工作区（`/workspace`）的所有者 UID/GID。若属于非 root 宿主机用户，将自动匹配其 UID/GID。
-   - **动态调整本地普通用户**：启动时动态调整容器内普通用户（默认 `dev`）的 UID/GID，自动创建与配置 `$HOME`、`~/.nix-defexpr` 与 Nix 状态目录权限，并通过 `su-exec` 切换至该用户执行后续操作，确保生成的构建产物权限与宿主机保持完全一致。
-   - **root 权限安全封闭**：`/root` 目录默认保持严格的 `700` 私有权限，敏感文件对普通用户完全隔离不可见。
-   - **root 运行控制**：若需要以 root 权限运行，传入 `HOST_UID=0` 或 `RUN_AS_ROOT=1` 即可。
-3. **SSH 自动初始化**（当 `services.openssh.enable = true` 时）：
-   - 自动生成 SSH Host Key（若缺失）。
-   - 公钥注入：自动读取 `/tmp/id_ed25519.pub` 并配置为 `/etc/ssh/authorized_keys/%u`，彻底解耦用户家目录与挂载卷。
-   - 环境变量导出：将容器环境变量写入 `/etc/environment`，确保通过 SSH 登录时系统环境变量不丢失，且无需写入用户家目录。
-4. **服务与命令分发**：
-   - 带有参数时：非 root 用户通过 `su-exec` 切换权限执行传入命令（`exec su-exec $TARGET_USER "$@"`，若显式启动 sshd 则保持 root 权限）。
-   - 无参数且启用 SSH 时：默认前台以 root 启动 `sshd -D -e`（支持多用户登录）。
-   - 无参数且未启用 SSH 时：默认启动交互式 Bash（非 root 用户通过 `su-exec` 切换至对应本地用户）。
+1. `container-init` 执行镜像 profile 声明的 UID/GID、目录、软链接和 SSH action，然后按 handoff 配置交给 `dev-env`。
+2. `dev-env` 加载 `/etc/dev-env/profiles.d`，物化 mise、Devbox、Rust 和其他 provider 的环境，并以同一份环境启动命令、shell 或 SSH login shell。
+
+`HOST_UID=uid[:gid]`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT=1` 是声明式 runtime input。`/bin/bash` 是兼容 shim，真实 Bash 位于 `/usr/local/libexec/dev-env/real/bash`；直接执行 `dev-env` 或 `docker exec ... dev-env ...` 会重新物化当前工作区环境。镜像不再包含旧的 `/bin/entrypoint.sh`。
 
 ### 编写自定义 Dockerfile 示例
 
-在派生镜像中，建议**保留 `/bin/entrypoint.sh` 作为 Entrypoint**，通过 `CMD` 或传入命令来扩展容器行为：
+派生镜像无需重新声明 Entrypoint 或 CMD；只需安装工具并增加 profile：
 
 ```dockerfile
 FROM ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
 
-# 1. 设置自定义环境变量
-ENV MY_CUSTOM_ENV="value"
-
-# 2. 安装额外依赖或复制配置（可利用内置的 nix 安装工具）
-RUN nix-env -iA nixpkgs.bun
-
-# 3. 必须确保 Entrypoint 依然使用 /bin/entrypoint.sh
-ENTRYPOINT ["/bin/entrypoint.sh"]
-
-# 默认启动参数：留空则根据镜像类型自适应启动
-CMD []
+RUN nix profile add nixpkgs#bun
+COPY .config/dev-env.toml /etc/dev-env/profiles.d/50-project.toml
 ```
 
-如果需要编写自定义的前置初始化脚本（例如 `custom-init.sh`），请在自定义脚本末尾通过 `exec /bin/entrypoint.sh "$@"` 将控制权移交给原入口脚本：
-
-```bash
-#!/usr/bin/env bash
-set -e
-
-# 执行你的前置初始化操作
-echo "Running custom setup..."
-
-# 移交给内置的 entrypoint.sh
-exec /bin/entrypoint.sh "$@"
-```
+自定义运行时初始化也应使用 Bootstrap DSL action；不要复制或链式调用旧 entrypoint。需要让新 profile 成为默认 profile 时，显式写入 `/etc/dev-env/default-profile`，并保持其 `extends` 链包含基础 profile。
 
 > [!TIP]
 > 完整的派生开发容器最佳实践（包含 BuildKit 缓存加速、构建期多语言工具预装与 Docker Compose 配置），请参考 [Mise 镜像与 Example 详细文档](images/mise/README.md)。
@@ -181,7 +150,7 @@ exec /bin/entrypoint.sh "$@"
 
 - `nix-ld`: 动态链接器封装，自动为非 Nix 二进制程序寻找所需的 `.so` 文件。
 - `direnv`: 进入目录时自动加载 `shell.nix` 或 `flake.nix` 环境。
-- `bash-wrapper`: 确保在通过 SSH 登录或交互终端时，`LD_LIBRARY_PATH` 等环境变量不会丢失。
+- `dev-env` Bash shim：确保通过 SSH 登录、交互终端和 `docker exec` 时使用同一份物化环境。
 - `/etc/gitconfig`: 构建期声明 Git `safe.directory`，保障容器工作区跨 UID/GID 权限时正常执行 Git 操作。
 
 ## 本地构建镜像
@@ -201,6 +170,18 @@ nix-build images/rust/image.nix
 
 构建完成后，使用 `docker load < result` 即可将镜像导入本地 Docker。
 
+### 本地 Docker 集成测试
+
+每个 image 都提供一套 Docker 测试脚本。脚本会构建 CLI 与 VS Code Remote 两个变体，加载镜像，并验证 `container-init` 计划、`dev-env` 环境物化、运行时 handoff、登录 shell shim；VS Code 变体还会验证默认 SSH 服务能够部署并保持运行：
+
+```bash
+bash images/rust/tests/docker.sh
+bash images/npins/tests/docker.sh
+bash images/mise/tests/docker.sh
+```
+
+CI 会对 `mise`、`npins`、`rust` 三个 image 运行相同测试。`coding-images` 暂不纳入本次迁移。
+
 ## 项目结构
 
 ```text
@@ -211,7 +192,7 @@ nix-build images/rust/image.nix
 │   └── mise/              # Mise 专用镜像 (mise, vscode-mise) -> 详见 [Mise 文档](images/mise/README.md)
 │       └── example/       # 生产级派生开发容器示例 (Dockerfile, compose, entrypoint)
 ├── modules/               # 统一 NixOS 模块系统
-│   ├── core/              # 核心构建器、系统配置与动态 entrypoint
+│   ├── core/              # 核心构建器、系统配置与 container-init/dev-env runtime
 │   └── profiles/          # 语言与工具特性 Profile (base, rust, npins, mise)
 ├── update-npins.sh        # 依赖自动更新脚本
 └── .github/workflows/     # CI/CD 自动化构建发布工作流

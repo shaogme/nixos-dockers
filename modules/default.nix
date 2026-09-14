@@ -9,6 +9,7 @@ let
     ./core/docker.nix
     ./core/system.nix
     ./core/environment.nix
+    ./core/runtime.nix
     ./profiles/base.nix
     ./profiles/rust.nix
     ./profiles/npins.nix

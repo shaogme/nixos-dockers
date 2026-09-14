@@ -1,0 +1,9 @@
+FROM rust:1.85-bookworm
+
+ENV DEV_ENV_HOST_LEAK=ambient-from-docker
+
+WORKDIR /workspace/nixos-dockers/dev-env
+COPY . .
+
+RUN cargo test --locked -p dev-env-cli --test docker --no-run
+CMD ["cargo", "test", "--locked", "-p", "dev-env-cli", "--test", "docker", "--", "--nocapture"]

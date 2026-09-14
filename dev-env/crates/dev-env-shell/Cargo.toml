@@ -1,0 +1,11 @@
+[package]
+name = "dev-env-shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Shell command construction, environment formatting, and shim support for dev-env"
+license = "MIT"
+
+[dependencies]
+dev-env-model = { path = "../dev-env-model" }
+serde_json = "1.0"
