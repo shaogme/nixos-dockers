@@ -2,6 +2,7 @@ use crate::config::LoadedConfig;
 use bootstrap_model::{ActionKind, PlanPhase, RunAs};
 use container_init_core::{
     CoreError, IdentityResolver, PosixSystem, ResolvedIdentity, RuntimeContext, SshCapability,
+    WorkspaceStatus,
 };
 use container_init_posix::is_writable;
 use serde::Serialize;
@@ -75,6 +76,17 @@ pub fn inspect(loaded: &LoadedConfig, context: &RuntimeContext) -> DoctorReport 
                 ),
                 error: None,
             });
+            if config.identity.auto_mapping && identity.workspace != WorkspaceStatus::Mounted {
+                checks.push(DoctorCheck {
+                    name: "workspace.mount".to_owned(),
+                    status: DoctorStatus::Warn,
+                    message: format!(
+                        "workspace mount was not proven ({:?}); automatic ownership mapping was not used",
+                        identity.workspace
+                    ),
+                    error: None,
+                });
+            }
             Some(identity)
         }
         Err(error) => {

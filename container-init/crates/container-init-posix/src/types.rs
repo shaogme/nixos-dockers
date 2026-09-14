@@ -1,5 +1,40 @@
 use std::path::PathBuf;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceObservation {
+    Mounted {
+        uid: u32,
+        gid: u32,
+        mount_point: PathBuf,
+        mount_id: u64,
+    },
+    NotMounted {
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl WorkspaceObservation {
+    pub fn mounted(uid: u32, gid: u32, mount_point: impl Into<PathBuf>, mount_id: u64) -> Self {
+        Self::Mounted {
+            uid,
+            gid,
+            mount_point: mount_point.into(),
+            mount_id,
+        }
+    }
+
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Mounted { .. } => "mounted",
+            Self::NotMounted { .. } => "not_mounted",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+}
+
 /// A copied POSIX passwd entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PosixUser {

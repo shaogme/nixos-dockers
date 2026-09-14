@@ -132,7 +132,7 @@ cargo clippy --workspace --all-targets --locked
 
 ## 入口一致性
 
-容器的默认 `Entrypoint` 是 `/usr/bin/container-init run --`。`container-init` 完成 bootstrap action 后，根据 handoff 配置把控制权交给 `dev-env`；环境 provider 不在 `container-init` 中执行。
+容器的默认 `Entrypoint` 是 `/usr/bin/container-init run --`。`container-init` 在 handoff 前完成 UID/GID namespace 解析、账户和降权，并把规范化的进程身份交给 `dev-env`；环境 provider 不在 `container-init` 中执行。
 
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |

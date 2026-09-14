@@ -71,4 +71,22 @@ impl HandoffCommand {
             source,
         })
     }
+
+    /// Replace the current process with a root-owned service handoff. The
+    /// daemon keeps root credentials, but receives a canonical root login
+    /// environment instead of the target development user's environment.
+    pub fn exec_as_root_service(&self) -> Result<(), CoreError> {
+        let mut command = std::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .env("HOME", "/root")
+            .env("USER", "root")
+            .env("LOGNAME", "root");
+        let source = command.exec();
+        Err(CoreError::Handoff {
+            program: self.program.clone(),
+            args: self.args.clone(),
+            source,
+        })
+    }
 }

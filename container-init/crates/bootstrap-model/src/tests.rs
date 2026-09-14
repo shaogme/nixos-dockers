@@ -48,6 +48,8 @@ fn declared_inputs() -> BTreeMap<String, BootstrapInput> {
                 aliases: Vec::new(),
                 runtime: true,
                 format: None,
+                namespace: (input_type == InputType::UidPair || input_type == InputType::Gid)
+                    .then_some(InputNamespace::Host),
                 default: None,
                 allow_outside_workspace: input_type == InputType::Path,
             },
@@ -68,6 +70,7 @@ fn uid_pair_and_typed_inputs_are_parsed_without_shell_logic() {
         aliases: vec!["HOST_UID".to_owned()],
         runtime: true,
         format: Some("uid[:gid]".to_owned()),
+        namespace: Some(InputNamespace::Host),
         default: None,
         allow_outside_workspace: false,
     };
@@ -108,6 +111,23 @@ fn uid_pair_and_typed_inputs_are_parsed_without_shell_logic() {
 }
 
 #[test]
+fn identity_uid_gid_inputs_require_and_agree_on_namespace() {
+    let mut config = crate::tests::config(Vec::new());
+    config.inputs.get_mut("HOST_UID").unwrap().namespace = None;
+    assert!(matches!(
+        config.validate(),
+        Err(ModelError::Invalid { location, .. }) if location.ends_with("HOST_UID.namespace")
+    ));
+
+    let mut config = crate::tests::config(Vec::new());
+    config.inputs.get_mut("HOST_GID").unwrap().namespace = Some(InputNamespace::Container);
+    assert!(matches!(
+        config.validate(),
+        Err(ModelError::Invalid { location, .. }) if location == "bootstrap.identity"
+    ));
+}
+
+#[test]
 fn path_input_rejects_traversal_and_shell_fragments() {
     let input = BootstrapInput {
         target: "identity.home".to_owned(),
@@ -115,6 +135,7 @@ fn path_input_rejects_traversal_and_shell_fragments() {
         aliases: vec![],
         runtime: true,
         format: None,
+        namespace: None,
         default: None,
         allow_outside_workspace: true,
     };

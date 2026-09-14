@@ -1,3 +1,4 @@
+use container_init_posix::WorkspaceObservation;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io;
@@ -14,7 +15,7 @@ pub struct RuntimeContext {
     env: BTreeMap<String, String>,
     cli_inputs: BTreeMap<String, String>,
     features: BTreeSet<String>,
-    workspace_owner: Option<(u32, u32)>,
+    workspace_observation: Option<WorkspaceObservation>,
 }
 
 impl RuntimeContext {
@@ -52,8 +53,8 @@ impl RuntimeContext {
         self
     }
 
-    pub fn with_workspace_owner(mut self, uid: u32, gid: u32) -> Self {
-        self.workspace_owner = Some((uid, gid));
+    pub fn with_workspace_observation(mut self, observation: WorkspaceObservation) -> Self {
+        self.workspace_observation = Some(observation);
         self
     }
 
@@ -85,7 +86,7 @@ impl RuntimeContext {
         self.features.contains(feature)
     }
 
-    pub(crate) fn workspace_owner(&self) -> Option<(u32, u32)> {
-        self.workspace_owner
+    pub fn workspace_observation(&self) -> Option<&WorkspaceObservation> {
+        self.workspace_observation.as_ref()
     }
 }

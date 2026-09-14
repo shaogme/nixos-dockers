@@ -53,6 +53,8 @@ fn declared_inputs() -> BTreeMap<String, BootstrapInput> {
                 aliases: Vec::new(),
                 runtime: true,
                 format: None,
+                namespace: (input_type == InputType::UidPair || input_type == InputType::Gid)
+                    .then_some(bootstrap_model::InputNamespace::Host),
                 default: None,
                 allow_outside_workspace: input_type == InputType::Path,
             },

@@ -81,7 +81,7 @@ workspace 路径按优先级选择：
 
 相对 workspace 会相对于启动 `container-init` 时的当前目录转换为绝对路径。`run` 会在执行 action 前切换到该目录；`plan` 和 `doctor` 不切换当前进程目录。
 
-注意：运行时 workspace 主要用于 `RuntimeContext.cwd`、workspace 属主探测和条件求值；profile 中的 `bootstrap.workspace_root` 仍是声明式配置，二者不自动相互覆盖。希望二者一致时，应在镜像生成 profile 时写入同一个绝对路径。
+注意：运行时 workspace 主要用于 `RuntimeContext.cwd`、mountinfo 挂载事实探测和条件求值；只有确认存在 workspace 挂载后，挂载视角下的属主才会参与自动映射。profile 中的 `bootstrap.workspace_root` 仍是声明式配置，二者不自动相互覆盖。希望二者一致时，应在镜像生成 profile 时写入同一个绝对路径。
 
 ## 3. 一个可继承的 profile 集合
 
@@ -110,12 +110,14 @@ home_input = "CONTAINER_HOME"
 [bootstrap.inputs.HOST_UID]
 target = "identity.uid"
 type = "uid_pair"
+namespace = "host"
 runtime = true
 format = "uid[:gid]"
 
 [bootstrap.inputs.HOST_GID]
 target = "identity.gid"
 type = "gid"
+namespace = "host"
 runtime = true
 
 [bootstrap.inputs.CONTAINER_HOME]

@@ -68,7 +68,7 @@ home_input = "CONTAINER_HOME"
 | `default_user` | POSIX 用户名 | 没有更具体结果时使用的用户名；允许尚未存在，配合 `identity.map_user` 创建/映射 |
 | `default_uid` | `0..=u32::MAX` | 默认 UID |
 | `default_gid` | `0..=u32::MAX` | 默认 GID |
-| `auto_mapping` | 布尔值 | 无 UID 输入时是否优先探测 workspace 属主 |
+| `auto_mapping` | 布尔值 | 无 UID 输入时是否优先探测已确认挂载的 workspace 属主；普通 rootfs 目录不参与 |
 | `run_as_root_input` | 输入名 | 指向 `bool` 输入；值为真时直接选择 root |
 | `uid_input` | 输入名 | 指向 `uid_pair` 输入 |
 | `gid_input` | 输入名 | 指向 `gid` 输入 |
@@ -78,11 +78,16 @@ home_input = "CONTAINER_HOME"
 
 1. `run_as_root_input` 解析为真时使用 UID/GID `0:0`、用户 `root`；HOME 使用声明的 home 输入，否则 `/root`。
 2. UID 使用 `uid_input` 的 UID；`uid_pair` 中带有的 GID 作为候选 GID。
-3. 如果没有 UID 输入且 `auto_mapping = true`，尝试使用 `RuntimeContext` 提供的 workspace 属主，或读取 `bootstrap.workspace_root` 的属主。
+3. 如果没有 UID 输入且 `auto_mapping = true`，只使用 platform backend 证明为挂载点的 workspace 属主；无法证明时不使用目录属主。
 4. 之后依次考虑 `default_uid`、配置用户名对应的 passwd UID、当前进程 UID。
 5. GID 的优先级为：`gid_input`、`uid_pair` 中的 GID、workspace GID、`default_gid`、配置用户的 GID，最后回退为 UID。
-6. 用户名优先使用 `default_user`，其次按 UID 查找 passwd；仍找不到时 UID 0 使用 `root`，其他 UID 使用 `uid-<uid>`。
-7. HOME 优先使用 `home_input`，其次是配置用户或 UID 查到的 passwd HOME，最后 root 使用 `/root`，普通用户使用 `/home/<user>`。
+6. UID 0 的用户名固定为 `root`；非零 UID 才使用 `default_user`、按 UID 查找 passwd 或 `uid-<uid>`。
+7. HOME 优先使用 `home_input`，其次是规范用户名对应的 passwd HOME，最后 root 使用 `/root`，普通用户使用 `/home/<user>`。
+
+`HOST_UID`/`HOST_GID` 等 UID/GID 输入必须声明 `namespace = "host"` 或
+`namespace = "container"`。host 值会通过 `/proc/self/uid_map` 或
+`/proc/self/gid_map` 转为当前 namespace 的 ID；未映射值和 map 解析错误会直接失败，
+不会原样使用。UID 与 GID 输入必须使用同一 namespace。
 
 这里的“解析身份”不会自动修改 `/etc/passwd`。需要修改或创建 POSIX 账户条目时，必须显式添加 `identity.map_user`，并且该 action 必须来自受信任 profile、以 root 运行。
 
@@ -131,6 +136,7 @@ container-init 通过 `exec` 替换当前进程，不启动子 shell。完成身
 [bootstrap.inputs.HOST_UID]
 target = "identity.uid"
 type = "uid_pair"
+namespace = "host"
 aliases = ["UID_GID"]
 runtime = true
 format = "uid[:gid]"
@@ -138,6 +144,7 @@ format = "uid[:gid]"
 [bootstrap.inputs.HOST_GID]
 target = "identity.gid"
 type = "gid"
+namespace = "host"
 runtime = true
 
 [bootstrap.inputs.RUN_AS_ROOT]
@@ -162,6 +169,7 @@ allow_outside_workspace = false
 | `aliases` | 否 | 其他合法环境变量名；所有输入和 alias 在整个合并结果中不得重名 |
 | `runtime` | 是 | `true` 才读取 CLI/环境；`false` 只使用 `default` |
 | `format` | 否 | 给 profile 使用者看的格式说明；当前解析器按 `type` 工作，不依据该字符串扩展语法 |
+| `namespace` | UID/GID 必填 | `host` 表示当前进程 user namespace 的父 namespace；`container` 表示当前 namespace；其他类型不得设置 |
 | `default` | 否 | TOML 布尔、整数或字符串；会按声明类型解析 |
 | `allow_outside_workspace` | 否 | 仅影响 `identity.home`；默认拒绝 workspace_root 之外的 HOME |
 
@@ -304,7 +312,7 @@ run_as = "root"
 depends_on = ["map-user"]
 ```
 
-`identity.map_user` 会保留既有 passwd 内容，只修改目标用户的 UID/GID；目标用户不存在时追加基本条目，默认 shell 为 `/bin/sh`。group 文件中如果没有目标 GID，也会追加一个同名 group。账户文件修改使用原子替换。
+`identity.map_user` 会保留既有 passwd 内容，reconcile 目标用户的 UID/GID/HOME；目标用户不存在时追加基本条目，默认 shell 为 `/bin/sh`。目标 GID 已存在时，会把目标用户幂等加入所有匹配 group entry；不存在时追加空成员字段的合法 group entry。passwd/group 会先同时校验，再在 bootstrap lock 内分别原子替换。
 
 ### 6.3 SSH action
 

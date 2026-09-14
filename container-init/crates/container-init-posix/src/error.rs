@@ -10,6 +10,7 @@ use std::io;
 #[derive(Debug)]
 pub enum PosixError {
     Invalid(String),
+    Namespace(String),
     Permission(String),
     Io(io::Error),
 }
@@ -23,6 +24,10 @@ impl PosixError {
         Self::Permission(message.into())
     }
 
+    pub(crate) fn namespace(message: impl Into<String>) -> Self {
+        Self::Namespace(message.into())
+    }
+
     pub(crate) fn io(source: io::Error) -> Self {
         Self::Io(source)
     }
@@ -32,6 +37,9 @@ impl fmt::Display for PosixError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) => write!(formatter, "invalid POSIX operation: {message}"),
+            Self::Namespace(message) => {
+                write!(formatter, "invalid namespace observation: {message}")
+            }
             Self::Permission(message) => write!(formatter, "POSIX permission denied: {message}"),
             Self::Io(source) => source.fmt(formatter),
         }
@@ -42,7 +50,7 @@ impl Error for PosixError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(source) => Some(source),
-            Self::Invalid(_) | Self::Permission(_) => None,
+            Self::Invalid(_) | Self::Namespace(_) | Self::Permission(_) => None,
         }
     }
 }

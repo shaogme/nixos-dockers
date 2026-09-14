@@ -105,13 +105,6 @@ pub fn runtime_context(
         })?;
     }
     let mut context = RuntimeContext::new(&workspace).with_environment(env::vars());
-    if let Ok(metadata) = fs::metadata(&workspace) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            context = context.with_workspace_owner(metadata.uid(), metadata.gid());
-        }
-    }
     for (name, value) in &options.inputs {
         context = context.with_cli_input(name.clone(), value.clone());
     }

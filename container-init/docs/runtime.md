@@ -98,7 +98,10 @@ container-init --profile coding-images run -- tool --flag 'value with spaces'
 6. 按需写 receipt；
 7. 将 `HOME`、`USER`、`LOGNAME` 设置为目标值，并用 `exec` 替换当前进程为 handoff runtime。
 
-`run` 会先把当前工作目录切换到 runtime workspace。目标身份解析依赖 `RuntimeContext` 中的 workspace 属主，因而该目录通常应在启动前已经存在。
+`run` 会先把当前工作目录切换到 runtime workspace。目标身份解析通过 Linux
+`/proc/self/mountinfo` 确认 workspace 挂载事实后才读取其属主；镜像构建时预创建的
+目录不会触发自动映射。无法证明挂载时会回退到 profile 默认身份并在 doctor/receipt
+中记录 warning。
 
 如果 profile 没有显式 `handoff.exec`，执行器仍会根据 `[bootstrap.handoff]` 生成 handoff。显式 action 主要用于让 handoff 出现在计划和 receipt 的 action 轨迹中。
 
@@ -168,9 +171,9 @@ profile 的 typed input 不是由 container-init 读取全部环境变量，而�
   > 未设置
 ```
 
-`runtime = false` 的输入不读取 CLI 或环境，只使用 profile default；没有 default 就没有这个解析值。
+`runtime = false` 的输入不读取 CLI 或环境，只使用 profile default；没有 default 就没有这个解析值。`uid_pair`/`gid` 输入还必须声明 `namespace = "host"` 或 `"container"`，两者不能混用；host ID 会按对应的 `/proc/self/uid_map` 或 `/proc/self/gid_map` 转换。
 
-身份 resolver 随后按 Bootstrap DSL 中的规则使用这些 typed value。`RUN_AS_ROOT` 为真时返回 root；否则 UID/GID、workspace 属主、profile 默认值和 POSIX passwd 查询共同决定目标身份。`CONTAINER_HOME` 默认不允许离开 `bootstrap.workspace_root`，除非该输入设置 `allow_outside_workspace = true`。
+身份 resolver 随后按 Bootstrap DSL 中的规则使用这些 typed value。`RUN_AS_ROOT` 为真时返回 root；否则 UID/GID、已证明挂载的 workspace 属主、profile 默认值和 POSIX passwd 查询共同决定目标身份。`CONTAINER_HOME` 默认不允许离开 `bootstrap.workspace_root`，除非该输入设置 `allow_outside_workspace = true`。
 
 解析成功的 identity 会序列化为：
 
@@ -180,7 +183,10 @@ profile 的 typed input 不是由 container-init 读取全部环境变量，而�
   "gid": 1000,
   "user": "dev",
   "home": "/home/dev",
-  "run_as_root": false
+  "run_as_root": false,
+  "uid_source": "profile_default",
+  "gid_source": "profile_default",
+  "workspace": "not_mounted"
 }
 ```
 
@@ -211,7 +217,7 @@ profile 的 typed input 不是由 container-init 读取全部环境变量，而�
 
 `process.drop_privileges` 调用 POSIX backend 设置 supplementary groups、GID、UID；成功后不能恢复 root。它是 handoff 阶段最后的降权边界。
 
-如果最终命令的第一个参数与 `bootstrap.handoff.ssh_daemon` 完全相同，并且当前进程是 root，执行器会跳过 `process.drop_privileges`，以便将 root 权限保留给 root service handoff。SSH session 的用户 shell 仍应由 `process.set_user_shell` 和 `login_shell` 配置完成。
+如果最终命令的第一个参数与 `bootstrap.handoff.ssh_daemon` 完全相同，并且当前进程是 root，执行器会跳过 `process.drop_privileges`，以便将 root 权限保留给 root service handoff。该例外会在 receipt 中标记，并向 daemon 注入 `HOME=/root`、`USER=root`、`LOGNAME=root`；普通命令或路径不完全相等时不享受例外。SSH session 的用户 shell 仍应由 `process.set_user_shell` 和 `login_shell` 配置完成。
 
 ### 5.3 失败和依赖
 

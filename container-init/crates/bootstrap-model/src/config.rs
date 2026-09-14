@@ -98,6 +98,29 @@ impl BootstrapConfig {
             }
         }
 
+        let uid_namespace = self
+            .identity
+            .uid_input
+            .as_deref()
+            .and_then(|name| input_declaration(&self.inputs, name))
+            .and_then(|input| input.namespace);
+        let gid_namespace = self
+            .identity
+            .gid_input
+            .as_deref()
+            .and_then(|name| input_declaration(&self.inputs, name))
+            .and_then(|input| input.namespace);
+        if let (Some(uid_namespace), Some(gid_namespace)) = (uid_namespace, gid_namespace) {
+            if uid_namespace != gid_namespace {
+                return Err(ModelError::Invalid {
+                    location: "bootstrap.identity".to_owned(),
+                    message: format!(
+                        "identity UID input and GID input must use the same namespace; got {uid_namespace:?} and {gid_namespace:?}"
+                    ),
+                });
+            }
+        }
+
         let mut ids = BTreeSet::new();
         for action in &self.actions {
             if !ids.insert(action.id.clone()) {
@@ -108,6 +131,17 @@ impl BootstrapConfig {
 
         Ok(())
     }
+}
+
+fn input_declaration<'a>(
+    inputs: &'a BTreeMap<String, BootstrapInput>,
+    name: &str,
+) -> Option<&'a BootstrapInput> {
+    inputs.get(name).or_else(|| {
+        inputs
+            .values()
+            .find(|input| input.aliases.iter().any(|alias| alias == name))
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

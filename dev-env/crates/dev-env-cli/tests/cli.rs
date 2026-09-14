@@ -3,7 +3,7 @@ use dev_env_loader::LoaderError;
 use dev_env_model::ModelError;
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -467,6 +467,3 @@ fn cli_error_keeps_a_structured_loader_error_as_its_source() {
         .downcast_ref::<ModelError>()
         .is_some());
 }
-
-#[allow(dead_code)]
-fn _path(_: &Path) {}

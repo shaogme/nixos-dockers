@@ -18,6 +18,7 @@ mod ssh;
 
 pub use condition::ConditionContext;
 pub use container_init_posix::PosixSystem;
+pub use container_init_posix::WorkspaceObservation;
 pub use context::RuntimeContext;
 pub use error::{CoreError, ErrorClass};
 pub use executor::{
@@ -25,7 +26,8 @@ pub use executor::{
 };
 pub use handoff::HandoffCommand;
 pub use identity::{
-    IdentityResolver, ParsedRuntimeInput, ResolvedIdentity, ResolvedInputs, RuntimeInput,
+    IdentityResolver, IdentitySource, ParsedRuntimeInput, ResolvedIdentity, ResolvedInputs,
+    RuntimeInput, WorkspaceStatus,
 };
 pub use lock::{BootstrapLock, LockOperation};
 pub use ssh::SshCapability;

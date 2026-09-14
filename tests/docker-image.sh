@@ -111,8 +111,23 @@ test_loaded_image() {
     handoff="$(docker run --rm --entrypoint /usr/bin/dev-env-login-shell "$attr:latest" -c 'printf "nixos-docker login-shell"')"
     assert_contains "$handoff" 'nixos-docker login-shell'
 
+    echo "==> validating non-mounted workspace default"
+    handoff="$(docker run --rm --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/dev && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = 1000 && test "$(id -g)" = 1000')"
+    [[ -z "$handoff" ]]
+
     echo "==> validating non-root identity handoff"
-    handoff="$(docker run --rm --env HOST_UID=1000:1000 --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/dev && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = 1000 && test "$(id -g)" = 1000')"
+    # Pick a parent ID that maps to container ID 1 in both maps. This keeps
+    # the integration check valid for rootful engines and for the partially
+    # mapped user namespaces used by rootless Podman.
+    local identity_fixture host_uid host_gid expected_uid expected_gid
+    identity_fixture="$(docker run --rm --entrypoint /bin/sh "$attr:latest" -c '
+        uid_parent="$(awk '\''$1 <= 1 && 1 < $1 + $3 { print $2 + (1 - $1); exit}'\'' /proc/self/uid_map)"
+        gid_parent="$(awk '\''$1 <= 1 && 1 < $1 + $3 { print $2 + (1 - $1); exit}'\'' /proc/self/gid_map)"
+        test -n "$uid_parent" && test -n "$gid_parent"
+        printf "%s:%s:1:1\\n" "$uid_parent" "$gid_parent"
+    ')"
+    IFS=: read -r host_uid host_gid expected_uid expected_gid <<< "$identity_fixture"
+    handoff="$(docker run --rm --env HOST_UID="$host_uid:$host_gid" --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/dev && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
     [[ -z "$handoff" ]]
 
     if [[ "$attr" == vscode-* ]]; then

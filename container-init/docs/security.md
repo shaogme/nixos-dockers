@@ -88,6 +88,8 @@ profile 仍然可以有意把 `bootstrap.handoff.runtime` 配成 `/bin/sh`，并
 - `current` action 使用当前有效身份；
 - `process.drop_privileges` 只允许 root，成功后通过 `setgid`/`setuid` 降权且不可恢复；
 - `identity.map_user` 和 `process.set_user_shell` 修改的是 POSIX account database，应只在 image/admin profile 声明。
+- `HOST_UID`/`HOST_GID` 只有在声明 namespace 后才会转换；无法读取或覆盖 namespace map 时 fail closed，不会把宿主 ID 当作容器 ID。
+- workspace 自动属主映射只接受 mountinfo 证明的挂载点；普通 rootfs 目录、不可读 mountinfo 和未知状态不会产生 root 身份。
 
 不要只把 `owner = "identity.target"` 当成权限边界。真正的写入权限还取决于 action 的 `run_as`、当前进程的有效凭据、父目录权限和 mount 状态。
 

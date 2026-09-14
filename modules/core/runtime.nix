@@ -135,12 +135,14 @@ let
     [bootstrap.inputs.HOST_UID]
     target = "identity.uid"
     type = "uid_pair"
+    namespace = "host"
     runtime = true
     format = "uid[:gid]"
 
     [bootstrap.inputs.HOST_GID]
     target = "identity.gid"
     type = "gid"
+    namespace = "host"
     runtime = true
 
     [bootstrap.inputs.RUN_AS_ROOT]

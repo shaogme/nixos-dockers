@@ -24,7 +24,7 @@ pub use config::{
     NonInteractivePolicy,
 };
 pub use error::ModelError;
-pub use input::{BootstrapInput, InputType, InputValue, ParsedInput};
+pub use input::{BootstrapInput, InputNamespace, InputType, InputValue, ParsedInput};
 pub use path::PathTemplate;
 pub use plan::{Plan, PlanEffect, PlanPhase, PlannedAction};
 pub use provenance::{Origin, SourceKind};

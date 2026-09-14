@@ -275,9 +275,8 @@ depends_on = ["drop"]
         ),
     )
     .unwrap();
-    let script = format!(
-        "printf 'HOME=%s USER=%s LOGNAME=%s UID=%s GID=%s\\n' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$(id -u)\" \"$(id -g)\"",
-    );
+    let script =
+        "printf 'HOME=%s USER=%s LOGNAME=%s UID=%s GID=%s\\n' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$(id -u)\" \"$(id -g)\"";
     let output = Command::new(binary())
         .args([
             "--profiles-dir",

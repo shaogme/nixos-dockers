@@ -3,8 +3,8 @@ use bootstrap_model::{
     IdentityConfig, NonInteractivePolicy, Origin, PlanPhase, RunAs,
 };
 use container_init_core::{
-    ActionStatus, CoreError, ExecutionOptions, IdentityResolver, PlanExecutor, PosixSystem,
-    RuntimeContext, SshCapability,
+    ActionStatus, CoreError, ExecutionOptions, IdentityResolver, IdentitySource, PlanExecutor,
+    PosixSystem, RuntimeContext, SshCapability, WorkspaceObservation, WorkspaceStatus,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -57,6 +57,129 @@ fn root_action(id: &str, kind: ActionKind) -> Action {
 fn executor(config: BootstrapConfig) -> PlanExecutor {
     let cwd = config.workspace_root.clone();
     PlanExecutor::new(config, RuntimeContext::new(cwd))
+}
+
+fn identity_input_config(workspace: &Path) -> BootstrapConfig {
+    let mut config = config(workspace, Vec::new());
+    config.identity.default_user = Some("dev".to_owned());
+    config.identity.default_uid = Some(1000);
+    config.identity.default_gid = Some(1000);
+    config.identity.auto_mapping = true;
+    config.identity.uid_input = Some("HOST_UID".to_owned());
+    config.identity.gid_input = Some("HOST_GID".to_owned());
+    config.inputs = [
+        (
+            "HOST_UID".to_owned(),
+            bootstrap_model::BootstrapInput {
+                target: "identity.uid".to_owned(),
+                input_type: bootstrap_model::InputType::UidPair,
+                aliases: Vec::new(),
+                runtime: true,
+                format: Some("uid[:gid]".to_owned()),
+                namespace: Some(bootstrap_model::InputNamespace::Host),
+                default: None,
+                allow_outside_workspace: false,
+            },
+        ),
+        (
+            "HOST_GID".to_owned(),
+            bootstrap_model::BootstrapInput {
+                target: "identity.gid".to_owned(),
+                input_type: bootstrap_model::InputType::Gid,
+                aliases: Vec::new(),
+                runtime: true,
+                format: None,
+                namespace: Some(bootstrap_model::InputNamespace::Host),
+                default: None,
+                allow_outside_workspace: false,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    config
+}
+
+#[test]
+fn host_namespace_inputs_are_translated_before_identity_selection() {
+    let temp = TempDir::new().unwrap();
+    let config = identity_input_config(temp.path());
+    let posix = PosixSystem::new()
+        .with_namespace_map_contents("100000 2000 1000\n", "200000 2000 1000\n")
+        .unwrap();
+    let context = RuntimeContext::new(temp.path())
+        .with_environment([("HOST_UID", "2000:2000"), ("HOST_GID", "2000")]);
+    let identity = IdentityResolver::with_posix(posix)
+        .resolve(&config, &context)
+        .unwrap();
+    assert_eq!((identity.uid, identity.gid), (100000, 200000));
+    assert_eq!(identity.user, "dev");
+    assert_eq!(identity.uid_source, IdentitySource::ExplicitHost);
+    assert_eq!(identity.gid_source, IdentitySource::ExplicitHost);
+    assert_eq!(identity.workspace, WorkspaceStatus::NotMounted);
+}
+
+#[test]
+fn mapped_host_root_is_canonical_root_and_unmapped_ids_fail() {
+    let temp = TempDir::new().unwrap();
+    let config = identity_input_config(temp.path());
+    let posix = PosixSystem::new()
+        .with_namespace_map_contents("0 1000 1\n", "0 1000 1\n")
+        .unwrap();
+    let context = RuntimeContext::new(temp.path())
+        .with_environment([("HOST_UID", "1000"), ("HOST_GID", "1000")]);
+    let identity = IdentityResolver::with_posix(posix.clone())
+        .resolve(&config, &context)
+        .unwrap();
+    assert_eq!((identity.uid, identity.gid), (0, 0));
+    assert_eq!(
+        (identity.user, identity.home),
+        ("root".to_owned(), Path::new("/root").to_path_buf())
+    );
+
+    let error = IdentityResolver::with_posix(posix)
+        .resolve(
+            &config,
+            &RuntimeContext::new(temp.path())
+                .with_environment([("HOST_UID", "2000"), ("HOST_GID", "2000")]),
+        )
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Identity { .. }));
+}
+
+#[test]
+fn workspace_owner_is_used_only_when_mount_observation_is_explicitly_mounted() {
+    let temp = TempDir::new().unwrap();
+    let mut config = config(temp.path(), Vec::new());
+    config.identity.default_user = Some("dev".to_owned());
+    config.identity.default_uid = Some(1000);
+    config.identity.default_gid = Some(1000);
+    config.identity.auto_mapping = true;
+
+    let not_mounted = IdentityResolver::new()
+        .resolve(
+            &config,
+            &RuntimeContext::new(temp.path()).with_workspace_observation(
+                WorkspaceObservation::NotMounted {
+                    reason: "rootfs directory".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+    assert_eq!((not_mounted.uid, not_mounted.gid), (1000, 1000));
+    assert_eq!(not_mounted.uid_source, IdentitySource::ProfileDefault);
+
+    let mounted = IdentityResolver::new()
+        .resolve(
+            &config,
+            &RuntimeContext::new(temp.path())
+                .with_workspace_observation(WorkspaceObservation::mounted(0, 0, temp.path(), 7)),
+        )
+        .unwrap();
+    assert_eq!((mounted.uid, mounted.gid), (0, 0));
+    assert_eq!(mounted.user, "root");
+    assert_eq!(mounted.home, Path::new("/root"));
+    assert_eq!(mounted.uid_source, IdentitySource::WorkspaceMount);
 }
 
 fn fake_ssh_keygen(root: &Path) -> std::path::PathBuf {
@@ -126,7 +249,7 @@ fn filesystem_actions_are_idempotent_and_atomic() {
 fn rendered_identity_paths_and_runtime_input_precedence_are_safe() {
     let temp = TempDir::new().unwrap();
     let mut config = config(temp.path(), vec![]);
-    config.identity.default_user = Some("root".to_owned());
+    config.identity.default_user = Some("dev".to_owned());
     config.identity.default_uid = Some(1234);
     config.identity.default_gid = Some(1234);
     config.identity.uid_input = Some("HOST_UID".to_owned());
@@ -141,6 +264,7 @@ fn rendered_identity_paths_and_runtime_input_precedence_are_safe() {
                 aliases: vec!["LEGACY_UID".to_owned()],
                 runtime: true,
                 format: Some("uid[:gid]".to_owned()),
+                namespace: Some(bootstrap_model::InputNamespace::Container),
                 default: None,
                 allow_outside_workspace: false,
             },
@@ -153,6 +277,7 @@ fn rendered_identity_paths_and_runtime_input_precedence_are_safe() {
                 aliases: vec![],
                 runtime: true,
                 format: None,
+                namespace: Some(bootstrap_model::InputNamespace::Container),
                 default: None,
                 allow_outside_workspace: false,
             },
@@ -165,6 +290,7 @@ fn rendered_identity_paths_and_runtime_input_precedence_are_safe() {
                 aliases: vec![],
                 runtime: true,
                 format: None,
+                namespace: None,
                 default: None,
                 allow_outside_workspace: true,
             },

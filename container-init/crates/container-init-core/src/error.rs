@@ -116,6 +116,7 @@ impl CoreError {
     pub(crate) fn from_posix(action: &str, path: Option<PathBuf>, error: PosixError) -> Self {
         match error {
             PosixError::Invalid(message) => Self::action(action, path, message),
+            PosixError::Namespace(message) => Self::Identity { message },
             PosixError::Permission(message) => Self::Permission {
                 action: Some(action.to_owned()),
                 message,

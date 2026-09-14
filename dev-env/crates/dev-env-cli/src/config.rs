@@ -43,12 +43,10 @@ impl LoadedConfig {
         &self.cwd
     }
 
-    #[allow(dead_code)]
     pub fn workspace_config_present(&self) -> bool {
         self.workspace_config_present
     }
 
-    #[allow(dead_code)]
     pub fn user_id(&self) -> u32 {
         self.user_id
     }
@@ -155,8 +153,8 @@ pub fn runtime_context(
         ),
     };
     Ok(context
-        .with_user_id(loaded.user_id)
-        .with_workspace_config_present(loaded.workspace_config_present))
+        .with_user_id(loaded.user_id())
+        .with_workspace_config_present(loaded.workspace_config_present()))
 }
 
 fn select_profile(options: &CliOptions) -> Result<String, CliError> {

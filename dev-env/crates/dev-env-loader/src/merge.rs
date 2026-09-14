@@ -2,7 +2,7 @@ use crate::error::{ConflictRemedy, LoaderError, TrustViolationReason, ValueKind}
 use crate::raw::{table, RawProfile};
 use crate::source::{LoadedProfile, ProfileSource, SourceKind};
 use dev_env_model::{
-    Layer, ModelError, Origin, OverrideOperation, OverrideSpec, ParsedInput, PolicyConfig,
+    ModelError, Origin, OverrideOperation, OverrideSpec, ParsedInput, PolicyConfig,
     ProvenanceIndex, ResolvedConfig, Sensitivity, ValueTree,
 };
 use std::collections::BTreeMap;
@@ -641,7 +641,3 @@ pub(crate) fn parsed_input_value(value: ParsedInput) -> ValueTree {
     parsed_input_to_value(value)
 }
 
-#[allow(dead_code)]
-fn _layer_is_runtime(layer: Layer) -> bool {
-    layer == Layer::Runtime
-}

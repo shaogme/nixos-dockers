@@ -9,6 +9,19 @@ pub(crate) fn current_ids() -> (u32, u32) {
     unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
+pub(crate) fn supplementary_groups_contain(gid: u32) -> Result<bool, crate::error::PosixError> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(crate::error::PosixError::io(io::Error::last_os_error()));
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let result = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    if result < 0 {
+        return Err(crate::error::PosixError::io(io::Error::last_os_error()));
+    }
+    Ok(groups[..result as usize].contains(&(gid as libc::gid_t)))
+}
+
 pub(crate) fn lookup_user_by_name(
     system: &PosixSystem,
     name: &str,
@@ -74,20 +87,47 @@ fn lookup_file_user(
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(source),
     };
-    Ok(contents.lines().find_map(|line| {
+    for (line_number, line) in contents.lines().enumerate() {
         if line.starts_with('#') || line.trim().is_empty() {
-            return None;
+            continue;
         }
         let fields = line.split(':').map(str::to_owned).collect::<Vec<_>>();
-        if fields.len() < 7 || !predicate(&fields) {
-            return None;
+        if fields.len() != 7 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed passwd entry on line {}", line_number + 1),
+            ));
         }
-        Some(PosixUser {
-            name: fields[0].clone(),
-            uid: fields[2].parse().ok()?,
-            gid: fields[3].parse().ok()?,
-            home: fields[5].clone().into(),
-            shell: fields[6].clone().into(),
-        })
-    }))
+        if fields[0].is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "passwd entry on line {} has an empty user name",
+                    line_number + 1
+                ),
+            ));
+        }
+        let uid = fields[2].parse::<u32>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed passwd UID on line {}", line_number + 1),
+            )
+        })?;
+        let gid = fields[3].parse::<u32>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed passwd GID on line {}", line_number + 1),
+            )
+        })?;
+        if predicate(&fields) {
+            return Ok(Some(PosixUser {
+                name: fields[0].clone(),
+                uid,
+                gid,
+                home: fields[5].clone().into(),
+                shell: fields[6].clone().into(),
+            }));
+        }
+    }
+    Ok(None)
 }

@@ -6,7 +6,8 @@ POSIX 基础设施操作，然后把当前进程交给 profile 指定的 runtime
 
 它解决的是“容器启动前需要准备什么”，例如：
 
-- 根据挂载 workspace 的属主或 `HOST_UID`/`HOST_GID` 选择目标 UID、GID、用户名和 HOME；
+- 仅根据已证明的 workspace 挂载属主或显式输入选择目标 UID、GID、用户名和 HOME；
+- 将声明为宿主 namespace 的 `HOST_UID`/`HOST_GID` 映射为当前容器 namespace 的 ID；
 - 创建 HOME、缓存目录、配置目录以及声明的软链接；
 - 必要时更新 passwd/group 和登录 shell；
 - 按声明准备可选的 OpenSSH host key、authorized keys 和运行目录；
@@ -19,7 +20,7 @@ Compose 注入的开发环境变量会随进程环境保留到 handoff runtime�
 后的 `dev-env` environment DSL。`container-init` 不解析这些变量，也不会因为
 `SCCACHE_DISABLE=1` 修改 `RUSTC_WRAPPER`。
 
-> 本 README 以当前 `container-init` 源码为准。仓库顶层的设计提案包含一些尚未进入当前 CLI 的扩展设想；实现状态和边界见[实现状态与边界](#实现状态与边界)。
+> 本 README 以当前 `container-init` 源码为准。身份 namespace 映射、挂载证据和 root service handoff 的实现约定见仓库顶层设计文档及[实现状态与边界](#实现状态与边界)。
 
 ## 文档导航
 
@@ -127,6 +128,7 @@ home_input = "CONTAINER_HOME"
 [bootstrap.inputs.HOST_UID]
 target = "identity.uid"
 type = "uid_pair"
+namespace = "host"
 aliases = ["UID_GID"]
 runtime = true
 format = "uid[:gid]"
@@ -134,6 +136,7 @@ format = "uid[:gid]"
 [bootstrap.inputs.HOST_GID]
 target = "identity.gid"
 type = "gid"
+namespace = "host"
 runtime = true
 
 [bootstrap.inputs.CONTAINER_HOME]
@@ -189,11 +192,12 @@ container-init --profile example \
 当前已经实现：
 
 - TOML profile 读取、`extends` 继承、父子冲突诊断和显式 override；
-- `identity.resolve`、`identity.map_user`、`identity.ensure_home`；
+- `identity.resolve`、`identity.map_user`、`identity.ensure_home`；UID 0 始终规范化为 `root`/`/root`，不会重写为开发用户；
 - `filesystem.ensure_dir`、`ensure_file`、`ensure_symlink`、`chown`、`chmod`；
 - `process.set_user_shell`、`process.drop_privileges`、`handoff.exec`；
 - 可选 `service.ssh.prepare`，仅通过受信任的 `ssh-keygen` capability 生成 host key；
 - `plan --json`、`doctor --json`、结构化错误、非阻塞锁和原子 receipt；
+- Linux mountinfo workspace 挂载证据、UID/GID namespace 映射和 group 成员 reconcile；
 - 独立的 `bootstrap-model`、`bootstrap-loader`、`container-init-core`、`container-init-posix` 和 `container-init-cli` crate。
 
 当前 CLI/源码没有实现或不负责：

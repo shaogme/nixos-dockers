@@ -12,6 +12,13 @@ pub struct BootstrapInput {
     pub aliases: Vec<String>,
     pub runtime: bool,
     pub format: Option<String>,
+    /// The namespace in which a UID/GID runtime value is expressed.
+    ///
+    /// This is deliberately optional at the Rust representation boundary so
+    /// that the model can produce a useful validation error for legacy
+    /// profiles which omitted it. It is required for every UID/GID input.
+    #[serde(default)]
+    pub namespace: Option<InputNamespace>,
     pub default: Option<InputValue>,
     #[serde(default)]
     pub allow_outside_workspace: bool,
@@ -39,6 +46,24 @@ impl BootstrapInput {
                     "input target {:?} requires type {:?}",
                     self.target, expected_type
                 ),
+            });
+        }
+        if matches!(self.input_type, InputType::UidPair | InputType::Gid)
+            && self.namespace.is_none()
+        {
+            return Err(ModelError::Invalid {
+                location: format!("bootstrap.inputs.{name}.namespace"),
+                message:
+                    "UID/GID inputs must explicitly declare namespace = \"host\" or \"container\""
+                        .to_owned(),
+            });
+        }
+        if !matches!(self.input_type, InputType::UidPair | InputType::Gid)
+            && self.namespace.is_some()
+        {
+            return Err(ModelError::Invalid {
+                location: format!("bootstrap.inputs.{name}.namespace"),
+                message: "namespace is only valid for uid_pair and gid inputs".to_owned(),
             });
         }
         for alias in &self.aliases {
@@ -103,6 +128,15 @@ pub enum InputType {
     Gid,
     Bool,
     Path,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputNamespace {
+    /// The parent user namespace of the current process.
+    Host,
+    /// The current process user namespace.
+    Container,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]

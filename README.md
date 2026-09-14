@@ -11,7 +11,7 @@
 - **VS Code 优化**:
   - 内置 `nix-ld` 支持，完美运行 VS Code Server 及其各类扩展（如 Copilot）。
   - 遵循 FHS 标准的软链接，解决非 Nix 二进制程序的依赖问题。
-- **自适应 UID/GID 映射**: 挂载宿主机目录时自动探测或支持通过 `HOST_UID:HOST_GID` 动态匹配宿主机用户权限，使用 `su-exec` 切换至匹配的本地普通用户（`dev`），彻底解决容器构建产物与宿主机权限冲突问题。
+- **自适应 UID/GID 映射**: 仅在 mountinfo 证明工作区确实为挂载点时探测挂载视角下的属主；普通 rootfs 目录回退到 profile 默认身份。`HOST_UID`/`HOST_GID` 显式输入会按声明的 host namespace 转换，兼容 Rootless Podman/Docker，并由 `container-init` 声明式降权。
 - **开箱即用**:
   - 内置 SSH 服务，支持远程连接。
   - 系统级 Git 安全目录：镜像制作时自动写入 `/etc/gitconfig`（默认将工作区 `/workspace` 设为 `safe.directory`），彻底解决宿主机挂载或跨用户操作时的 Git `dubious ownership` 权限告警。
@@ -54,7 +54,6 @@
 docker run -d \
   --name nix-dev \
   -p 2222:22 \
-  -e HOST_UID=$(id -u):$(id -g) \
   -v $(pwd):/workspace \
   ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
 ```
@@ -62,8 +61,13 @@ docker run -d \
 ### 2. 使用 Docker 运行通用 CLI 镜像（无 SSH）
 
 ```bash
+# 运行 mise 镜像
 docker run -it --rm \
-  -e HOST_UID=$(id -u):$(id -g) \
+  -v $(pwd):/workspace \
+  ghcr.io/shaogme/nixos-dockers/mise:latest
+
+# 或运行 rust 镜像
+docker run -it --rm \
   -v $(pwd):/workspace \
   ghcr.io/shaogme/nixos-dockers/rust:latest
 ```
@@ -75,7 +79,8 @@ services:
   nix-dev:
     image: ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
     environment:
-      - HOST_UID=${HOST_UID:-1000:1000}
+      # 已确认 /workspace 为挂载点时自动探测属主；若需显式覆盖可解开下行注释：
+      # - HOST_UID=${HOST_UID:-1000:1000}
       - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev}
     ports:
       - "2222:22"
@@ -91,7 +96,8 @@ services:
 > 若需切换为 root 身份运行，只需在启动时传入环境变量：
 >
 > ```bash
-> HOST_UID=0 CONTAINER_HOME=/root docker compose up -d
+> RUN_AS_ROOT=1 CONTAINER_HOME=/root docker compose up -d
+> # 或 HOST_UID=0 CONTAINER_HOME=/root docker compose up -d（仅在当前 namespace 映射了宿主 UID 0 时）
 > ```
 >
 > 卷将自动无缝重定向挂载至 `/root/.xxx`，底层脚本 0 硬编码，所见即所得。

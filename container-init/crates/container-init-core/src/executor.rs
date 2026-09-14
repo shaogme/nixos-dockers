@@ -3,7 +3,7 @@ use crate::context::RuntimeContext;
 use crate::error::CoreError;
 use crate::filesystem;
 use crate::handoff::HandoffCommand;
-use crate::identity::{IdentityResolver, ResolvedIdentity, ResolvedInputs};
+use crate::identity::{IdentityResolver, ResolvedIdentity, ResolvedInputs, WorkspaceStatus};
 use crate::lock::BootstrapLock;
 use crate::receipt;
 use crate::ssh::{self, SshCapability};
@@ -83,6 +83,8 @@ pub struct ExecutionReport {
     pub identity: ResolvedIdentity,
     pub outcomes: Vec<ActionOutcome>,
     pub handoff: Option<HandoffCommand>,
+    pub root_service_handoff: bool,
+    pub warnings: Vec<String>,
 }
 
 impl ExecutionReport {
@@ -138,6 +140,8 @@ impl PlanExecutor {
         let _lock = self.acquire_lock()?;
         let resolver = IdentityResolver::with_posix(self.options.posix.clone());
         let identity = resolver.resolve(&self.config, &self.context)?;
+        let root_service_handoff = self.is_root_service_handoff(command);
+        let warnings = identity_warnings(&self.config, &identity);
         let inputs = resolver.resolve_inputs(&self.config, &self.context)?;
         let values = interpolation_values(&self.config, &self.context, &identity, &inputs);
         let condition_context = ConditionContext::new(
@@ -205,9 +209,7 @@ impl PlanExecutor {
             // A configured SSH daemon is a root-owned service handoff. Keep
             // the bootstrap process privileged for that one command; the
             // login shell still receives the resolved identity later.
-            if action.kind == ActionKind::ProcessDropPrivileges
-                && self.is_root_service_handoff(command)
-            {
+            if action.kind == ActionKind::ProcessDropPrivileges && root_service_handoff {
                 let outcome = ActionOutcome {
                     id: planned.id.clone(),
                     kind: planned.kind,
@@ -216,6 +218,30 @@ impl PlanExecutor {
                     status: ActionStatus::Succeeded,
                     path: action_path(action, &values)?,
                     message: "privilege drop skipped for root service handoff".to_owned(),
+                    error: None,
+                };
+                completed.insert(planned.id.clone(), ActionStatus::Succeeded);
+                outcomes.push(outcome);
+                continue;
+            }
+
+            if identity.uid == 0
+                && matches!(
+                    action.kind,
+                    ActionKind::IdentityMapUser
+                        | ActionKind::IdentityEnsureHome
+                        | ActionKind::ProcessSetUserShell
+                        | ActionKind::ProcessDropPrivileges
+                )
+            {
+                let outcome = ActionOutcome {
+                    id: planned.id.clone(),
+                    kind: planned.kind,
+                    phase: planned.phase,
+                    origin: planned.origin.clone(),
+                    status: ActionStatus::Succeeded,
+                    path: action_path(action, &values)?,
+                    message: "ordinary target identity action skipped for root".to_owned(),
                     error: None,
                 };
                 completed.insert(planned.id.clone(), ActionStatus::Succeeded);
@@ -273,6 +299,8 @@ impl PlanExecutor {
             identity,
             outcomes,
             handoff,
+            root_service_handoff,
+            warnings,
         };
         self.write_receipt(&report)?;
         Ok(report)
@@ -289,10 +317,14 @@ impl PlanExecutor {
     /// Execute the plan and replace this process with the configured runtime.
     pub fn execute_and_handoff(&self, plan: &Plan, command: &[String]) -> Result<(), CoreError> {
         let report = self.execute(plan, command)?;
-        report
+        let handoff = report
             .handoff
-            .unwrap_or(self.build_handoff_command(command)?)
-            .exec_with_identity(Some(&report.identity))
+            .unwrap_or(self.build_handoff_command(command)?);
+        if report.root_service_handoff {
+            handoff.exec_as_root_service()
+        } else {
+            handoff.exec_with_identity(Some(&report.identity))
+        }
     }
 
     fn validate_plan(&self, plan: &Plan) -> Result<(), CoreError> {
@@ -498,6 +530,17 @@ fn posix_identity(identity: &ResolvedIdentity) -> PosixIdentity {
         identity.user.clone(),
         identity.home.clone(),
     )
+}
+
+fn identity_warnings(config: &BootstrapConfig, identity: &ResolvedIdentity) -> Vec<String> {
+    if config.identity.auto_mapping && identity.workspace != WorkspaceStatus::Mounted {
+        vec![format!(
+            "workspace auto-mapping was not used ({:?})",
+            identity.workspace
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn interpolation_values(
