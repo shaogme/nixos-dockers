@@ -428,7 +428,7 @@ fn env_string(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn effective_user_id() -> u32 {
+pub(crate) fn effective_user_id() -> u32 {
     #[cfg(unix)]
     {
         // libc is used only for this process fact; providers still receive it

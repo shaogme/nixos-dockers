@@ -79,8 +79,8 @@ services:
   nix-dev:
     image: ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
     environment:
-      # 已确认 /workspace 为挂载点时自动探测属主；若需显式覆盖可解开下行注释：
-      # - HOST_UID=${HOST_UID:-1000:1000}
+      # 已确认 /workspace 为挂载点时自动探测属主；需要显式覆盖时传入真实宿主 ID：
+      # - HOST_UID
       - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev}
     ports:
       - "2222:22"
@@ -99,8 +99,13 @@ services:
 > RUN_AS_ROOT=1 CONTAINER_HOME=/root docker compose up -d
 > # 或 HOST_UID=0 CONTAINER_HOME=/root docker compose up -d（仅在当前 namespace 映射了宿主 UID 0 时）
 > ```
+
 >
 > 卷将自动无缝重定向挂载至 `/root/.xxx`，底层脚本 0 硬编码，所见即所得。
+
+不要使用 `${HOST_UID:-1000:1000}` 作为通用默认值。`HOST_UID`/`HOST_GID` 按宿主
+namespace 映射，rootless 容器可能映射宿主 UID 1000 但未映射 GID 1000；未设置时让
+workspace 挂载属主自动解析，需要覆盖时请传入 `$(id -u):$(id -g)`。
 
 ### 4. 连接到开发环境
 
@@ -126,7 +131,7 @@ services:
 1. `container-init` 执行镜像 profile 声明的 UID/GID、目录、软链接和 SSH action，然后按 handoff 配置交给 `dev-env`。
 2. `dev-env` 加载 `/etc/dev-env/profiles.d`，物化 mise、Devbox、Rust 和其他 provider 的环境，并以同一份环境启动命令、shell 或 SSH login shell。
 
-`HOST_UID=uid[:gid]`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT=1` 是声明式 runtime input。`/bin/bash` 是兼容 shim，真实 Bash 位于 `/usr/local/libexec/dev-env/real/bash`；直接执行 `dev-env` 或 `docker exec ... dev-env ...` 会重新物化当前工作区环境。镜像不再包含旧的 `/bin/entrypoint.sh`。
+`HOST_UID=uid[:gid]`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT=1` 是声明式 runtime input。`/bin/bash` 与 `/usr/bin/bash` 是兼容 shim；root 的 `docker exec ... bash` 会先重新进入 `container-init` 身份 Bootstrap，非 root 则直接物化环境，真实 Bash 位于 `/usr/local/libexec/dev-env/real/bash`。需要 root 时显式传入 `RUN_AS_ROOT=1 CONTAINER_HOME=/root`，或使用 `/bin/sh`/real Bash 低层入口。镜像不再包含旧的 `/bin/entrypoint.sh`。
 
 ### 编写自定义 Dockerfile 示例
 
@@ -156,7 +161,7 @@ COPY .config/dev-env.toml /etc/dev-env/profiles.d/50-project.toml
 
 - `nix-ld`: 动态链接器封装，自动为非 Nix 二进制程序寻找所需的 `.so` 文件。
 - `direnv`: 进入目录时自动加载 `shell.nix` 或 `flake.nix` 环境。
-- `dev-env` Bash shim：确保通过 SSH 登录、交互终端和 `docker exec` 时使用同一份物化环境。
+- `dev-env` Bash shim：root 的 `docker exec` 先复用 `container-init` 身份 Bootstrap，再与 SSH 登录、交互终端共享同一份物化环境。
 - `/etc/gitconfig`: 构建期声明 Git `safe.directory`，保障容器工作区跨 UID/GID 权限时正常执行 Git 操作。
 
 ## 本地构建镜像
@@ -178,7 +183,7 @@ nix-build images/rust/image.nix
 
 ### 本地 Docker 集成测试
 
-每个 image 都提供一套 Docker 测试脚本。脚本会构建 CLI 与 VS Code Remote 两个变体，加载镜像，并验证 `container-init` 计划、`dev-env` 环境物化、运行时 handoff、登录 shell shim；VS Code 变体还会验证默认 SSH 服务能够部署并保持运行：
+每个 image 都提供一套 Docker 测试脚本。脚本会构建 CLI 与 VS Code Remote 两个变体，加载镜像，并验证 `container-init` 计划、`dev-env` 环境物化、运行时 handoff、登录 shell shim、root `docker exec` Bash 身份 Bootstrap；VS Code 变体还会验证默认 SSH 服务能够部署并保持运行：
 
 ```bash
 bash images/rust/tests/docker.sh

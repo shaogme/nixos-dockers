@@ -111,6 +111,33 @@ ENTRYPOINT ["/usr/bin/container-init", "run"]
 
 如果需要把 `run` 的命令参数传给 handoff runtime，使用 `--` 结束 `container-init` 自身的选项。没有显式命令时使用 `shell_prefix`；有显式命令时使用 `exec_prefix`。程序始终以 argv 调用，不把参数拼成 shell 字符串。
 
+### `docker exec` 与 Bash shim
+
+Docker daemon 不会为已运行容器重新执行 Entrypoint，因此它不会自动应用
+`container-init` 的身份解析和降权。镜像中的 `/bin/bash` 与 `/usr/bin/bash` 是
+`dev-env` 的兼容 shim；root 启动 shim 时，shim 会通过内部的
+`DEVENV_CONTAINER_INIT`、`DEVENV_BOOTSTRAP_REAL_SHELL` 路径重新执行：
+
+```text
+dev-env Bash shim
+  → container-init run -- /usr/local/libexec/dev-env/real/bash <原始 argv>
+  → identity.resolve / map_user / ensure_home / drop_privileges
+  → dev-env exec -- /usr/local/libexec/dev-env/real/bash <原始 argv>
+```
+
+这些变量只标记镜像提供的内部能力，shim 不会猜测 PATH 中的程序，也不会复制
+UID/GID 解析逻辑。`HOST_UID`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT` 会
+随继承环境传给 Bootstrap。需要保留 root 时显式使用：
+
+```bash
+docker exec -e RUN_AS_ROOT=1 -e CONTAINER_HOME=/root -it <container> bash
+```
+
+`/usr/bin/dev-env-login-shell` 是 root SSH 的稳定 login shell，不会因为 `/bin/bash`
+shim 而把 root 登录映射到开发用户；`/bin/sh` 和 real Bash 是低层诊断/显式逃生
+入口，不会自动运行身份 Bootstrap。`docker exec` 的自动身份行为来自 shim 委托，
+不是 Docker daemon 修改了容器默认用户。
+
 ### 3. 用运行时输入映射宿主身份
 
 profile 先声明输入，CLI 或环境变量才可以设置它：
@@ -156,6 +183,12 @@ container-init --profile example \
   --input HOST_UID=1001:1001 --input HOST_GID=1001 \
   run
 ```
+
+Compose 或其他编排默认不应把 `HOST_UID` 写成 `${HOST_UID:-1000:1000}`。这里的值
+声明为宿主 namespace 后，UID 和 GID 都必须存在于当前进程的 namespace map 中；在
+rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映射。未设置
+`HOST_UID` 时会使用已确认的 workspace 挂载属主或 profile 默认值；需要显式覆盖时，
+请传入真实的宿主 UID/GID，例如 `HOST_UID=$(id -u):$(id -g)`。
 
 对 `runtime = true` 的输入，优先级是 CLI `--input`/`--set`，其次是环境变量，最后是 profile 的 `default`。CLI 同名输入优先于环境变量；输入必须在 profile 中声明，未声明的 `--input` 直接以配置错误退出。
 

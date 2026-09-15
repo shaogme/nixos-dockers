@@ -101,7 +101,13 @@ dev-env shim \
   -- -lc 'echo "$PATH"'
 ```
 
-它只负责：物化环境 → 使用不可递归的绝对 real path → 原样转发 argv。镜像中的 `/bin/bash` 是指向 `dev-env` 的 symlink；CLI 根据 argv0 把它识别为 Bash shim，并使用 `DEVENV_REAL_SHELL` 或默认 `/usr/local/libexec/dev-env/real/bash`。
+非 root shim 只负责：物化环境 → 使用不可递归的绝对 real path → 原样转发 argv。
+镜像中的 `/bin/bash` 和 `/usr/bin/bash` 是指向 `dev-env` 的 symlink；CLI 根据
+argv0 把它识别为 Bash shim，并使用 `DEVENV_REAL_SHELL` 或默认
+`/usr/local/libexec/dev-env/real/bash`。当 shim 以 root 启动且镜像提供
+`DEVENV_CONTAINER_INIT` 与 `DEVENV_BOOTSTRAP_REAL_SHELL` 时，它会在加载 profile 前
+以继承环境的结构化 argv 委托给 `container-init run -- real-bash ...`，因此不会先
+以 root 物化一次 provider。
 
 `--real` 与配置的 shim 路径必须分离。直接将 real shell 配置成 `/bin/bash` 会导致 `/bin/bash` 再回到 dev-env，应该把真实 executable 放在 profile 明确的非 shim 路径。
 
@@ -222,7 +228,12 @@ docker exec <container> dev-env exec -- cargo test
 docker exec <container> dev-env print --format json
 ```
 
-如果镜像安装 Bash shim，`docker exec -it <container> bash -lc ...` 也会重新 materialize。直接指定 `/nix/store/.../bash`、`/bin/sh` 或任意非 shell binary 不会自动注入开发环境；此时请显式写 `dev-env exec --`。
+如果镜像安装 Bash shim，root 的 `docker exec -it <container> bash -lc ...` 和
+`docker exec -it <container> /bin/bash -lc ...` 会先重新进入身份 Bootstrap，再
+materialize；非 root 调用则直接 materialize。需要保留 root 时显式传入
+`RUN_AS_ROOT=1` 和 `CONTAINER_HOME=/root`。直接指定 `/nix/store/.../bash`、
+`/bin/sh` 或任意非 shell binary 不会自动注入开发环境；此时请显式写
+`dev-env exec --`。
 
 ### SSH
 

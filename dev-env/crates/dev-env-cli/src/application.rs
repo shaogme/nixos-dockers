@@ -1,11 +1,12 @@
 use crate::args::{Cli, CliCommand, CliOptions};
 use crate::config::LoadedConfig;
-use crate::error::CliError;
+use crate::error::{BootstrapError, BootstrapPathError, CliError};
 use crate::{config, doctor, explain, output, process, trust};
 use dev_env_core::{ContextError, CoreError, Materialization, Materializer};
 use dev_env_model::ShellConfig;
 use dev_env_shell::{build_invocation, CommandLine, ConfiguredShellAdapter, ShellInvocation, Shim};
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 
 pub fn run<I>(arguments: I) -> Result<i32, CliError>
@@ -98,6 +99,13 @@ fn run_shim(
     real: &Path,
     args: Vec<OsString>,
 ) -> Result<i32, CliError> {
+    if config::effective_user_id() == 0 {
+        if let Some(paths) = BootstrapPaths::from_environment()? {
+            let line = paths.build_command(&args)?;
+            return process::execute_inherited(line);
+        }
+    }
+
     let loaded = config::load(options)?;
     let materialization = materialize(&loaded, Some(shell))?;
     // The configured shell command is the real executable that the shim must
@@ -107,6 +115,117 @@ fn run_shim(
     // layout and is not the configured real shell command.
     let line = Shim::new(real).build(&args)?;
     process::execute(line, materialization.environment(), loaded.cwd())
+}
+
+const CONTAINER_INIT_ENV: &str = "DEVENV_CONTAINER_INIT";
+const BOOTSTRAP_REAL_SHELL_ENV: &str = "DEVENV_BOOTSTRAP_REAL_SHELL";
+
+struct BootstrapPaths {
+    container_init: std::path::PathBuf,
+    real_shell: std::path::PathBuf,
+}
+
+impl BootstrapPaths {
+    fn from_environment() -> Result<Option<Self>, CliError> {
+        let container_init = std::env::var_os(CONTAINER_INIT_ENV);
+        let real_shell = std::env::var_os(BOOTSTRAP_REAL_SHELL_ENV);
+        if container_init.is_none() && real_shell.is_none() {
+            return Ok(None);
+        }
+
+        let container_init = container_init
+            .ok_or(BootstrapError::MissingVariable {
+                variable: CONTAINER_INIT_ENV,
+            })
+            .map(std::path::PathBuf::from)?;
+        let real_shell = real_shell
+            .ok_or(BootstrapError::MissingVariable {
+                variable: BOOTSTRAP_REAL_SHELL_ENV,
+            })
+            .map(std::path::PathBuf::from)?;
+
+        validate_bootstrap_executable(CONTAINER_INIT_ENV, &container_init)?;
+        validate_bootstrap_executable(BOOTSTRAP_REAL_SHELL_ENV, &real_shell)?;
+        if real_shell == Path::new("/bin/bash") || real_shell == Path::new("/usr/bin/bash") {
+            return Err(BootstrapError::RecursiveShell { path: real_shell }.into());
+        }
+
+        Ok(Some(Self {
+            container_init,
+            real_shell,
+        }))
+    }
+
+    fn build_command(&self, args: &[OsString]) -> Result<CommandLine, CliError> {
+        let mut bootstrap_args = Vec::with_capacity(args.len() + 3);
+        bootstrap_args.push(OsString::from("run"));
+        bootstrap_args.push(OsString::from("--"));
+        bootstrap_args.push(self.real_shell.clone().into_os_string());
+        bootstrap_args.extend(args.iter().cloned());
+        CommandLine::try_new(self.container_init.clone(), bootstrap_args)
+            .map_err(CliError::CommandLine)
+    }
+}
+
+fn validate_bootstrap_executable(variable: &'static str, path: &Path) -> Result<(), CliError> {
+    let reason = if path.as_os_str().is_empty() {
+        Some(BootstrapPathError::Empty)
+    } else if contains_nul(path) {
+        Some(BootstrapPathError::Nul)
+    } else if !path.is_absolute() {
+        Some(BootstrapPathError::Relative)
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(BootstrapError::InvalidPath {
+            variable,
+            path: path.to_path_buf(),
+            reason,
+        }
+        .into());
+    }
+
+    let metadata = fs::metadata(path).map_err(|source| BootstrapError::NotExecutable {
+        variable,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let executable = metadata.is_file() && {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    };
+    if !executable {
+        return Err(BootstrapError::NotExecutable {
+            variable,
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path is not a regular executable file",
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn contains_nul(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().contains(&0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.as_os_str().to_string_lossy().contains('\0')
+    }
 }
 
 fn materialize(loaded: &LoadedConfig, shell: Option<&str>) -> Result<Materialization, CliError> {

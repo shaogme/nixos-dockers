@@ -22,7 +22,8 @@ pub use config::{
 };
 pub use doctor::{inspect, DoctorCheck, DoctorIssue, DoctorReport, DoctorStatus};
 pub use error::{
-    CliError, ConfigurationError, DefaultProfileReason, IoOperation, OutputError, TrustError,
+    BootstrapError, BootstrapPathError, CliError, ConfigurationError, DefaultProfileReason,
+    IoOperation, OutputError, TrustError,
 };
 pub use explain::{build_report, ExplainProvenance, ExplainReport};
 pub use trust::trust as trust_path;

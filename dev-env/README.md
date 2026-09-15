@@ -58,6 +58,11 @@ Docker Compose 注入的环境变量只有在 profile 的 `[inputs]` 中声明�
 `inherit_process = true` 时只作为 ambient environment 继承。这一边界避免
 Compose 中的任意变量意外改变镜像行为。
 
+`HOST_UID` 是由 `container-init` 解析的宿主 namespace 输入，不应使用
+`${HOST_UID:-1000:1000}` 作为通用默认值：rootless user namespace 可能没有覆盖宿主
+GID 1000。Compose 未设置 `HOST_UID` 时会使用已验证的 workspace 挂载属主；需要显式
+映射时请传入当前宿主机的实际值，例如 `HOST_UID=$(id -u):$(id -g)`。
+
 Rust 镜像使用这一机制配置 Cargo 和 sccache：
 
 ```yaml
@@ -97,13 +102,25 @@ docker exec <container> dev-env explain environment.variables.PATH
 docker exec <container> dev-env doctor --json
 ```
 
-镜像还可以把 `/bin/bash` 做成兼容 shim，因此旧的 `docker exec ... bash -lc ...` 会先重新物化环境：
+镜像还可以把 `/bin/bash` 和 `/usr/bin/bash` 做成兼容 shim。root 启动的
+`docker exec ... bash -lc ...` 会先重新进入 `container-init` 的身份 Bootstrap，
+再物化环境并启动真实 Bash；已经以目标用户运行的 shell 只会物化环境：
 
 ```bash
 docker exec -it <container> bash -lc 'printf "%s\\n" "$PATH"'
+docker exec -it <container> /bin/bash -lc 'id && printf "%s\\n" "$HOME"'
 ```
 
-`/bin/sh` 则保留为真实的 POSIX shell，直接使用 `docker exec ... /bin/sh` 是低层诊断入口，不会自动运行 `dev-env`。需要开发环境时请使用 `dev-env exec -- sh ...`。
+需要 root 时显式声明：
+
+```bash
+docker exec -e RUN_AS_ROOT=1 -e CONTAINER_HOME=/root -it <container> bash
+```
+
+`/usr/bin/dev-env-login-shell` 是 root SSH 使用的稳定 login shell；`/bin/sh` 和
+`/usr/local/libexec/dev-env/real/bash` 是绕过 Bootstrap 的低层入口。直接使用
+`docker exec ... /bin/sh` 不会自动运行 `dev-env`；需要开发环境时请使用
+`dev-env exec -- sh ...`。
 
 ### 从源码构建
 
@@ -139,7 +156,9 @@ cargo clippy --workspace --all-targets --locked
 | Docker 默认命令 | `container-init` → `dev-env exec/shell` | 当前用户、cwd、profile、provider |
 | `docker exec` 非 shell 命令 | `dev-env exec -- <command>` | 重新解析当前会话 |
 | `docker exec` 交互 shell | `dev-env shell` | 重新解析当前会话 |
-| 兼容 Bash 调用 | `/bin/bash` shim | 重新解析后转发原始 argv |
+| root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | Bootstrap 身份、再物化并转发原始 argv |
+| 非 root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | 直接物化并转发原始 argv |
+| 显式 root | `RUN_AS_ROOT=1 ... bash` | 保留 root，仍物化环境 |
 | SSH 登录 | `/usr/bin/dev-env-login-shell` | 重新解析 SSH 用户的环境 |
 | 仅查看 | `print` / `explain` / `doctor` | 不启动目标 shell；`explain`/`doctor` 不执行 provider |
 
@@ -153,9 +172,10 @@ child process 由 `CommandLine` 使用 `env_clear()` 后注入 `MaterializedEnv`
 | --- | --- | --- |
 | `nixos-docker` | — | 基础 shell、PATH、Nix 环境和 bootstrap handoff |
 | `coding-images` | `nixos-docker` | mise、Devbox provider、共享数据目录变量 |
+| `coding-images-podman` | `coding-images` | Podman runtime 和容器数据目录 |
 | `coding-images-rust` | `coding-images` | Rustup、pnpm、sccache 和 Rust 环境 |
 | `coding-images-rust-wasm` | `coding-images-rust` | Fontconfig、headless 图形相关变量 |
-| `coding-images-qemu` | `coding-images` | QEMU 数据目录和设备 action |
+| `coding-images-qemu` | `coding-images-podman` | QEMU 数据目录；`/dev/kvm` 权限由容器运行时设备配置提供 |
 | `coding-images-qemu-rust` | `coding-images-qemu` | QEMU + Rust 环境 |
 
 实际的派生 profile 示例位于 [`images/common/.config/dev-env.toml`](../../images/common/.config/dev-env.toml)、[`images/rust/common/.config/dev-env.toml`](../../images/rust/common/.config/dev-env.toml) 等文件中。Dockerfile 负责安装工具和复制 profile；provider 的运行时行为由 profile 声明。

@@ -467,3 +467,104 @@ fn cli_error_keeps_a_structured_loader_error_as_its_source() {
         .downcast_ref::<ModelError>()
         .is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn root_bash_shim_rebootstraps_with_original_argv_and_runtime_inputs() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let container_init = fixture.root.join("fake-container-init");
+    let real_shell = fixture.root.join("real-bash");
+    let argv_file = fixture.root.join("bootstrap-argv");
+    let environment_file = fixture.root.join("bootstrap-environment");
+    fs::write(
+        &container_init,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' \"${{HOST_UID-unset}}\" \"${{HOST_GID-unset}}\" \"${{CONTAINER_HOME-unset}}\" \"${{RUN_AS_ROOT-unset}}\" > '{}'\n",
+            argv_file.display(),
+            environment_file.display(),
+        ),
+    )
+    .unwrap();
+    fs::write(&real_shell, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&container_init, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&real_shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut command = fixture.command();
+    command
+        .arg0("/bin/bash")
+        .env("DEVENV_CONTAINER_INIT", &container_init)
+        .env("DEVENV_BOOTSTRAP_REAL_SHELL", &real_shell)
+        .env("HOST_UID", "1001:1002")
+        .env("HOST_GID", "1002")
+        .env("CONTAINER_HOME", "/home/dev")
+        .env("RUN_AS_ROOT", "0")
+        .args([
+            "-l",
+            "-c",
+            "printf '%s' \"argument\"",
+            "literal;$(not-a-command)",
+        ]);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fs::read_to_string(&argv_file).unwrap(),
+        format!(
+            "run\n--\n{}\n-l\n-c\nprintf '%s' \"argument\"\nliteral;$(not-a-command)\n",
+            real_shell.display()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&environment_file).unwrap(),
+        "1001:1002\n1002\n/home/dev\n0\n"
+    );
+    assert_eq!(fs::metadata(&container_init).unwrap().mode() & 0o111, 0o111);
+}
+
+#[cfg(unix)]
+#[test]
+fn root_bash_shim_reports_invalid_bootstrap_configuration() {
+    use std::os::unix::process::CommandExt;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let cases = [
+        (
+            Some("relative/container-init"),
+            Some("/bin/sh"),
+            "must be absolute",
+        ),
+        (Some("/bin/sh"), None, "DEVENV_BOOTSTRAP_REAL_SHELL"),
+        (Some("/bin/sh"), Some("/bin/bash"), "public bash shim"),
+    ];
+
+    for (container_init, real_shell, expected) in cases {
+        let mut command = fixture.command();
+        command.arg0("/bin/bash");
+        if let Some(container_init) = container_init {
+            command.env("DEVENV_CONTAINER_INIT", container_init);
+        }
+        if let Some(real_shell) = real_shell {
+            command.env("DEVENV_BOOTSTRAP_REAL_SHELL", real_shell);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(65));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("DEVENV-E-BOOTSTRAP"), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+}

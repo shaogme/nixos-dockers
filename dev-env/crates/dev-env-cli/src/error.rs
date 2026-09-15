@@ -180,6 +180,90 @@ impl Error for TrustError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapPathError {
+    Empty,
+    Relative,
+    Nul,
+}
+
+impl fmt::Display for BootstrapPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "path may not be empty",
+            Self::Relative => "path must be absolute",
+            Self::Nul => "path may not contain NUL",
+        })
+    }
+}
+
+impl Error for BootstrapPathError {}
+
+#[derive(Debug)]
+pub enum BootstrapError {
+    MissingVariable {
+        variable: &'static str,
+    },
+    InvalidPath {
+        variable: &'static str,
+        path: PathBuf,
+        reason: BootstrapPathError,
+    },
+    NotExecutable {
+        variable: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    RecursiveShell {
+        path: PathBuf,
+    },
+}
+
+impl fmt::Display for BootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingVariable { variable } => write!(
+                formatter,
+                "Bootstrap requires {variable} when the other internal path is configured"
+            ),
+            Self::InvalidPath {
+                variable,
+                path,
+                reason,
+            } => write!(
+                formatter,
+                "Bootstrap path {variable} {}: {reason}",
+                path.display()
+            ),
+            Self::NotExecutable {
+                variable,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "Bootstrap path {variable} {} is not executable: {source}",
+                path.display()
+            ),
+            Self::RecursiveShell { path } => write!(
+                formatter,
+                "Bootstrap real shell {} points at the public bash shim",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl Error for BootstrapError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotExecutable { source, .. } => Some(source),
+            Self::MissingVariable { .. }
+            | Self::InvalidPath { .. }
+            | Self::RecursiveShell { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CliError {
     Arguments(ParseError),
@@ -197,6 +281,7 @@ pub enum CliError {
     },
     Output(OutputError),
     Trust(TrustError),
+    Bootstrap(BootstrapError),
     Launch {
         program: PathBuf,
         args: Vec<std::ffi::OsString>,
@@ -234,6 +319,7 @@ impl CliError {
             Self::Shell(_) | Self::Shim(_) | Self::CommandLine(_) | Self::Format(_) => 65,
             Self::Io { .. } | Self::Output(_) => 74,
             Self::Trust(_) => 66,
+            Self::Bootstrap(_) => 65,
             Self::Launch { .. } => 127,
             Self::DoctorFailed { .. } => 65,
         }
@@ -275,6 +361,7 @@ impl fmt::Display for CliError {
             } => write!(formatter, "DEVENV-E-IO: {operation} failed: {source}"),
             Self::Output(error) => write!(formatter, "DEVENV-E-OUTPUT: {error}"),
             Self::Trust(error) => write!(formatter, "DEVENV-E-TRUST: {error}"),
+            Self::Bootstrap(error) => write!(formatter, "DEVENV-E-BOOTSTRAP: {error}"),
             Self::Launch {
                 program, source, ..
             } => write!(
@@ -304,6 +391,7 @@ impl Error for CliError {
             Self::Io { source, .. } => Some(source),
             Self::Output(error) => Some(error),
             Self::Trust(error) => Some(error),
+            Self::Bootstrap(error) => Some(error),
             Self::Launch { source, .. } => Some(source),
             Self::DoctorFailed { .. } => None,
         }
@@ -361,6 +449,12 @@ impl From<CommandLineError> for CliError {
 impl From<TrustError> for CliError {
     fn from(source: TrustError) -> Self {
         Self::Trust(source)
+    }
+}
+
+impl From<BootstrapError> for CliError {
+    fn from(source: BootstrapError) -> Self {
+        Self::Bootstrap(source)
     }
 }
 

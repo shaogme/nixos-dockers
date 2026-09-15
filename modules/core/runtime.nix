@@ -1,5 +1,8 @@
 { config, lib, pkgs, ... }:
 let
+  containerInitPath = "/usr/bin/container-init";
+  bootstrapRealShellPath = "/usr/local/libexec/dev-env/real/bash";
+
   containerInit = pkgs.rustPlatform.buildRustPackage {
     pname = "container-init";
     version = "0.1.0";
@@ -210,6 +213,10 @@ in
   };
 
   config = lib.mkIf config.runtime.enable {
+    environment.variables = {
+      DEVENV_CONTAINER_INIT = lib.mkForce containerInitPath;
+      DEVENV_BOOTSTRAP_REAL_SHELL = lib.mkForce bootstrapRealShellPath;
+    };
     docker.extraContents = [ runtimeContents profile defaultProfile ];
     docker.extraCommands = ''
       mkdir -p usr/local/libexec/dev-env/real
@@ -219,6 +226,8 @@ in
       # the shim path so invoking it cannot recurse into dev-env.
       rm -f bin/bash
       ln -sf /usr/bin/dev-env bin/bash
+      rm -f usr/bin/bash
+      ln -sf dev-env usr/bin/bash
       # Keep /bin/sh as a plain POSIX shell. Commands handed off through
       # dev-env are still materialized; --entrypoint /bin/sh remains useful
       # for low-level image diagnostics without invoking the runtime.

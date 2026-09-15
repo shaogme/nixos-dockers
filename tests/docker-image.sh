@@ -65,6 +65,25 @@ wait_for_running() {
     return 1
 }
 
+docker_exec_wait_for_bootstrap() {
+    local output status attempt
+    for attempt in {1..30}; do
+        if output="$(docker exec "$@" 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        else
+            status=$?
+        fi
+        if [[ "$output" != *"bootstrap lock"* ]]; then
+            printf '%s\n' "$output" >&2
+            return "$status"
+        fi
+        sleep 1
+    done
+    printf '%s\n' "$output" >&2
+    return "$status"
+}
+
 test_loaded_image() {
     local attr="$1"
     local archive="$tmp_dir/${attr//\//_}.tar.gz"
@@ -130,6 +149,33 @@ test_loaded_image() {
     handoff="$(docker run --rm --env HOST_UID="$host_uid:$host_gid" --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/dev && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
     [[ -z "$handoff" ]]
 
+    local exec_container="nixos-dockers-${image}-${attr//[^a-zA-Z0-9_.-]/-}-exec-$$"
+    local exec_output low_level root_output
+    echo "==> validating root docker exec Bash bootstrap ($exec_container)"
+    containers+=("$exec_container")
+    docker run --detach --name "$exec_container" \
+        --env HOST_UID="$host_uid:$host_gid" \
+        "$attr:latest" /bin/sleep 300 >/dev/null
+    wait_for_running "$exec_container"
+
+    exec_output="$(docker_exec_wait_for_bootstrap --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" bash -lc \
+        'test "$USER" = dev && test "$HOME" = /home/dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
+    [[ -z "$exec_output" ]]
+
+    exec_output="$(docker_exec_wait_for_bootstrap --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" /bin/bash -lc \
+        'test "$USER" = dev && test "$HOME" = /home/dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
+    [[ -z "$exec_output" ]]
+
+    root_output="$(docker_exec_wait_for_bootstrap -e RUN_AS_ROOT=1 -e CONTAINER_HOME=/root "$exec_container" bash -lc \
+        'test "$USER" = root && test "$HOME" = /root && test "$(id -u)" = 0 && test "$(id -g)" = 0')"
+    [[ -z "$root_output" ]]
+
+    low_level="$(docker exec "$exec_container" /bin/sh -c 'test "$(id -u)" = 0 && printf "%s" "${BASH-unset}"')"
+    [[ "$low_level" == /bin/sh ]]
+
+    docker rm -f "$exec_container" >/dev/null
+    unset 'containers[-1]'
+
     if [[ "$attr" == vscode-* ]]; then
         local container="nixos-dockers-${image}-$$"
         echo "==> validating default service deployment ($container)"
@@ -138,6 +184,13 @@ test_loaded_image() {
         wait_for_running "$container"
         environment="$(docker exec "$container" /usr/bin/dev-env print --format json)"
         assert_contains "$environment" '"PATH"'
+        echo "==> validating root SSH login shell"
+        handoff="$(docker exec "$container" /bin/sh -c \
+            'test "$(awk -F: '\''$1 == "root" { print $7; exit }'\'' /etc/passwd)" = /usr/bin/dev-env-login-shell')"
+        [[ -z "$handoff" ]]
+        handoff="$(docker exec "$container" /usr/bin/dev-env-login-shell -c \
+            'test "$HOME" = /root && test "$(id -u)" = 0 && test "$(id -g)" = 0')"
+        [[ -z "$handoff" ]]
         docker rm -f "$container" >/dev/null
         unset 'containers[-1]'
     fi

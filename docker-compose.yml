@@ -3,7 +3,7 @@ x-app-base: &app-base
   image: ghcr.io/shaogme/coding-images/npins-common:latest
   environment:
     - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
-    - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
+    - HOST_UID # Set HOST_UID=host_uid[:host_gid] explicitly; otherwise infer the mounted workspace owner
     - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
   security_opt:
     - seccomp:unconfined # Required for some low-level operations

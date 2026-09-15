@@ -1,7 +1,9 @@
 { config, lib, pkgs, ... }:
 let
+  rootLoginShell = if config.runtime.enable then "/usr/bin/dev-env-login-shell" else "/bin/sh";
+
   passwd = pkgs.writeTextDir "etc/passwd" ''
-    root:x:0:0:System Administrator:/root:/bin/bash
+    root:x:0:0:System Administrator:/root:${rootLoginShell}
     ${config.system.defaultUser}:x:${toString config.system.defaultUid}:${toString config.system.defaultGid}:Developer:/home/${config.system.defaultUser}:/bin/bash
     ${lib.optionalString config.services.openssh.enable "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin\n"}
   '';
