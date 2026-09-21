@@ -315,3 +315,86 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_unprivileged_non_root() {
     let report = runner.execute_plan(&plan).unwrap();
     assert!(report.succeeded());
 }
+
+#[test]
+fn executes_real_home_ownership_reconciliation_between_root_and_dev() {
+    use std::os::unix::fs::MetadataExt;
+
+    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(
+        PosixSystem::new().current_ids().0,
+        0,
+        "Docker fixture must run as root"
+    );
+
+    let temp = TempDir::new().unwrap();
+    let user_home = temp.path().join("home/user");
+
+    // 1. Bootstrap as dev (UID 1000, GID 1000)
+    let mut resolve_dev = action("resolve", ActionKind::IdentityResolve);
+    resolve_dev.run_as = RunAs::Root;
+    let mut ensure_home_dev = action("ensure-home", ActionKind::IdentityEnsureHome);
+    ensure_home_dev.path = Some(user_home.display().to_string());
+    ensure_home_dev.owner = Some("identity.target".to_owned());
+    ensure_home_dev.mode = Some("0755".to_owned());
+    ensure_home_dev.run_as = RunAs::Root;
+    ensure_home_dev.depends_on = vec!["resolve".to_owned()];
+
+    let mut config_dev = fixture_config(temp.path(), vec![ensure_home_dev, resolve_dev]);
+    config_dev.identity.default_uid = Some(1000);
+    config_dev.identity.default_gid = Some(1000);
+    config_dev.identity.default_user = Some("dev".to_owned());
+    config_dev.identity.default_home = Some(user_home.display().to_string());
+
+    let plan_dev = config_dev.build_plan().unwrap();
+    let runner_dev = PlanExecutor::new(config_dev.clone(), RuntimeContext::new(temp.path()));
+    let report_dev = runner_dev.execute_plan(&plan_dev).unwrap();
+    assert!(report_dev.succeeded());
+
+    // Verify /home/user is owned by dev (1000:1000)
+    let meta_dev = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_dev.uid(), meta_dev.gid()),
+        (1000, 1000),
+        "Home must be owned by dev (1000:1000)"
+    );
+
+    // 2. Now enter/bootstrap as root (UID 0, GID 0)
+    let mut resolve_root = action("resolve", ActionKind::IdentityResolve);
+    resolve_root.run_as = RunAs::Root;
+    let mut ensure_home_root = action("ensure-home", ActionKind::IdentityEnsureHome);
+    ensure_home_root.path = Some(user_home.display().to_string());
+    ensure_home_root.owner = Some("identity.target".to_owned());
+    ensure_home_root.mode = Some("0755".to_owned());
+    ensure_home_root.run_as = RunAs::Root;
+    ensure_home_root.depends_on = vec!["resolve".to_owned()];
+
+    let mut config_root = fixture_config(temp.path(), vec![ensure_home_root, resolve_root]);
+    config_root.identity.default_uid = Some(0);
+    config_root.identity.default_gid = Some(0);
+    config_root.identity.default_user = Some("root".to_owned());
+    config_root.identity.default_home = Some(user_home.display().to_string());
+
+    let plan_root = config_root.build_plan().unwrap();
+    let runner_root = PlanExecutor::new(config_root, RuntimeContext::new(temp.path()));
+    let report_root = runner_root.execute_plan(&plan_root).unwrap();
+    assert!(report_root.succeeded());
+
+    // Verify /home/user is now automatically reconciled and owned by root (0:0)
+    let meta_root = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_root.uid(), meta_root.gid()),
+        (0, 0),
+        "Home must be reconciled to root (0:0)"
+    );
+
+    // 3. Switch back to dev, verify ownership is reconciled back to dev (1000:1000)
+    let report_dev2 = runner_dev.execute_plan(&plan_dev).unwrap();
+    assert!(report_dev2.succeeded());
+    let meta_dev2 = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_dev2.uid(), meta_dev2.gid()),
+        (1000, 1000),
+        "Home must be reconciled back to dev (1000:1000)"
+    );
+}

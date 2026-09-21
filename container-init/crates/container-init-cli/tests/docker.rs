@@ -491,3 +491,151 @@ depends_on = ["resolve"]
     let receipt_str = fs::read_to_string(&receipt).unwrap();
     assert!(receipt_str.contains("\"cgroup-bind-init\""));
 }
+
+#[test]
+fn cli_reconciles_home_ownership_between_root_and_dev() {
+    use std::os::unix::fs::MetadataExt;
+
+    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(
+        container_init_core::PosixSystem::new().current_ids().0,
+        0,
+        "Docker fixture must run as root"
+    );
+
+    let temp = TempDir::new().unwrap();
+    let profiles = temp.path().join("profiles");
+    let workspace = temp.path().join("workspace");
+    let user_home = temp.path().join("home/user");
+    let lock = temp.path().join("bootstrap.lock");
+    let receipt = temp.path().join("receipt.json");
+    fs::create_dir(&profiles).unwrap();
+    fs::create_dir(&workspace).unwrap();
+
+    fs::write(
+        profiles.join("reconcile.toml"),
+        format!(
+            r#"
+schema = 1
+id = "reconcile"
+
+[bootstrap]
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "dev"
+default_uid = 1000
+default_gid = 1000
+default_home = "{}"
+auto_mapping = false
+run_as_root_input = "RUN_AS_ROOT"
+
+[bootstrap.inputs.RUN_AS_ROOT]
+target = "identity.run_as_root"
+type = "bool"
+runtime = true
+default = false
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "resolve"
+kind = "identity.resolve"
+run_as = "root"
+
+[[bootstrap.actions]]
+id = "ensure-home"
+kind = "identity.ensure_home"
+path = "{}"
+mode = "0755"
+owner = "identity.target"
+run_as = "root"
+depends_on = ["resolve"]
+"#,
+            workspace.display(),
+            user_home.display(),
+            user_home.display()
+        ),
+    )
+    .unwrap();
+
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("container-init");
+
+    let common_args = [
+        "--profiles-dir",
+        profiles.to_str().unwrap(),
+        "--profile",
+        "reconcile",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--lock-path",
+        lock.to_str().unwrap(),
+        "--receipt-path",
+        receipt.to_str().unwrap(),
+    ];
+
+    // 1. Run container-init as dev (default, RUN_AS_ROOT is false)
+    let run_dev = Command::new(&binary)
+        .args(common_args)
+        .args(["run", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        run_dev.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run_dev.stderr)
+    );
+    let meta_dev = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_dev.uid(), meta_dev.gid()),
+        (1000, 1000),
+        "Home must be owned by dev (1000:1000)"
+    );
+
+    // 2. Run container-init with RUN_AS_ROOT=1
+    let run_root = Command::new(&binary)
+        .args(common_args)
+        .env("RUN_AS_ROOT", "1")
+        .args(["run", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        run_root.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run_root.stderr)
+    );
+    let meta_root = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_root.uid(), meta_root.gid()),
+        (0, 0),
+        "Home must be reconciled to root (0:0)"
+    );
+
+    // 3. Run container-init again as dev (RUN_AS_ROOT=0)
+    let run_dev2 = Command::new(&binary)
+        .args(common_args)
+        .env("RUN_AS_ROOT", "0")
+        .args(["run", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        run_dev2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run_dev2.stderr)
+    );
+    let meta_dev2 = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_dev2.uid(), meta_dev2.gid()),
+        (1000, 1000),
+        "Home must be reconciled back to dev (1000:1000)"
+    );
+}

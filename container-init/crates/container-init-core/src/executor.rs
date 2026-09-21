@@ -230,7 +230,6 @@ impl PlanExecutor {
                 && matches!(
                     action.kind,
                     ActionKind::IdentityMapUser
-                        | ActionKind::IdentityEnsureHome
                         | ActionKind::ProcessSetUserShell
                         | ActionKind::ProcessDropPrivileges
                 )

@@ -74,7 +74,7 @@ fn existing_groups_are_reconciled_for_every_matching_gid_without_duplicates() {
     let group = temp.path().join("group");
     fs::write(
         &passwd,
-        "dev:x:2000:100::/home/dev:/bin/sh\nother:x:2001:2001::/home/other:/bin/sh\n",
+        "dev:x:2000:100::/home/user:/bin/sh\nother:x:2001:2001::/home/other:/bin/sh\n",
     )
     .unwrap();
     fs::write(
@@ -83,7 +83,7 @@ fn existing_groups_are_reconciled_for_every_matching_gid_without_duplicates() {
     )
     .unwrap();
     let system = PosixSystem::with_account_files(&passwd, &group);
-    let identity = PosixIdentity::new(2000, 100, "dev", "/home/dev");
+    let identity = PosixIdentity::new(2000, 100, "dev", "/home/user");
 
     system.map_user(&identity).unwrap();
     let contents = fs::read_to_string(&group).unwrap();
@@ -99,14 +99,14 @@ fn malformed_account_entries_are_not_overwritten() {
     let temp = TempDir::new().unwrap();
     let passwd = temp.path().join("passwd");
     let group = temp.path().join("group");
-    fs::write(&passwd, "dev:x:2000:100::/home/dev\n").unwrap();
+    fs::write(&passwd, "dev:x:2000:100::/home/user\n").unwrap();
     fs::write(&group, "users:x:100:\n").unwrap();
     let system = PosixSystem::with_account_files(&passwd, &group);
-    let identity = PosixIdentity::new(2000, 100, "dev", "/home/dev");
+    let identity = PosixIdentity::new(2000, 100, "dev", "/home/user");
     assert!(system.map_user(&identity).is_err());
     assert_eq!(
         fs::read_to_string(&passwd).unwrap(),
-        "dev:x:2000:100::/home/dev\n"
+        "dev:x:2000:100::/home/user\n"
     );
 }
 
