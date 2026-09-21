@@ -574,3 +574,86 @@ run_as = "root"
     assert_eq!(cg_action["kind"], "cgroup_v2_init");
     assert_eq!(cg_action["run_as"], "root");
 }
+
+#[test]
+fn plans_cgroup_v2_init_bind_mount_mode_profile() {
+    let temp = TempDir::new().unwrap();
+    let workspace = temp.path().join("workspace");
+    let profiles = temp.path().join("profiles.d");
+    let lock = temp.path().join("lock");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+
+    let profile_content = format!(
+        r#"
+schema = 1
+id = "fixture-cgroup-bind"
+
+[bootstrap]
+schema = 1
+mode = "strict"
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "root"
+default_uid = 0
+default_gid = 0
+auto_mapping = false
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "cg-bind-init"
+kind = "cgroup.v2_init"
+mount_mode = "bind_mount"
+shadow_path = "/run/cgroup_custom"
+path = "/sys/fs/cgroup"
+subgroup = "init"
+controllers = ["cpu", "memory"]
+run_as = "root"
+"#,
+        workspace.display(),
+    );
+    fs::write(profiles.join("10-cgroup-bind.toml"), profile_content).unwrap();
+
+    let output = Command::new(binary())
+        .args([
+            "--profiles-dir",
+            profiles.to_str().unwrap(),
+            "--profile",
+            "fixture-cgroup-bind",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--lock-path",
+            lock.to_str().unwrap(),
+            "plan",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["profile"], "fixture-cgroup-bind");
+    let cg_action = document["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "cg-bind-init")
+        .expect("cg-bind-init action should be planned");
+    assert_eq!(cg_action["kind"], "cgroup_v2_init");
+    assert_eq!(
+        cg_action["effect"]["cgroup_v2_init"]["mount_mode"],
+        "bind_mount"
+    );
+    assert_eq!(
+        cg_action["effect"]["cgroup_v2_init"]["shadow_path"],
+        "/run/cgroup_custom"
+    );
+}

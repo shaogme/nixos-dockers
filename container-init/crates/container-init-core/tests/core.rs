@@ -718,3 +718,44 @@ fn cgroup_v2_init_fails_on_unavailable_controller_or_missing_cgroup() {
     let err2 = executor(cfg2).execute_plan(&plan2).unwrap_err();
     assert!(err2.to_string().contains("not available"));
 }
+
+#[test]
+fn cgroup_v2_init_bind_mount_mode_shadows_and_delegates() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let target_dir = temp.path().join("sys_cgroup");
+    let shadow_dir = temp.path().join("run_cgroup");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::create_dir_all(&shadow_dir).unwrap();
+
+    fs::write(
+        shadow_dir.join("cgroup.controllers"),
+        "cpu io memory pids\n",
+    )
+    .unwrap();
+    fs::write(shadow_dir.join("cgroup.procs"), "2001\n").unwrap();
+    fs::write(shadow_dir.join("cgroup.subtree_control"), "").unwrap();
+
+    let mut action = root_action("cg_bind", ActionKind::CgroupV2Init);
+    action.path = Some(target_dir.display().to_string());
+    action.shadow_path = Some(shadow_dir.display().to_string());
+    action.mount_mode = Some("bind_mount".to_string());
+    action.subgroup = Some("init".to_string());
+    action.controllers = Some(vec!["cpu".to_string(), "pids".to_string()]);
+
+    let config = config(temp.path(), vec![action]);
+    let plan = config.build_plan().unwrap();
+    let report = executor(config).execute_plan(&plan).unwrap();
+    assert!(report.succeeded());
+
+    // Verify shadow subgroup created
+    assert!(shadow_dir.join("init").exists());
+
+    // Verify shadow subtree_control
+    let subtree = fs::read_to_string(shadow_dir.join("cgroup.subtree_control")).unwrap();
+    assert!(subtree.contains("+cpu"));
+    assert!(subtree.contains("+pids"));
+}

@@ -11,7 +11,7 @@ POSIX 基础设施操作，然后把当前进程交给 profile 指定的 runtime
 - 创建 HOME、缓存目录、配置目录以及声明的软链接；
 - 必要时更新 passwd/group 和登录 shell；
 - 按声明准备可选的 OpenSSH host key、authorized keys 和运行目录；
-- 按声明自动化初始化 cgroup v2 层级、迁移隔离根进程并委托子树控制器；
+- 按声明自动化初始化 cgroup v2 层级、迁移隔离根进程并委托子树控制器，支持默认就地与只读挂载覆挂模式；
 - 以结构化 argv 方式 handoff 到 `dev-env` 或其他 runtime。
 
 它不执行 shell 脚本，不运行 `mise`、Devbox、sccache 或 provider，也不负责开发环境变量的物化。环境 DSL 与 Bootstrap DSL 可以存在于同一个 profile，但由不同程序分别读取。
@@ -230,7 +230,7 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 - `filesystem.ensure_dir`、`ensure_file`、`ensure_symlink`、`chown`、`chmod`；
 - `process.set_user_shell`、`process.drop_privileges`、`handoff.exec`；
 - 可选 `service.ssh.prepare`，仅通过受信任的 `ssh-keygen` capability 生成 host key；
-- 可选 `cgroup.v2_init`，自动化 cgroup v2 根进程子组迁移与控制器（`cpu`、`io`、`memory`、`pids`）委托，供嵌套容器引擎使用；
+- 可选 `cgroup.v2_init`，自动化 cgroup v2 根进程子组迁移与控制器（`cpu`、`io`、`memory`、`pids`）委托，支持默认就地模式与只读环境下的挂载覆挂重定向（bind-mount shadowing），供嵌套容器引擎使用；
 - `plan --json`、`doctor --json`、结构化错误、非阻塞锁和原子 receipt；
 - Linux mountinfo workspace 挂载证据、UID/GID namespace 映射和 group 成员 reconcile；
 - 独立的 `bootstrap-model`、`bootstrap-loader`、`container-init-core`、`container-init-posix` 和 `container-init-cli` crate。

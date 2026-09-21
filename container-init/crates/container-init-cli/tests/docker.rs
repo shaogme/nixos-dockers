@@ -391,3 +391,103 @@ depends_on = ["resolve"]
     let _ = fs::remove_dir(child_cgroup.join("worker"));
     let _ = fs::remove_dir(&child_cgroup);
 }
+
+#[test]
+fn runs_cli_cgroup_v2_init_bind_mount_shadowing_as_root() {
+    let temp = TempDir::new().unwrap();
+    let profiles = temp.path().join("profiles");
+    let workspace = temp.path().join("workspace");
+    let lock = temp.path().join("lock");
+    let receipt = temp.path().join("receipt.json");
+    let handoff = workspace.join("handoff");
+    let shadow_cgroup = temp.path().join("shadow_cg");
+    let target_cgroup = temp.path().join("target_cg");
+    fs::create_dir_all(&profiles).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&target_cgroup).unwrap();
+
+    fs::write(
+        profiles.join("10-cgroup-bind.toml"),
+        format!(
+            r#"
+schema = 1
+id = "cgroup-bind"
+
+[bootstrap]
+schema = 1
+mode = "strict"
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "root"
+default_uid = 0
+default_gid = 0
+auto_mapping = false
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "resolve"
+kind = "identity.resolve"
+run_as = "root"
+
+[[bootstrap.actions]]
+id = "cgroup-bind-init"
+kind = "cgroup.v2_init"
+run_as = "root"
+mount_mode = "bind_mount"
+shadow_path = "{}"
+path = "{}"
+subgroup = "worker"
+depends_on = ["resolve"]
+"#,
+            workspace.display(),
+            shadow_cgroup.display(),
+            target_cgroup.display(),
+        ),
+    )
+    .unwrap();
+
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("container-init");
+    let common = [
+        "--profiles-dir",
+        profiles.to_str().unwrap(),
+        "--profile",
+        "cgroup-bind",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--lock-path",
+        lock.to_str().unwrap(),
+        "--receipt-path",
+        receipt.to_str().unwrap(),
+    ];
+
+    let script = format!("printf 'cgroup bind handoff\\n' > {}", handoff.display());
+    let run = Command::new(&binary)
+        .args(common)
+        .args(["run", "--"])
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(target_cgroup.join("worker").is_dir());
+    assert_eq!(
+        fs::read_to_string(&handoff).unwrap(),
+        "cgroup bind handoff\n"
+    );
+    let receipt_str = fs::read_to_string(&receipt).unwrap();
+    assert!(receipt_str.contains("\"cgroup-bind-init\""));
+}

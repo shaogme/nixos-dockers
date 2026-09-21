@@ -132,6 +132,10 @@ pub struct Action {
     pub subgroup: Option<String>,
     #[serde(alias = "cgroup_controllers")]
     pub controllers: Option<Vec<String>>,
+    #[serde(alias = "cgroup_mount_mode")]
+    pub mount_mode: Option<String>,
+    #[serde(alias = "cgroup_shadow_path")]
+    pub shadow_path: Option<String>,
     pub when: Option<String>,
     #[serde(default)]
     pub failure: FailurePolicy,
@@ -175,6 +179,8 @@ impl Action {
             ssh_keygen: None,
             subgroup: None,
             controllers: None,
+            mount_mode: None,
+            shadow_path: None,
             when: None,
             failure: FailurePolicy::Error,
             run_as: RunAs::Current,
@@ -200,6 +206,7 @@ impl Action {
                 self.authorized_keys_source.as_deref(),
                 self.runtime_dir.as_deref(),
                 self.subgroup.as_deref(),
+                self.shadow_path.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -337,6 +344,7 @@ impl Action {
                 self.authorized_keys_source.as_deref(),
             ),
             ("runtime_dir", self.runtime_dir.as_deref()),
+            ("shadow_path", self.shadow_path.as_deref()),
         ] {
             if let Some(value) = field.1 {
                 validate_path_template(
@@ -345,11 +353,13 @@ impl Action {
                 )?;
             }
         }
-        if let Some(mode) = &self.mode {
-            parse_mode(mode).map_err(|message| ModelError::Invalid {
-                location: format!("bootstrap.actions.{}.mode", self.id),
-                message,
-            })?;
+        if self.kind != ActionKind::CgroupV2Init {
+            if let Some(mode) = &self.mode {
+                parse_mode(mode).map_err(|message| ModelError::Invalid {
+                    location: format!("bootstrap.actions.{}.mode", self.id),
+                    message,
+                })?;
+            }
         }
         if let Some(mode) = &self.parent_mode {
             parse_mode(mode).map_err(|message| ModelError::Invalid {
@@ -475,6 +485,20 @@ impl Action {
                 }
             }
             ActionKind::CgroupV2Init => {
+                let resolved_mount_mode = self.mount_mode.as_deref().or(self.mode.as_deref());
+                if let Some(mode_str) = resolved_mount_mode {
+                    match mode_str {
+                        "default" | "direct" | "bind_mount" | "mount_shadow" | "shadow" => {}
+                        _ => {
+                            return Err(ModelError::Invalid {
+                                location: format!("bootstrap.actions.{}.mount_mode", self.id),
+                                message: format!(
+                                    "invalid mount_mode {mode_str:?}; expected 'default' or 'bind_mount'"
+                                ),
+                            });
+                        }
+                    }
+                }
                 if let Some(subgroup) = &self.subgroup {
                     if subgroup.is_empty()
                         || subgroup.contains('/')
@@ -511,5 +535,12 @@ impl Action {
             _ => {}
         }
         Ok(())
+    }
+
+    pub fn cgroup_mount_mode(&self) -> &str {
+        match self.mount_mode.as_deref().or(self.mode.as_deref()) {
+            Some("bind_mount" | "mount_shadow" | "shadow") => "bind_mount",
+            _ => "default",
+        }
     }
 }

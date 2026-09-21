@@ -2,7 +2,9 @@ use crate::error::CoreError;
 use crate::filesystem;
 use crate::identity::ResolvedIdentity;
 use bootstrap_model::Action;
-use container_init_posix::{ActionChange, PosixSystem};
+use container_init_posix::{
+    bind_mount, mount_cgroup2, unshare_user_and_mount_namespaces, ActionChange, PosixSystem,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -15,20 +17,40 @@ pub(crate) fn init_v2(
     posix_system: &PosixSystem,
 ) -> Result<ActionChange, CoreError> {
     let action_id = action.id.as_str();
-    let cgroup_root = match &action.path {
+    let mount_mode = action.cgroup_mount_mode();
+
+    let target_root = match &action.path {
         Some(path_template) => filesystem::render_path(action_id, "path", path_template, values)?,
         None => PathBuf::from("/sys/fs/cgroup"),
     };
 
-    if !cgroup_root.exists() {
+    let (working_root, is_bind_mount) = if mount_mode == "bind_mount" {
+        let shadow_root = match &action.shadow_path {
+            Some(tpl) => filesystem::render_path(action_id, "shadow_path", tpl, values)?,
+            None => PathBuf::from("/run/cgroup"),
+        };
+        // If the shadow path doesn't already have cgroup.controllers, attempt to mount cgroup2
+        if !shadow_root.join("cgroup.controllers").exists() && mount_cgroup2(&shadow_root).is_err()
+        {
+            // Try entering a private user and mount namespace
+            let (uid, gid) = posix_system.current_ids();
+            let _ = unshare_user_and_mount_namespaces(uid, gid);
+            let _ = mount_cgroup2(&shadow_root);
+        }
+        (shadow_root, true)
+    } else {
+        (target_root.clone(), false)
+    };
+
+    if !working_root.exists() {
         return Err(CoreError::action(
             action_id,
-            Some(cgroup_root),
+            Some(working_root),
             "cgroup root path does not exist",
         ));
     }
 
-    let controllers_file = cgroup_root.join("cgroup.controllers");
+    let controllers_file = working_root.join("cgroup.controllers");
     if !controllers_file.exists() {
         return Err(CoreError::action(
             action_id,
@@ -38,15 +60,15 @@ pub(crate) fn init_v2(
     }
 
     let subgroup_name = action.subgroup.as_deref().unwrap_or("init");
-    let subgroup_path = cgroup_root.join(subgroup_name);
+    let subgroup_path = working_root.join(subgroup_name);
     if !subgroup_path.exists() {
         fs::create_dir_all(&subgroup_path).map_err(|source| {
             CoreError::io(Some(action_id), Some(subgroup_path.clone()), source)
         })?;
     }
 
-    // 1. Move processes from cgroup_root/cgroup.procs to subgroup_path/cgroup.procs
-    let root_procs_file = cgroup_root.join("cgroup.procs");
+    // 1. Move processes from working_root/cgroup.procs to subgroup_path/cgroup.procs
+    let root_procs_file = working_root.join("cgroup.procs");
     let subgroup_procs_file = subgroup_path.join("cgroup.procs");
     if !subgroup_procs_file.exists() {
         // In real cgroupfs, cgroup.procs is automatically created by the kernel upon mkdir.
@@ -100,7 +122,7 @@ pub(crate) fn init_v2(
     };
 
     // 3. Read currently enabled controllers in cgroup.subtree_control
-    let subtree_control_file = cgroup_root.join("cgroup.subtree_control");
+    let subtree_control_file = working_root.join("cgroup.subtree_control");
     let currently_enabled: BTreeSet<String> = if subtree_control_file.exists() {
         fs::read_to_string(&subtree_control_file)
             .map(|content| content.split_whitespace().map(|s| s.to_string()).collect())
@@ -120,8 +142,7 @@ pub(crate) fn init_v2(
 
             // If EBUSY, drain any newly spawned processes in root cgroup.procs and retry
             if let Err(ref err) = write_result {
-                if err.kind() == std::io::ErrorKind::ResourceBusy || err.raw_os_error() == Some(16)
-                {
+                if err.raw_os_error() == Some(16) {
                     if let Ok(procs_content) = fs::read_to_string(&root_procs_file) {
                         for line in procs_content.lines() {
                             let pid = line.trim();
@@ -163,16 +184,48 @@ pub(crate) fn init_v2(
         )?;
     }
 
+    // 5. If mount_mode is bind_mount, bind-mount working_root over target_root
+    if is_bind_mount && bind_mount(&working_root, &target_root).is_err() {
+        let (uid, gid) = posix_system.current_ids();
+        let _ = unshare_user_and_mount_namespaces(uid, gid);
+        if !working_root.join("cgroup.controllers").exists() {
+            let _ = mount_cgroup2(&working_root);
+        }
+        bind_mount(&working_root, &target_root).map_err(|source| {
+            CoreError::action(
+                action_id,
+                Some(target_root.clone()),
+                format!("failed to bind-mount {working_root:?} over {target_root:?}: {source}"),
+            )
+        })?;
+    }
+
     let message = if !enabled_controllers.is_empty() {
-        format!(
-            "delegated cgroup v2 controllers ({}) to subtree_control; moved {moved_pids} procs to {subgroup_name}",
-            enabled_controllers.join(" ")
-        )
+        if is_bind_mount {
+            format!(
+                "delegated cgroup v2 controllers ({}) to subtree_control; moved {moved_pids} procs to {subgroup_name}; shadowed to {}",
+                enabled_controllers.join(" "),
+                target_root.display()
+            )
+        } else {
+            format!(
+                "delegated cgroup v2 controllers ({}) to subtree_control; moved {moved_pids} procs to {subgroup_name}",
+                enabled_controllers.join(" ")
+            )
+        }
     } else {
-        format!(
-            "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}",
-            target_controllers.join(" ")
-        )
+        if is_bind_mount {
+            format!(
+                "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}; shadowed to {}",
+                target_controllers.join(" "),
+                target_root.display()
+            )
+        } else {
+            format!(
+                "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}",
+                target_controllers.join(" ")
+            )
+        }
     };
 
     Ok(ActionChange::new(message))

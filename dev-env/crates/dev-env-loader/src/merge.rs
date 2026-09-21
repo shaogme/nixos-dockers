@@ -640,4 +640,3 @@ fn parsed_input_to_value(value: ParsedInput) -> ValueTree {
 pub(crate) fn parsed_input_value(value: ParsedInput) -> ValueTree {
     parsed_input_to_value(value)
 }
-

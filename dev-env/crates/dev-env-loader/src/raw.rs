@@ -23,12 +23,13 @@ pub(crate) fn parse_profile(contents: &str, location: String) -> Result<RawProfi
     if let Some(table) = environment_root.as_table_mut() {
         table.remove("bootstrap");
     }
-    let document: ProfileDocument = environment_root
-        .try_into()
-        .map_err(|source| LoaderError::Parse {
-            location: location.clone(),
-            source,
-        })?;
+    let document: ProfileDocument =
+        environment_root
+            .try_into()
+            .map_err(|source| LoaderError::Parse {
+                location: location.clone(),
+                source,
+            })?;
     document.validate().map_err(|source| LoaderError::Model {
         location: Some(location),
         source,

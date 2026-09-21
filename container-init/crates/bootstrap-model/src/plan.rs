@@ -66,6 +66,8 @@ pub enum PlanEffect {
     },
     CgroupV2Init {
         path: Option<String>,
+        mount_mode: String,
+        shadow_path: Option<String>,
         subgroup: Option<String>,
         controllers: Option<Vec<String>>,
     },
@@ -135,6 +137,8 @@ impl PlanEffect {
             },
             ActionKind::CgroupV2Init => Self::CgroupV2Init {
                 path: action.path.clone(),
+                mount_mode: action.cgroup_mount_mode().to_owned(),
+                shadow_path: action.shadow_path.clone(),
                 subgroup: action.subgroup.clone(),
                 controllers: action.controllers.clone(),
             },

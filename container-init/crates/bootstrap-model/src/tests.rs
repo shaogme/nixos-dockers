@@ -349,10 +349,40 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
         plan.actions()[0].effect,
         PlanEffect::CgroupV2Init {
             path: Some("/sys/fs/cgroup".to_owned()),
+            mount_mode: "default".to_owned(),
+            shadow_path: None,
             subgroup: Some("init".to_owned()),
             controllers: Some(vec!["cpu".to_owned(), "memory".to_owned()]),
         }
     );
+
+    // Tests bind_mount mode and shadow_path
+    let mut cg_bind = action("cg_bind", ActionKind::CgroupV2Init);
+    cg_bind.run_as = RunAs::Root;
+    cg_bind.mount_mode = Some("bind_mount".to_owned());
+    cg_bind.shadow_path = Some("/run/cgroup".to_owned());
+    let plan_bind = config(vec![cg_bind])
+        .build_plan()
+        .expect("cgroup init with bind_mount should build plan");
+    assert_eq!(
+        plan_bind.actions()[0].effect,
+        PlanEffect::CgroupV2Init {
+            path: None,
+            mount_mode: "bind_mount".to_owned(),
+            shadow_path: Some("/run/cgroup".to_owned()),
+            subgroup: None,
+            controllers: None,
+        }
+    );
+
+    // Rejects invalid mount_mode
+    let mut cg_bad_mode = action("cg", ActionKind::CgroupV2Init);
+    cg_bad_mode.run_as = RunAs::Root;
+    cg_bad_mode.mount_mode = Some("invalid_mode".to_owned());
+    assert!(matches!(
+        config(vec![cg_bad_mode]).build_plan(),
+        Err(ModelError::Invalid { message, .. }) if message.contains("invalid mount_mode")
+    ));
 
     // Rejects non-root
     let mut cg_user = action("cg", ActionKind::CgroupV2Init);

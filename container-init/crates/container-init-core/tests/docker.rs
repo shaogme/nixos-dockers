@@ -245,3 +245,40 @@ fn executes_real_cgroup_v2_init_as_root() {
     let _ = fs::remove_dir(child_cgroup.join("child_worker"));
     let _ = fs::remove_dir(&child_cgroup);
 }
+
+#[test]
+fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
+    let posix_system = PosixSystem::new();
+    if posix_system.current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let shadow_path = temp.path().join("shadow_cg");
+    let target_path = temp.path().join("target_cg");
+    fs::create_dir_all(&target_path).unwrap();
+
+    let mut resolve = action("resolve", ActionKind::IdentityResolve);
+    resolve.run_as = RunAs::Root;
+
+    let mut cg = action("cg-bind", ActionKind::CgroupV2Init);
+    cg.run_as = RunAs::Root;
+    cg.mount_mode = Some("bind_mount".to_owned());
+    cg.shadow_path = Some(shadow_path.display().to_string());
+    cg.path = Some(target_path.display().to_string());
+    cg.subgroup = Some("init".to_owned());
+    cg.controllers = Some(vec!["pids".to_owned()]);
+    cg.depends_on = vec!["resolve".to_owned()];
+
+    let config = fixture_config(temp.path(), vec![cg, resolve]);
+    let plan = config.build_plan().unwrap();
+    let runner = PlanExecutor::new(config, RuntimeContext::new(temp.path()));
+    let report = runner.execute_plan(&plan).unwrap();
+    assert!(report.succeeded());
+
+    // Verify shadow_path and target_path both reflect the initialized subgroup and subtree_control
+    assert!(shadow_path.join("init").is_dir());
+    assert!(target_path.join("init").is_dir());
+    let target_subtree = fs::read_to_string(target_path.join("cgroup.subtree_control")).unwrap();
+    assert!(target_subtree.contains("pids"));
+}

@@ -228,4 +228,82 @@ pub fn read_namespace_map(path: &Path) -> Result<NamespaceMap, PosixError> {
     NamespaceMap::parse(&contents)
 }
 
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+
+pub fn unshare_user_and_mount_namespaces(uid: u32, gid: u32) -> Result<(), PosixError> {
+    let res = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if res != 0 {
+        return Err(PosixError::io(std::io::Error::last_os_error()));
+    }
+
+    let _ = fs::write("/proc/self/setgroups", "deny");
+    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).map_err(PosixError::io)?;
+    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).map_err(PosixError::io)?;
+
+    let res = unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP) };
+    if res != 0 {
+        return Err(PosixError::io(std::io::Error::last_os_error()));
+    }
+
+    let slash = CString::new("/").map_err(|_| PosixError::invalid("invalid cstring"))?;
+    let res = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            slash.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if res != 0 {
+        return Err(PosixError::io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+pub fn mount_cgroup2(target: &Path) -> Result<(), PosixError> {
+    if !target.exists() {
+        let _ = fs::create_dir_all(target);
+    }
+    let cgroup2 = CString::new("cgroup2").map_err(|_| PosixError::invalid("invalid cstring"))?;
+    let target_cstr = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| PosixError::invalid("invalid target path"))?;
+    let res = unsafe {
+        libc::mount(
+            cgroup2.as_ptr(),
+            target_cstr.as_ptr(),
+            cgroup2.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if res != 0 {
+        return Err(PosixError::io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+pub fn bind_mount(source: &Path, target: &Path) -> Result<(), PosixError> {
+    if !target.exists() {
+        let _ = fs::create_dir_all(target);
+    }
+    let source_cstr = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| PosixError::invalid("invalid source path"))?;
+    let target_cstr = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| PosixError::invalid("invalid target path"))?;
+    let res = unsafe {
+        libc::mount(
+            source_cstr.as_ptr(),
+            target_cstr.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if res != 0 {
+        return Err(PosixError::io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}

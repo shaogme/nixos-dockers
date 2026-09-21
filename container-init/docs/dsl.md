@@ -242,7 +242,7 @@ DSL 中使用 dotted 名称，例如 `filesystem.ensure_dir`；下面的“必�
 | `process.set_user_shell` | `user`、`shell` | 更新 passwd 的 login shell 字段 | 仅 trusted image/admin 来源；目标用户必须存在 |
 | `process.drop_privileges` | 无 | `initgroups`/`setgroups` 后执行 `setgid`、`setuid` | 必须 root；最多一个；计划阶段为 handoff |
 | `service.ssh.prepare` | host key、authorized key、runtime 三个目录 | 创建 SSH 目录、生成/校验 host key、可选写入 authorized keys | 必须 root、trusted 来源；需启用 SSH capability |
-| `cgroup.v2_init` | 无（path/subgroup/controllers 均有默认值） | 校验 cgroup v2、将根进程迁移至子组并向 subtree_control 委托控制器 | 必须 root、仅 trusted 来源；计划阶段为 Root |
+| `cgroup.v2_init` | 无（path/subgroup/controllers/mount_mode 均有默认值） | 校验并初始化 cgroup v2、根进程迁移与控制器委托；支持默认就地模式与只读环境下的挂载覆挂重定向 | 必须 root、仅 trusted 来源；计划阶段为 Root |
 | `handoff.exec` | 无 | 将最终命令包装成 handoff runtime 命令 | 仅 trusted 来源；最多一个；非幂等、必须位于 handoff 阶段 |
 
 ### 6.1 文件 action 示例
@@ -346,9 +346,13 @@ SSH capability 只提供受信任的 keygen 可执行文件；action 自己声�
 
 ### 6.4 cgroup v2 初始化示例
 
-在以 `--privileged` 运行且拥有独立 cgroup namespace 的容器内嵌套运行 Podman / Docker / crun 时，cgroup v2 规范禁止存在内部进程的层级开启子树控制器（"no internal processes" 规则）。若容器内 PID 1 或当前进程位于根 cgroup，向根节点的 `cgroup.subtree_control` 写入会报错 `EBUSY`；而子层级（如 `/libpod_parent/...`）试图启用控制器时则会报错 `ENOENT: write cgroup.subtree_control: no such file or directory`。
+在容器内嵌套运行 Podman / Docker / crun 等容器引擎时，cgroup v2 规范禁止存在内部进程的层级开启子树控制器（"no internal processes" 规则）。若容器内 PID 1 或当前进程位于根 cgroup，向根节点的 `cgroup.subtree_control` 写入会报错 `EBUSY`；而子层级（如 `/libpod_parent/...`）试图启用控制器时则会报错 `ENOENT: write cgroup.subtree_control: no such file or directory`。
 
-`cgroup.v2_init` action 声明在容器启动阶段由 root 自动化完成 cgroup v2 初始化与子树委托：
+此外，在不同的容器运行环境（特权非只读 vs 非特权只读）下，cgroup 挂载点的读写状态存在差异：
+- **非只读环境（特权/读写环境）**：容器拥有宿主赋权的 `CAP_SYS_ADMIN` 或 `/sys/fs/cgroup` 挂载为可写（`rw`），可以直接就地操作。
+- **只读环境（只读/非特权环境）**：在以 `--read-only` 启动的容器，或外部容器引擎（Docker / containerd）默认以非特权模式运行容器时，宿主会为 `/sys/fs/cgroup` 施加 `MS_RDONLY` 只读保护。若直接向其写入会遭遇 `Read-only file system (os error 30)` 错误。
+
+`cgroup.v2_init` action 声明在容器启动阶段由 root 自动化完成 cgroup v2 初始化与子树委托，并通过子配置项选项支持不同的挂载模式：
 
 ```toml
 [[bootstrap.actions]]
@@ -364,6 +368,8 @@ run_as = "root"
 id = "cgroup-init"
 kind = "cgroup.v2_init"
 path = "/sys/fs/cgroup"
+mount_mode = "default" # "default"（默认就地初始化）或 "bind_mount"（挂载覆挂重定向）
+shadow_path = "/run/cgroup" # 仅在 mount_mode = "bind_mount" 时使用，默认 /run/cgroup
 subgroup = "init"
 controllers = ["cpu", "io", "memory", "pids"]
 owner = "root"
@@ -371,18 +377,25 @@ run_as = "root"
 ```
 
 字段说明：
-- `path`：可选。cgroup 根路径，默认 `/sys/fs/cgroup`。
-- `subgroup`：可选。用于移入容器根进程的子组目录名称，默认 `"init"`（对应 `/sys/fs/cgroup/init`）。
-- `controllers`：可选。要启用到 `cgroup.subtree_control` 的控制器列表。未指定时自动读取 `/sys/fs/cgroup/cgroup.controllers` 中所有可用的控制器进行全量委托。若指定控制器在当前层级不可用，校验会直接报错失败。
+- `mount_mode`（别名 `mode`）：可选。初始化挂载模式，默认 `"default"`：
+  - `"default"`（**默认模式**）：就地初始化。直接在目标路径（`path`，默认 `/sys/fs/cgroup`）执行子组创建、进程排空与控制器委托。适用于目标路径自身可写的非只读环境（如特权容器）。
+  - `"bind_mount"`（**挂载覆挂重定向模式**）：在独立可写虚拟内存文件系统（`shadow_path`，默认 `/run/cgroup`）上挂载私有 cgroup2 树并完成子组初始化与控制器委托，随后通过 `mount --bind` 覆挂重定向至目标 `path`（默认 `/sys/fs/cgroup`）。该模式专为只读环境（如 Docker `--read-only` 或受限 `ro` cgroup2 挂载）设计，无需依赖宿主特权即可使 `/sys/fs/cgroup` 变为可写层级，向下游 OCI 运行时无缝提供标准 cgroup 树。
+- `shadow_path`：可选。挂载覆挂重定向模式下的独立可写暂存路径，默认 `"/run/cgroup"`。
+- `path`：可选。目标 cgroup 根路径，默认 `"/sys/fs/cgroup"`。
+- `subgroup`：可选。用于移入容器根进程的子组目录名称，默认 `"init"`（对应 `<path>/init`）。
+- `controllers`：可选。要启用到 `cgroup.subtree_control` 的控制器列表。未指定时自动读取目标 cgroup2 层级中 `cgroup.controllers` 的所有可用控制器进行全量委托。若指定控制器不可用，校验会直接报错失败。
 - `owner`：可选。子组目录的属主（例如 `"identity.target"`）。
 - `run_as`：必须为 `"root"`，且仅能来自受信任 profile。
 
 执行逻辑：
-1. 校验 `cgroup_root` 存在且包含 `cgroup.controllers`（验证为有效的 cgroup v2 层级）。
-2. 创建子组目录 `/sys/fs/cgroup/<subgroup>`。
-3. 读取 `/sys/fs/cgroup/cgroup.procs`，将所有既有进程迁移至 `/sys/fs/cgroup/<subgroup>/cgroup.procs`，清空根层级的进程占用。
-4. 读取已在 `cgroup.subtree_control` 启用的控制器，通过追加写入 `+<controller>` 启用目标控制器（支持幂等重复执行）。
-5. 若配置了 `owner`，对子组目录执行属主对齐。
+1. **模式判定与准备**：
+   - 若 `mount_mode = "default"`：基准工作目录为 `path`（默认 `/sys/fs/cgroup`）。校验该路径存在且包含 `cgroup.controllers`。
+   - 若 `mount_mode = "bind_mount"`：基准工作目录为 `shadow_path`（默认 `/run/cgroup`）。若尚未挂载，则在当前私有命名空间（User + Mount + Cgroup Namespace）中挂载 `cgroup2` 文件系统至 `shadow_path`。
+2. **创建子组**：在基准工作目录下创建子组 `<work_dir>/<subgroup>`（默认 `<work_dir>/init`）。
+3. **排空进程**：读取 `<work_dir>/cgroup.procs`，将所有既有进程迁移至 `<work_dir>/<subgroup>/cgroup.procs`，清空根层级的进程占用以满足 cgroup v2 规范。
+4. **委托控制器**：读取已在 `cgroup.subtree_control` 启用的控制器，通过追加写入 `+<controller>` 启用目标控制器（支持 EBUSY 自动重试排空，幂等执行）。
+5. **属主对齐**：若配置了 `owner`，对子组目录执行属主对齐。
+6. **覆挂重定向**（仅 `mount_mode = "bind_mount"`）：通过 `mount --bind <shadow_path> <path>` 将初始化好的可写 cgroup2 树覆盖挂载至目标 `path`（默认 `/sys/fs/cgroup`），原只读挂载点被新层级覆盖，使下游程序（如 `crun`/`podman`）能够透明读写标准路径。
 
 ## 7. 插值与条件
 
