@@ -405,7 +405,7 @@ extends = ["base"]
 [config.environment.variables]
 CARGO_INCREMENTAL = "0"
 CARGO_TARGET_DIR = "/data/.cargo/target"
-SCCACHE_DIR = "/data/sccache"
+SCCACHE_DIR = "/data/cache/sccache"
 
 [config.environment.conditional_variables.RUSTC_WRAPPER]
 value = "sccache"

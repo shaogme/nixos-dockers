@@ -68,7 +68,7 @@ Rust 镜像使用这一机制配置 Cargo 和 sccache：
 ```yaml
 - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
 - CARGO_TARGET_DIR=/data/.cargo/target
-- SCCACHE_DIR=/data/sccache
+- SCCACHE_DIR=/data/cache/sccache
 - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0}
 - ENABLE_SCCACHE=${ENABLE_SCCACHE:-1}
 ```
