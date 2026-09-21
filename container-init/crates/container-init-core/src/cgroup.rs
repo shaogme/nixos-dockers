@@ -30,12 +30,41 @@ pub(crate) fn init_v2(
             None => PathBuf::from("/run/cgroup"),
         };
         // If the shadow path doesn't already have cgroup.controllers, attempt to mount cgroup2
-        if !shadow_root.join("cgroup.controllers").exists() && mount_cgroup2(&shadow_root).is_err()
-        {
-            // Try entering a private user and mount namespace
-            let (uid, gid) = posix_system.current_ids();
-            let _ = unshare_user_and_mount_namespaces(uid, gid);
-            let _ = mount_cgroup2(&shadow_root);
+        if !shadow_root.join("cgroup.controllers").exists() {
+            if let Err(initial_mount_err) = mount_cgroup2(&shadow_root) {
+                if !identity.run_as_root && identity.uid != 0 {
+                    // In an unprivileged container where target is non-root, entering a single-user
+                    // namespace would prevent subsequent drop_privileges to target UID.
+                    if target_root.join("cgroup.controllers").exists() {
+                        return Ok(ActionChange::new(format!(
+                            "unprivileged non-root environment: preserving existing cgroup hierarchy at {} without shadow mount",
+                            target_root.display()
+                        )));
+                    } else {
+                        return Ok(ActionChange::new(
+                            "unprivileged non-root environment: cgroup v2 hierarchy unavailable",
+                        ));
+                    }
+                }
+                // For root target, enter private user and mount namespace
+                let (uid, gid) = posix_system.current_ids();
+                unshare_user_and_mount_namespaces(uid, gid).map_err(|err| {
+                    CoreError::action(
+                        action_id,
+                        Some(shadow_root.clone()),
+                        format!(
+                            "failed to mount cgroup2 directly ({initial_mount_err}) and failed to enter private namespace: {err}"
+                        ),
+                    )
+                })?;
+                mount_cgroup2(&shadow_root).map_err(|err| {
+                    CoreError::action(
+                        action_id,
+                        Some(shadow_root.clone()),
+                        format!("failed to mount cgroup2 in private namespace: {err}"),
+                    )
+                })?;
+            }
         }
         (shadow_root, true)
     } else {
@@ -185,12 +214,7 @@ pub(crate) fn init_v2(
     }
 
     // 5. If mount_mode is bind_mount, bind-mount working_root over target_root
-    if is_bind_mount && bind_mount(&working_root, &target_root).is_err() {
-        let (uid, gid) = posix_system.current_ids();
-        let _ = unshare_user_and_mount_namespaces(uid, gid);
-        if !working_root.join("cgroup.controllers").exists() {
-            let _ = mount_cgroup2(&working_root);
-        }
+    if is_bind_mount {
         bind_mount(&working_root, &target_root).map_err(|source| {
             CoreError::action(
                 action_id,

@@ -233,19 +233,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 
 pub fn unshare_user_and_mount_namespaces(uid: u32, gid: u32) -> Result<(), PosixError> {
-    let res = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    let res =
+        unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP | libc::CLONE_NEWUSER) };
     if res != 0 {
         return Err(PosixError::io(std::io::Error::last_os_error()));
     }
 
-    let _ = fs::write("/proc/self/setgroups", "deny");
     fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).map_err(PosixError::io)?;
+    let _ = fs::write("/proc/self/setgroups", "deny");
     fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).map_err(PosixError::io)?;
-
-    let res = unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP) };
-    if res != 0 {
-        return Err(PosixError::io(std::io::Error::last_os_error()));
-    }
 
     let slash = CString::new("/").map_err(|_| PosixError::invalid("invalid cstring"))?;
     let res = unsafe {

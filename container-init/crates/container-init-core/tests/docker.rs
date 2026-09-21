@@ -282,3 +282,35 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
     let target_subtree = fs::read_to_string(target_path.join("cgroup.subtree_control")).unwrap();
     assert!(target_subtree.contains("pids"));
 }
+
+#[test]
+fn executes_real_cgroup_v2_init_bind_mount_shadowing_unprivileged_non_root() {
+    let posix_system = PosixSystem::new();
+    if posix_system.current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let shadow_path = temp.path().join("non_existent_shadow/cg");
+    let target_path = Path::new("/sys/fs/cgroup");
+
+    let mut resolve = action("resolve", ActionKind::IdentityResolve);
+    resolve.run_as = RunAs::Root;
+
+    let mut cg = action("cg-bind", ActionKind::CgroupV2Init);
+    cg.run_as = RunAs::Root;
+    cg.mount_mode = Some("bind_mount".to_owned());
+    cg.shadow_path = Some(shadow_path.display().to_string());
+    cg.path = Some(target_path.display().to_string());
+    cg.depends_on = vec!["resolve".to_owned()];
+
+    let mut config = fixture_config(temp.path(), vec![cg, resolve]);
+    config.identity.default_user = Some("nobody".to_owned());
+    config.identity.default_uid = Some(65534);
+    config.identity.default_gid = Some(65534);
+
+    let plan = config.build_plan().unwrap();
+    let runner = PlanExecutor::new(config, RuntimeContext::new(temp.path()));
+    let report = runner.execute_plan(&plan).unwrap();
+    assert!(report.succeeded());
+}
