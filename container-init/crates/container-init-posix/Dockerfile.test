@@ -1,7 +1,7 @@
-FROM rust:1.85-bookworm
+FROM docker.io/library/rust:1.85-bookworm
 
 WORKDIR /workspace/nixos-dockers/container-init
 COPY . .
 
 RUN cargo test --locked -p container-init-posix --test docker --no-run
-CMD ["cargo", "test", "--locked", "-p", "container-init-posix", "--test", "docker", "--", "--nocapture"]
+CMD ["cargo", "test", "--locked", "-p", "container-init-posix", "--test", "docker", "--", "--test-threads=1", "--nocapture"]

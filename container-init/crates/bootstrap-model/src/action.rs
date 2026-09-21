@@ -24,6 +24,8 @@ pub enum ActionKind {
     ProcessSetUserShell,
     ProcessDropPrivileges,
     ServiceSshPrepare,
+    #[serde(alias = "cgroup_init")]
+    CgroupV2Init,
     HandoffExec,
 }
 
@@ -42,6 +44,7 @@ impl ActionKind {
                 | Self::ProcessSetUserShell
                 | Self::ProcessDropPrivileges
                 | Self::ServiceSshPrepare
+                | Self::CgroupV2Init
                 | Self::HandoffExec
         )
     }
@@ -54,6 +57,7 @@ impl ActionKind {
             {
                 PlanPhase::Root
             }
+            Self::CgroupV2Init => PlanPhase::Root,
             _ => match run_as {
                 RunAs::Root => PlanPhase::Root,
                 RunAs::Current => PlanPhase::Current,
@@ -124,6 +128,10 @@ pub struct Action {
     pub host_key_types: Option<Vec<String>>,
     #[serde(alias = "keygen")]
     pub ssh_keygen: Option<String>,
+    #[serde(alias = "cgroup_subgroup", alias = "init_subgroup")]
+    pub subgroup: Option<String>,
+    #[serde(alias = "cgroup_controllers")]
+    pub controllers: Option<Vec<String>>,
     pub when: Option<String>,
     #[serde(default)]
     pub failure: FailurePolicy,
@@ -165,6 +173,8 @@ impl Action {
             runtime_dir: None,
             host_key_types: None,
             ssh_keygen: None,
+            subgroup: None,
+            controllers: None,
             when: None,
             failure: FailurePolicy::Error,
             run_as: RunAs::Current,
@@ -189,6 +199,7 @@ impl Action {
                 self.authorized_keys_dir.as_deref(),
                 self.authorized_keys_source.as_deref(),
                 self.runtime_dir.as_deref(),
+                self.subgroup.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -303,6 +314,7 @@ impl Action {
                 | ActionKind::IdentityEnsureHome
                 | ActionKind::ServiceSshPrepare
                 | ActionKind::ProcessDropPrivileges
+                | ActionKind::CgroupV2Init
         ) && self.run_as != RunAs::Root
         {
             return Err(ModelError::Invalid {
@@ -460,6 +472,40 @@ impl Action {
                         message: "authorized_keys_source and content are mutually exclusive"
                             .to_owned(),
                     });
+                }
+            }
+            ActionKind::CgroupV2Init => {
+                if let Some(subgroup) = &self.subgroup {
+                    if subgroup.is_empty()
+                        || subgroup.contains('/')
+                        || subgroup.contains("..")
+                        || subgroup.contains('\0')
+                    {
+                        return Err(ModelError::Invalid {
+                            location: format!("bootstrap.actions.{}.subgroup", self.id),
+                            message: "subgroup must not be empty or contain '/', '..', or NUL"
+                                .to_owned(),
+                        });
+                    }
+                }
+                if let Some(controllers) = &self.controllers {
+                    if controllers.is_empty() {
+                        return Err(ModelError::Invalid {
+                            location: format!("bootstrap.actions.{}.controllers", self.id),
+                            message: "controllers list may not be empty if specified".to_owned(),
+                        });
+                    }
+                    for controller in controllers {
+                        if controller.is_empty()
+                            || controller.contains(char::is_whitespace)
+                            || controller.contains('\0')
+                        {
+                            return Err(ModelError::Invalid {
+                                location: format!("bootstrap.actions.{}.controllers", self.id),
+                                message: format!("invalid controller name {controller:?}"),
+                            });
+                        }
+                    }
                 }
             }
             _ => {}

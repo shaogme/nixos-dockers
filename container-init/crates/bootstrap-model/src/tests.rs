@@ -331,3 +331,52 @@ fn ssh_prepare_rejects_unsupported_key_types_and_conflicting_key_sources() {
         Err(ModelError::Invalid { message, .. }) if message.contains("mutually exclusive")
     ));
 }
+
+#[test]
+fn cgroup_v2_init_action_model_and_plan_effects() {
+    let mut cg = action("cg", ActionKind::CgroupV2Init);
+    cg.run_as = RunAs::Root;
+    cg.path = Some("/sys/fs/cgroup".to_owned());
+    cg.subgroup = Some("init".to_owned());
+    cg.controllers = Some(vec!["cpu".to_owned(), "memory".to_owned()]);
+
+    let plan = config(vec![cg])
+        .build_plan()
+        .expect("cgroup init action should build plan");
+    assert_eq!(plan.ids().collect::<Vec<_>>(), vec!["cg"]);
+    assert_eq!(plan.actions()[0].phase, PlanPhase::Root);
+    assert_eq!(
+        plan.actions()[0].effect,
+        PlanEffect::CgroupV2Init {
+            path: Some("/sys/fs/cgroup".to_owned()),
+            subgroup: Some("init".to_owned()),
+            controllers: Some(vec!["cpu".to_owned(), "memory".to_owned()]),
+        }
+    );
+
+    // Rejects non-root
+    let mut cg_user = action("cg", ActionKind::CgroupV2Init);
+    cg_user.run_as = RunAs::Target;
+    assert!(matches!(
+        config(vec![cg_user]).build_plan(),
+        Err(ModelError::Invalid { message, .. }) if message.contains("must run as root")
+    ));
+
+    // Rejects invalid subgroup names
+    let mut cg_bad_subgroup = action("cg", ActionKind::CgroupV2Init);
+    cg_bad_subgroup.run_as = RunAs::Root;
+    cg_bad_subgroup.subgroup = Some("foo/bar".to_owned());
+    assert!(matches!(
+        config(vec![cg_bad_subgroup]).build_plan(),
+        Err(ModelError::Invalid { message, .. }) if message.contains("subgroup")
+    ));
+
+    // Rejects empty controllers list
+    let mut cg_empty_controllers = action("cg", ActionKind::CgroupV2Init);
+    cg_empty_controllers.run_as = RunAs::Root;
+    cg_empty_controllers.controllers = Some(vec![]);
+    assert!(matches!(
+        config(vec![cg_empty_controllers]).build_plan(),
+        Err(ModelError::Invalid { message, .. }) if message.contains("controllers")
+    ));
+}

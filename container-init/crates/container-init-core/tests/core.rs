@@ -644,3 +644,77 @@ fn ssh_prepare_rejects_incomplete_or_symlinked_host_keys() {
         .expect_err("a half-installed host key must be rejected");
     assert!(error.to_string().contains("incomplete"));
 }
+
+#[test]
+fn cgroup_v2_init_delegates_controllers_and_moves_processes() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let cgroup_dir = temp.path().join("cgroup");
+    fs::create_dir_all(&cgroup_dir).unwrap();
+
+    fs::write(
+        cgroup_dir.join("cgroup.controllers"),
+        "cpu io memory pids\n",
+    )
+    .unwrap();
+    fs::write(cgroup_dir.join("cgroup.procs"), "1001\n1002\n").unwrap();
+    fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
+
+    let mut action = root_action("cg", ActionKind::CgroupV2Init);
+    action.path = Some(cgroup_dir.display().to_string());
+    action.subgroup = Some("init".to_string());
+    action.controllers = Some(vec!["cpu".to_string(), "memory".to_string()]);
+
+    let config = config(temp.path(), vec![action]);
+    let plan = config.build_plan().unwrap();
+    let report = executor(config.clone()).execute_plan(&plan).unwrap();
+    assert!(report.succeeded());
+
+    // Verify subgroup was created
+    assert!(cgroup_dir.join("init").exists());
+
+    // Verify subtree_control has the requested controllers enabled
+    let subtree_content = fs::read_to_string(cgroup_dir.join("cgroup.subtree_control")).unwrap();
+    assert!(subtree_content.contains("+cpu"));
+    assert!(subtree_content.contains("+memory"));
+    assert!(!subtree_content.contains("+io"));
+
+    // Verify procs file in subgroup received pids
+    let subgroup_procs = fs::read_to_string(cgroup_dir.join("init/cgroup.procs")).unwrap();
+    assert!(!subgroup_procs.is_empty());
+
+    // Idempotency: execute again
+    let report2 = executor(config).execute_plan(&plan).unwrap();
+    assert!(report2.succeeded());
+}
+
+#[test]
+fn cgroup_v2_init_fails_on_unavailable_controller_or_missing_cgroup() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let cgroup_dir = temp.path().join("cgroup");
+    fs::create_dir_all(&cgroup_dir).unwrap();
+
+    // 1. Missing cgroup.controllers
+    let mut action = root_action("cg", ActionKind::CgroupV2Init);
+    action.path = Some(cgroup_dir.display().to_string());
+    let cfg = config(temp.path(), vec![action.clone()]);
+    let plan = cfg.build_plan().unwrap();
+    let err = executor(cfg).execute_plan(&plan).unwrap_err();
+    assert!(err.to_string().contains("not a cgroup v2 hierarchy"));
+
+    // 2. Request controller not in cgroup.controllers
+    fs::write(cgroup_dir.join("cgroup.controllers"), "cpu memory\n").unwrap();
+    fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
+    action.controllers = Some(vec!["unsupported_controller".to_string()]);
+    let cfg2 = config(temp.path(), vec![action]);
+    let plan2 = cfg2.build_plan().unwrap();
+    let err2 = executor(cfg2).execute_plan(&plan2).unwrap_err();
+    assert!(err2.to_string().contains("not available"));
+}

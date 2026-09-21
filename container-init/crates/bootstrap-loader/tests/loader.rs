@@ -435,3 +435,39 @@ run_as = "target"
         .expect_err("user bootstrap overlays are not trusted");
     assert!(matches!(error, LoaderError::TrustViolation { .. }));
 }
+
+#[test]
+fn profile_loader_loads_cgroup_v2_init() {
+    let mut loader = base_loader();
+    loader
+        .add_str(
+            "cgroup-profile",
+            SourceKind::ImageProfile,
+            r#"
+schema = 1
+id = "cgroup-profile"
+extends = ["base"]
+
+[[bootstrap.actions]]
+id = "cgroup-init"
+kind = "cgroup.v2_init"
+subgroup = "init"
+controllers = ["cpu", "memory"]
+run_as = "root"
+"#,
+        )
+        .unwrap();
+    let loaded = loader.load("cgroup-profile").unwrap();
+    let cg_action = loaded
+        .config()
+        .actions
+        .iter()
+        .find(|a| a.id == "cgroup-init")
+        .expect("cgroup-init action should be present");
+    assert_eq!(cg_action.kind, ActionKind::CgroupV2Init);
+    assert_eq!(cg_action.subgroup.as_deref(), Some("init"));
+    assert_eq!(
+        cg_action.controllers.as_deref(),
+        Some(&["cpu".to_string(), "memory".to_string()][..])
+    );
+}

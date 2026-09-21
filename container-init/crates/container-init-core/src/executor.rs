@@ -1,3 +1,4 @@
+use crate::cgroup;
 use crate::condition::ConditionContext;
 use crate::context::RuntimeContext;
 use crate::error::CoreError;
@@ -509,6 +510,9 @@ impl PlanExecutor {
                     )
                 })?;
                 ssh::prepare(action, identity, values, &self.options.posix, capability)
+            }
+            ActionKind::CgroupV2Init => {
+                cgroup::init_v2(action, identity, values, &self.options.posix)
             }
             ActionKind::HandoffExec => unreachable!("handled before the action match"),
         };

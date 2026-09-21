@@ -156,3 +156,92 @@ fn executes_real_openssh_preparation_and_is_idempotent() {
         .message
         .contains("0 host key(s) generated"));
 }
+
+#[test]
+fn executes_real_cgroup_v2_init_as_root() {
+    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(
+        PosixSystem::new().current_ids().0,
+        0,
+        "Docker fixture must run as root"
+    );
+
+    let cgroup_base = Path::new("/sys/fs/cgroup");
+    if !cgroup_base.join("cgroup.controllers").exists() {
+        return;
+    }
+    // Skip if cgroup filesystem is mounted read-only (non-privileged container)
+    let test_probe = cgroup_base.join("probe_cgroup_rw");
+    if fs::create_dir(&test_probe).is_err() {
+        return;
+    }
+    let _ = fs::remove_dir(&test_probe);
+
+    let temp = TempDir::new().unwrap();
+    let mut resolve = action("resolve", ActionKind::IdentityResolve);
+    resolve.run_as = RunAs::Root;
+
+    // Test 1: Real cgroup v2 init on /sys/fs/cgroup with default subgroup "init"
+    let mut cg = action("cg-init", ActionKind::CgroupV2Init);
+    cg.run_as = RunAs::Root;
+    cg.subgroup = Some("init".to_owned());
+    cg.depends_on = vec!["resolve".to_owned()];
+
+    let config = fixture_config(temp.path(), vec![cg, resolve.clone()]);
+    let plan = config.build_plan().unwrap();
+    let runner = PlanExecutor::new(config.clone(), RuntimeContext::new(temp.path())).with_options(
+        ExecutionOptions::default().with_receipt_path(temp.path().join("receipt.json")),
+    );
+    let report = runner.execute_plan(&plan).unwrap();
+    assert!(report.succeeded());
+
+    // Verify /sys/fs/cgroup/init exists
+    assert!(cgroup_base.join("init").is_dir());
+
+    // Verify controllers in subtree_control
+    let controllers = fs::read_to_string(cgroup_base.join("cgroup.controllers")).unwrap();
+    let subtree = fs::read_to_string(cgroup_base.join("cgroup.subtree_control")).unwrap();
+    for ctrl in controllers.split_whitespace() {
+        assert!(
+            subtree.contains(ctrl),
+            "expected {ctrl} in subtree_control, got: {subtree}"
+        );
+    }
+
+    // Verify receipt was written
+    let receipt = fs::read_to_string(temp.path().join("receipt.json")).unwrap();
+    assert!(receipt.contains("\"cg-init\""));
+
+    // Verify idempotency
+    let report2 = runner.execute_plan(&plan).unwrap();
+    assert!(report2.succeeded());
+
+    // Test 2: Nested child cgroup hierarchy with custom subgroup
+    let child_cgroup = cgroup_base.join("docker_test_child_cg");
+    fs::create_dir_all(&child_cgroup).unwrap();
+
+    let mut nested_cg = action("nested-cg", ActionKind::CgroupV2Init);
+    nested_cg.run_as = RunAs::Root;
+    nested_cg.path = Some(child_cgroup.display().to_string());
+    nested_cg.subgroup = Some("child_worker".to_owned());
+    nested_cg.controllers = Some(vec!["memory".to_owned(), "pids".to_owned()]);
+    nested_cg.depends_on = vec!["resolve".to_owned()];
+
+    let nested_config = fixture_config(temp.path(), vec![nested_cg, resolve]);
+    let nested_plan = nested_config.build_plan().unwrap();
+    let nested_runner = PlanExecutor::new(nested_config, RuntimeContext::new(temp.path()))
+        .with_options(
+            ExecutionOptions::default().with_receipt_path(temp.path().join("receipt_nested.json")),
+        );
+    let nested_report = nested_runner.execute_plan(&nested_plan).unwrap();
+    assert!(nested_report.succeeded());
+
+    assert!(child_cgroup.join("child_worker").is_dir());
+    let child_subtree = fs::read_to_string(child_cgroup.join("cgroup.subtree_control")).unwrap();
+    assert!(child_subtree.contains("memory"));
+    assert!(child_subtree.contains("pids"));
+
+    // Cleanup child cgroup
+    let _ = fs::remove_dir(child_cgroup.join("child_worker"));
+    let _ = fs::remove_dir(&child_cgroup);
+}

@@ -5,6 +5,7 @@
 //! supplied by `bootstrap-model`; loading and trust-aware merging remain in
 //! `bootstrap-loader`.
 
+mod cgroup;
 mod condition;
 mod context;
 mod error;

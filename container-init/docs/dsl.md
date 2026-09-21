@@ -242,6 +242,7 @@ DSL 中使用 dotted 名称，例如 `filesystem.ensure_dir`；下面的“必�
 | `process.set_user_shell` | `user`、`shell` | 更新 passwd 的 login shell 字段 | 仅 trusted image/admin 来源；目标用户必须存在 |
 | `process.drop_privileges` | 无 | `initgroups`/`setgroups` 后执行 `setgid`、`setuid` | 必须 root；最多一个；计划阶段为 handoff |
 | `service.ssh.prepare` | host key、authorized key、runtime 三个目录 | 创建 SSH 目录、生成/校验 host key、可选写入 authorized keys | 必须 root、trusted 来源；需启用 SSH capability |
+| `cgroup.v2_init` | 无（path/subgroup/controllers 均有默认值） | 校验 cgroup v2、将根进程迁移至子组并向 subtree_control 委托控制器 | 必须 root、仅 trusted 来源；计划阶段为 Root |
 | `handoff.exec` | 无 | 将最终命令包装成 handoff runtime 命令 | 仅 trusted 来源；最多一个；非幂等、必须位于 handoff 阶段 |
 
 ### 6.1 文件 action 示例
@@ -342,6 +343,46 @@ depends_on = ["resolve"]
 SSH capability 只提供受信任的 keygen 可执行文件；action 自己声明所有路径。container-init 不执行 sshd，也不内置任何镜像专用目录。
 
 兼容早期 DSL 的别名仍可使用：`path` 作为 `host_key_dir`、`target` 作为 `authorized_keys_dir`、`link` 作为 `runtime_dir`；新配置应使用命名字段。
+
+### 6.4 cgroup v2 初始化示例
+
+在以 `--privileged` 运行且拥有独立 cgroup namespace 的容器内嵌套运行 Podman / Docker / crun 时，cgroup v2 规范禁止存在内部进程的层级开启子树控制器（"no internal processes" 规则）。若容器内 PID 1 或当前进程位于根 cgroup，向根节点的 `cgroup.subtree_control` 写入会报错 `EBUSY`；而子层级（如 `/libpod_parent/...`）试图启用控制器时则会报错 `ENOENT: write cgroup.subtree_control: no such file or directory`。
+
+`cgroup.v2_init` action 声明在容器启动阶段由 root 自动化完成 cgroup v2 初始化与子树委托：
+
+```toml
+[[bootstrap.actions]]
+id = "cgroup-init"
+kind = "cgroup.v2_init"
+run_as = "root"
+```
+
+完整可选参数如下：
+
+```toml
+[[bootstrap.actions]]
+id = "cgroup-init"
+kind = "cgroup.v2_init"
+path = "/sys/fs/cgroup"
+subgroup = "init"
+controllers = ["cpu", "io", "memory", "pids"]
+owner = "root"
+run_as = "root"
+```
+
+字段说明：
+- `path`：可选。cgroup 根路径，默认 `/sys/fs/cgroup`。
+- `subgroup`：可选。用于移入容器根进程的子组目录名称，默认 `"init"`（对应 `/sys/fs/cgroup/init`）。
+- `controllers`：可选。要启用到 `cgroup.subtree_control` 的控制器列表。未指定时自动读取 `/sys/fs/cgroup/cgroup.controllers` 中所有可用的控制器进行全量委托。若指定控制器在当前层级不可用，校验会直接报错失败。
+- `owner`：可选。子组目录的属主（例如 `"identity.target"`）。
+- `run_as`：必须为 `"root"`，且仅能来自受信任 profile。
+
+执行逻辑：
+1. 校验 `cgroup_root` 存在且包含 `cgroup.controllers`（验证为有效的 cgroup v2 层级）。
+2. 创建子组目录 `/sys/fs/cgroup/<subgroup>`。
+3. 读取 `/sys/fs/cgroup/cgroup.procs`，将所有既有进程迁移至 `/sys/fs/cgroup/<subgroup>/cgroup.procs`，清空根层级的进程占用。
+4. 读取已在 `cgroup.subtree_control` 启用的控制器，通过追加写入 `+<controller>` 启用目标控制器（支持幂等重复执行）。
+5. 若配置了 `owner`，对子组目录执行属主对齐。
 
 ## 7. 插值与条件
 

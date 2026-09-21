@@ -1,6 +1,7 @@
 # Base configuration for the application
 x-app-base: &app-base
   image: ghcr.io/shaogme/coding-images/npins-common:latest
+  privileged: true
   environment:
     - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
     - HOST_UID # Set HOST_UID=host_uid[:host_gid] explicitly; otherwise infer the mounted workspace owner

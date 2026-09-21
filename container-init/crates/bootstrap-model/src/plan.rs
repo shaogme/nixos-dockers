@@ -64,6 +64,11 @@ pub enum PlanEffect {
         host_key_types: Vec<String>,
         authorized_keys: bool,
     },
+    CgroupV2Init {
+        path: Option<String>,
+        subgroup: Option<String>,
+        controllers: Option<Vec<String>>,
+    },
     HandoffExec,
 }
 
@@ -127,6 +132,11 @@ impl PlanEffect {
                 },
                 authorized_keys: action.content.is_some()
                     || action.authorized_keys_source.is_some(),
+            },
+            ActionKind::CgroupV2Init => Self::CgroupV2Init {
+                path: action.path.clone(),
+                subgroup: action.subgroup.clone(),
+                controllers: action.controllers.clone(),
             },
             ActionKind::HandoffExec => Self::HandoffExec,
         }

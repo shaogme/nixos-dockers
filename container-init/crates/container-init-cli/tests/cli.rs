@@ -497,3 +497,80 @@ fn trust_exit_code_uses_the_structured_error_variant() {
     }));
     assert_eq!(ordinary_error.exit_code(), 65);
 }
+
+#[test]
+fn cli_plans_cgroup_v2_init_action() {
+    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let (temp, profiles, workspace, _, _) = profile_fixture();
+    let lock = temp.path().join("lock");
+    let cgroup_dir = temp.path().join("cgroup");
+    fs::create_dir_all(&cgroup_dir).unwrap();
+    fs::write(cgroup_dir.join("cgroup.controllers"), "cpu memory\n").unwrap();
+    fs::write(cgroup_dir.join("cgroup.procs"), "").unwrap();
+    fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
+
+    let profile_content = format!(
+        r#"
+schema = 1
+id = "fixture-cgroup"
+
+[bootstrap]
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "root"
+default_uid = 0
+default_gid = 0
+auto_mapping = false
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "cg-init"
+kind = "cgroup.v2_init"
+path = "{}"
+subgroup = "init"
+controllers = ["cpu"]
+run_as = "root"
+"#,
+        workspace.display(),
+        cgroup_dir.display(),
+    );
+    fs::write(profiles.join("10-cgroup.toml"), profile_content).unwrap();
+
+    let output = Command::new(binary())
+        .args([
+            "--profiles-dir",
+            profiles.to_str().unwrap(),
+            "--profile",
+            "fixture-cgroup",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--lock-path",
+            lock.to_str().unwrap(),
+            "plan",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["profile"], "fixture-cgroup");
+    let cg_action = document["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "cg-init")
+        .expect("cg-init action should be planned");
+    assert_eq!(cg_action["kind"], "cgroup_v2_init");
+    assert_eq!(cg_action["run_as"], "root");
+}

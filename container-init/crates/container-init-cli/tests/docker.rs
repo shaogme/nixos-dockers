@@ -266,3 +266,128 @@ depends_on = ["resolve"]
     assert!(runtime.is_dir());
     assert_eq!(fs::read_to_string(handoff).unwrap(), "docker ssh handoff\n");
 }
+
+#[test]
+fn cli_runs_a_real_cgroup_v2_init_bootstrap_action_before_handoff() {
+    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(
+        container_init_core::PosixSystem::new().current_ids().0,
+        0,
+        "Docker fixture must run as root"
+    );
+
+    let cgroup_base = std::path::Path::new("/sys/fs/cgroup");
+    if !cgroup_base.join("cgroup.controllers").exists() {
+        return;
+    }
+    let test_probe = cgroup_base.join("probe_cgroup_cli_rw");
+    if fs::create_dir(&test_probe).is_err() {
+        return;
+    }
+    let _ = fs::remove_dir(&test_probe);
+
+    let temp = TempDir::new().unwrap();
+    let profiles = temp.path().join("profiles");
+    let workspace = temp.path().join("workspace");
+    let handoff = workspace.join("handoff");
+    let lock = temp.path().join("bootstrap.lock");
+    let receipt = temp.path().join("receipt.json");
+    fs::create_dir(&profiles).unwrap();
+    fs::create_dir(&workspace).unwrap();
+
+    let child_cgroup = cgroup_base.join("docker_cli_test_cg");
+    fs::create_dir_all(&child_cgroup).unwrap();
+
+    fs::write(
+        profiles.join("cgroup.toml"),
+        format!(
+            r#"
+schema = 1
+id = "cgroup"
+
+[bootstrap]
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "root"
+default_uid = 0
+default_gid = 0
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "resolve"
+kind = "identity.resolve"
+run_as = "root"
+
+[[bootstrap.actions]]
+id = "cgroup-init"
+kind = "cgroup.v2_init"
+run_as = "root"
+path = "{}"
+subgroup = "worker"
+depends_on = ["resolve"]
+"#,
+            workspace.display(),
+            child_cgroup.display()
+        ),
+    )
+    .unwrap();
+
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("container-init");
+    let common = [
+        "--profiles-dir",
+        profiles.to_str().unwrap(),
+        "--profile",
+        "cgroup",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--lock-path",
+        lock.to_str().unwrap(),
+        "--receipt-path",
+        receipt.to_str().unwrap(),
+    ];
+
+    let plan = Command::new(&binary)
+        .args(common)
+        .args(["plan", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan_doc: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(plan_doc["actions"][1]["id"], "cgroup-init");
+
+    let script = format!("printf 'cgroup handoff\\n' > {}", handoff.display());
+    let run = Command::new(&binary)
+        .args(common)
+        .args(["run", "--"])
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(child_cgroup.join("worker").is_dir());
+    assert_eq!(fs::read_to_string(&handoff).unwrap(), "cgroup handoff\n");
+    let receipt_str = fs::read_to_string(&receipt).unwrap();
+    assert!(receipt_str.contains("\"cgroup-init\""));
+
+    // Cleanup
+    let _ = fs::remove_dir(child_cgroup.join("worker"));
+    let _ = fs::remove_dir(&child_cgroup);
+}
