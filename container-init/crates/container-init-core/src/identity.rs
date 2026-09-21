@@ -6,6 +6,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub const DEFAULT_CONTAINER_HOME: &str = "/home/user";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentitySource {
@@ -140,9 +142,15 @@ impl IdentityResolver {
         )?
         .unwrap_or(false);
 
+        let default_home = config
+            .identity
+            .default_home
+            .as_deref()
+            .unwrap_or(DEFAULT_CONTAINER_HOME);
+
         if run_as_root {
             let home = input_home(config, &inputs, config.identity.home_input.as_deref())?
-                .unwrap_or_else(|| PathBuf::from("/root"));
+                .unwrap_or_else(|| PathBuf::from(default_home));
             return Ok(ResolvedIdentity {
                 uid: 0,
                 gid: 0,
@@ -297,35 +305,8 @@ impl IdentityResolver {
             }
         }
 
-        let canonical_user = if uid == 0 {
-            None
-        } else {
-            self.posix
-                .lookup_user_by_name(&user)
-                .map_err(|source| CoreError::io(None, None, source))?
-        };
         let home = input_home(config, &inputs, config.identity.home_input.as_deref())?
-            .or_else(|| {
-                if uid == 0 {
-                    None
-                } else {
-                    named_user.as_ref().map(|user| user.home.clone())
-                }
-            })
-            .or_else(|| {
-                if uid == 0 {
-                    Some(PathBuf::from("/root"))
-                } else {
-                    canonical_user.as_ref().map(|user| user.home.clone())
-                }
-            })
-            .unwrap_or_else(|| {
-                if uid == 0 {
-                    PathBuf::from("/root")
-                } else {
-                    PathBuf::from(format!("/home/{user}"))
-                }
-            });
+            .unwrap_or_else(|| PathBuf::from(default_home));
 
         if !home.is_absolute() {
             return Err(CoreError::Identity {

@@ -12,6 +12,7 @@ fn config(actions: Vec<Action>) -> BootstrapConfig {
             default_user: Some("dev".to_owned()),
             default_uid: Some(1000),
             default_gid: Some(1000),
+            default_home: None,
             auto_mapping: true,
             run_as_root_input: Some("RUN_AS_ROOT".to_owned()),
             uid_input: Some("HOST_UID".to_owned()),
@@ -245,10 +246,10 @@ fn workspace_actions_are_limited_to_safe_target_user_actions() {
 fn rendered_paths_are_revalidated_after_interpolation() {
     let template = PathTemplate::new("${identity.home}/.config/tool").unwrap();
     let mut values = BTreeMap::new();
-    values.insert("identity.home".to_owned(), "/home/dev".to_owned());
+    values.insert("identity.home".to_owned(), "/home/user".to_owned());
     assert_eq!(
         template.render(&values).unwrap(),
-        "/home/dev/.config/tool".to_owned()
+        "/home/user/.config/tool".to_owned()
     );
     values.insert("identity.home".to_owned(), "/home/../root".to_owned());
     assert!(template.render(&values).is_err());

@@ -131,7 +131,7 @@ UID/GID 解析逻辑。`HOST_UID`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_RO
 随继承环境传给 Bootstrap。需要保留 root 时显式使用：
 
 ```bash
-docker exec -e RUN_AS_ROOT=1 -e CONTAINER_HOME=/root -it <container> bash
+docker exec -e RUN_AS_ROOT=1 -it <container> bash
 ```
 
 `/usr/bin/dev-env-login-shell` 是 root SSH 的稳定 login shell，不会因为 `/bin/bash`

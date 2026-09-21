@@ -131,7 +131,7 @@ test_loaded_image() {
     assert_contains "$handoff" 'nixos-docker login-shell'
 
     echo "==> validating non-mounted workspace default"
-    handoff="$(docker run --rm --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/dev && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = 1000 && test "$(id -g)" = 1000')"
+    handoff="$(docker run --rm --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/user && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = 1000 && test "$(id -g)" = 1000')"
     [[ -z "$handoff" ]]
 
     echo "==> validating non-root identity handoff"
@@ -146,7 +146,7 @@ test_loaded_image() {
         printf "%s:%s:1:1\\n" "$uid_parent" "$gid_parent"
     ')"
     IFS=: read -r host_uid host_gid expected_uid expected_gid <<< "$identity_fixture"
-    handoff="$(docker run --rm --env HOST_UID="$host_uid:$host_gid" --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/dev && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
+    handoff="$(docker run --rm --env HOST_UID="$host_uid:$host_gid" --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" --entrypoint /usr/bin/container-init "$attr:latest" run -- /bin/sh -c 'test "$HOME" = /home/user && test "$USER" = dev && test "$LOGNAME" = dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
     [[ -z "$handoff" ]]
 
     local exec_container="nixos-dockers-${image}-${attr//[^a-zA-Z0-9_.-]/-}-exec-$$"
@@ -159,15 +159,15 @@ test_loaded_image() {
     wait_for_running "$exec_container"
 
     exec_output="$(docker_exec_wait_for_bootstrap --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" bash -lc \
-        'test "$USER" = dev && test "$HOME" = /home/dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
+        'test "$USER" = dev && test "$HOME" = /home/user && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
     [[ -z "$exec_output" ]]
 
     exec_output="$(docker_exec_wait_for_bootstrap --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" /bin/bash -lc \
-        'test "$USER" = dev && test "$HOME" = /home/dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
+        'test "$USER" = dev && test "$HOME" = /home/user && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID"')"
     [[ -z "$exec_output" ]]
 
-    root_output="$(docker_exec_wait_for_bootstrap -e RUN_AS_ROOT=1 -e CONTAINER_HOME=/root "$exec_container" bash -lc \
-        'test "$USER" = root && test "$HOME" = /root && test "$(id -u)" = 0 && test "$(id -g)" = 0')"
+    root_output="$(docker_exec_wait_for_bootstrap -e RUN_AS_ROOT=1 "$exec_container" bash -lc \
+        'test "$USER" = root && test "$HOME" = /home/user && test "$(id -u)" = 0 && test "$(id -g)" = 0')"
     [[ -z "$root_output" ]]
 
     low_level="$(docker exec "$exec_container" /bin/sh -c 'test "$(id -u)" = 0 && printf "%s" "${BASH-unset}"')"
@@ -189,7 +189,7 @@ test_loaded_image() {
             'test "$(awk -F: '\''$1 == "root" { print $7; exit }'\'' /etc/passwd)" = /usr/bin/dev-env-login-shell')"
         [[ -z "$handoff" ]]
         handoff="$(docker exec "$container" /usr/bin/dev-env-login-shell -c \
-            'test "$HOME" = /root && test "$(id -u)" = 0 && test "$(id -g)" = 0')"
+            'test "$HOME" = /home/user && test "$(id -u)" = 0 && test "$(id -g)" = 0')"
         [[ -z "$handoff" ]]
         docker rm -f "$container" >/dev/null
         unset 'containers[-1]'

@@ -25,6 +25,7 @@ fn config(workspace: &Path, actions: Vec<Action>) -> BootstrapConfig {
             default_user: None,
             default_uid: Some(uid),
             default_gid: Some(gid),
+            default_home: None,
             auto_mapping: false,
             run_as_root_input: None,
             uid_input: None,
@@ -134,7 +135,7 @@ fn mapped_host_root_is_canonical_root_and_unmapped_ids_fail() {
     assert_eq!((identity.uid, identity.gid), (0, 0));
     assert_eq!(
         (identity.user, identity.home),
-        ("root".to_owned(), Path::new("/root").to_path_buf())
+        ("root".to_owned(), Path::new("/home/user").to_path_buf())
     );
 
     let error = IdentityResolver::with_posix(posix)
@@ -178,7 +179,7 @@ fn workspace_owner_is_used_only_when_mount_observation_is_explicitly_mounted() {
         .unwrap();
     assert_eq!((mounted.uid, mounted.gid), (0, 0));
     assert_eq!(mounted.user, "root");
-    assert_eq!(mounted.home, Path::new("/root"));
+    assert_eq!(mounted.home, Path::new("/home/user"));
     assert_eq!(mounted.uid_source, IdentitySource::WorkspaceMount);
 }
 
@@ -412,7 +413,7 @@ fn passwd_mapping_shell_update_and_receipt_are_auditable() {
         .unwrap();
     assert!(report.succeeded());
     let passwd_contents = fs::read_to_string(&passwd).unwrap();
-    assert!(passwd_contents.contains("fixture:x:2100:2101::/home/fixture:/usr/bin/test-shell"));
+    assert!(passwd_contents.contains("fixture:x:2100:2101::/home/user:/usr/bin/test-shell"));
     assert!(fs::read_to_string(&group)
         .unwrap()
         .contains("fixture:x:2101:"));

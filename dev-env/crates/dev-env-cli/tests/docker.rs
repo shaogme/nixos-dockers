@@ -36,8 +36,11 @@ impl Fixture {
         fs::write(workspace.join("project.config"), "enabled\n").unwrap();
         fs::write(&default_profile, "docker\n").unwrap();
         write_provider(&provider);
+        let real_bash = std::env::var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/bash"));
         #[cfg(unix)]
-        std::os::unix::fs::symlink("/bin/bash", &configured_bash).unwrap();
+        std::os::unix::fs::symlink(&real_bash, &configured_bash).unwrap();
         fs::write(
             profiles.join("00-docker.toml"),
             profile_contents(&workspace, &provider, &configured_bash, &root),
@@ -257,6 +260,9 @@ fn assert_materialized_projection(environment: &BTreeMap<String, String>, shell:
 #[test]
 fn docker_cli_materializes_one_environment_across_real_entrypoints() {
     assert_eq!(std::env::consts::OS, "linux");
+    let real_bash = std::env::var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/bash"));
     let fixture = Fixture::new();
 
     let printed = json_environment(&fixture.run(&["print", "--format", "json"]));
@@ -293,7 +299,7 @@ fn docker_cli_materializes_one_environment_across_real_entrypoints() {
         "--shell",
         "bash",
         "--real",
-        "/bin/bash",
+        real_bash.to_str().unwrap(),
         "--",
         "-c",
         "printf '%s' \"$SPECIAL\"",

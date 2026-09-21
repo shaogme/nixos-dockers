@@ -230,8 +230,8 @@ docker exec <container> dev-env print --format json
 
 如果镜像安装 Bash shim，root 的 `docker exec -it <container> bash -lc ...` 和
 `docker exec -it <container> /bin/bash -lc ...` 会先重新进入身份 Bootstrap，再
-materialize；非 root 调用则直接 materialize。需要保留 root 时显式传入
-`RUN_AS_ROOT=1` 和 `CONTAINER_HOME=/root`。直接指定 `/nix/store/.../bash`、
+materialize；非 root 调用则直接 materialize。需要保留 root 身份时显式传入
+`RUN_AS_ROOT=1`。直接指定 `/nix/store/.../bash`、
 `/bin/sh` 或任意非 shell binary 不会自动注入开发环境；此时请显式写
 `dev-env exec --`。
 

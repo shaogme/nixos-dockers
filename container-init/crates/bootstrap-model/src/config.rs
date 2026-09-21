@@ -149,6 +149,7 @@ pub struct IdentityConfig {
     pub default_user: Option<String>,
     pub default_uid: Option<u32>,
     pub default_gid: Option<u32>,
+    pub default_home: Option<String>,
     pub auto_mapping: bool,
     pub run_as_root_input: Option<String>,
     pub uid_input: Option<String>,
@@ -160,6 +161,9 @@ impl IdentityConfig {
     fn validate(&self) -> Result<(), ModelError> {
         if let Some(user) = &self.default_user {
             validate_user_name("bootstrap.identity.default_user", user)?;
+        }
+        if let Some(home) = &self.default_home {
+            validate_path_template("bootstrap.identity.default_home", home)?;
         }
         for (field, value) in [
             ("run_as_root_input", &self.run_as_root_input),

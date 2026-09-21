@@ -23,6 +23,7 @@ fn fixture_config(root: &Path, actions: Vec<Action>) -> BootstrapConfig {
             default_user: Some("root".to_owned()),
             default_uid: Some(uid),
             default_gid: Some(gid),
+            default_home: None,
             auto_mapping: false,
             run_as_root_input: None,
             uid_input: None,

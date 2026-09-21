@@ -114,7 +114,7 @@ docker exec -it <container> /bin/bash -lc 'id && printf "%s\\n" "$HOME"'
 需要 root 时显式声明：
 
 ```bash
-docker exec -e RUN_AS_ROOT=1 -e CONTAINER_HOME=/root -it <container> bash
+docker exec -e RUN_AS_ROOT=1 -it <container> bash
 ```
 
 `/usr/bin/dev-env-login-shell` 是 root SSH 使用的稳定 login shell；`/bin/sh` 和

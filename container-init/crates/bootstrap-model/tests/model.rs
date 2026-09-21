@@ -17,6 +17,7 @@ fn minimal_config(actions: Vec<Action>) -> BootstrapConfig {
             default_user: Some("dev".to_owned()),
             default_uid: Some(1000),
             default_gid: Some(1000),
+            default_home: None,
             auto_mapping: true,
             run_as_root_input: Some("RUN_AS_ROOT".to_owned()),
             uid_input: Some("HOST_UID".to_owned()),

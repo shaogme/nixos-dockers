@@ -201,7 +201,7 @@ fn print_exec_shell_login_and_shim_share_the_same_environment() {
             "--shell",
             "sh",
             "--real",
-            "/bin/bash",
+            "/bin/sh",
             "--",
             "-c",
             "printf '%s' \"$BASE\"",
@@ -503,7 +503,7 @@ fn root_bash_shim_rebootstraps_with_original_argv_and_runtime_inputs() {
         .env("DEVENV_BOOTSTRAP_REAL_SHELL", &real_shell)
         .env("HOST_UID", "1001:1002")
         .env("HOST_GID", "1002")
-        .env("CONTAINER_HOME", "/home/dev")
+        .env("CONTAINER_HOME", "/home/user")
         .env("RUN_AS_ROOT", "0")
         .args([
             "-l",
@@ -527,7 +527,7 @@ fn root_bash_shim_rebootstraps_with_original_argv_and_runtime_inputs() {
     );
     assert_eq!(
         fs::read_to_string(&environment_file).unwrap(),
-        "1001:1002\n1002\n/home/dev\n0\n"
+        "1001:1002\n1002\n/home/user\n0\n"
     );
     assert_eq!(fs::metadata(&container_init).unwrap().mode() & 0o111, 0o111);
 }

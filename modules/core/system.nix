@@ -3,8 +3,8 @@ let
   rootLoginShell = if config.runtime.enable then "/usr/bin/dev-env-login-shell" else "/bin/sh";
 
   passwd = pkgs.writeTextDir "etc/passwd" ''
-    root:x:0:0:System Administrator:/root:${rootLoginShell}
-    ${config.system.defaultUser}:x:${toString config.system.defaultUid}:${toString config.system.defaultGid}:Developer:/home/${config.system.defaultUser}:/bin/bash
+    root:x:0:0:System Administrator:/home/user:${rootLoginShell}
+    ${config.system.defaultUser}:x:${toString config.system.defaultUid}:${toString config.system.defaultGid}:Developer:/home/user:/bin/bash
     ${lib.optionalString config.services.openssh.enable "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin\n"}
   '';
 
@@ -224,8 +224,8 @@ in
       chmod 644 etc/subgid
 
       # 3. Non-Root User Setup & Defexpr
-      mkdir -p home/${config.system.defaultUser}/.nix-defexpr
-      ln -sf ${pkgs.path} home/${config.system.defaultUser}/.nix-defexpr/nixpkgs
+      mkdir -p home/user/.nix-defexpr
+      ln -sf ${pkgs.path} home/user/.nix-defexpr/nixpkgs
       mkdir -p root
       chmod 700 root
 
@@ -292,7 +292,7 @@ in
     '';
 
     docker.fakeRootCommands = ''
-      target_home="home/${config.system.defaultUser}"
+      target_home="home/user"
       if [ ! -d "$target_home" ] && [ -d "/$target_home" ]; then
         target_home="/$target_home"
       fi
