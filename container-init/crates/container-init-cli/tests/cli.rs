@@ -202,6 +202,85 @@ fn run_executes_actions_then_handoffs_to_the_declared_runtime() {
 }
 
 #[test]
+fn parser_parses_exec_command_with_double_dash_and_arguments() {
+    let cli = Cli::parse_strings([
+        "container-init",
+        "--profiles-dir",
+        "/profiles",
+        "exec",
+        "--",
+        "tool",
+        "--flag",
+        "value",
+    ])
+    .unwrap();
+    assert_eq!(cli.options.profiles_dir, Some(PathBuf::from("/profiles")));
+    assert_eq!(
+        cli.command,
+        CliCommand::Exec {
+            command: vec!["tool".to_owned(), "--flag".to_owned(), "value".to_owned(),]
+        }
+    );
+}
+
+#[test]
+fn exec_hands_off_without_bootstrap_actions_or_lock_or_receipt() {
+    let (temp, profiles, workspace, marker, handoff) = profile_fixture();
+    let lock = temp.path().join("lock");
+    let receipt = temp.path().join("receipt.json");
+    let script = format!("printf 'exec-handoff\\n' > {}", handoff.display());
+    let output = Command::new(binary())
+        .args(common_args(&profiles, &workspace, &lock))
+        .args(["--receipt-path", receipt.to_str().unwrap(), "exec", "--"])
+        .arg(script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "exec must not execute bootstrap actions");
+    assert!(
+        !receipt.exists(),
+        "exec must not write an execution receipt"
+    );
+    assert!(!lock.exists(), "exec must not create or acquire a lock");
+    assert_eq!(fs::read_to_string(&handoff).unwrap(), "exec-handoff\n");
+}
+
+#[test]
+fn exec_supports_parallel_execution_without_lock_contention() {
+    let (temp, profiles, workspace, _marker, _handoff) = profile_fixture();
+    let lock = temp.path().join("lock");
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let profiles = profiles.clone();
+        let workspace = workspace.clone();
+        let lock = lock.clone();
+        let out_file = temp.path().join(format!("parallel-{i}"));
+        handles.push(std::thread::spawn(move || {
+            let script = format!("printf '{i}\\n' > {}", out_file.display());
+            let output = Command::new(binary())
+                .args(common_args(&profiles, &workspace, &lock))
+                .args(["exec", "--"])
+                .arg(script)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "parallel exec {i} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read_to_string(&out_file).unwrap(), format!("{i}\n"));
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+#[test]
 fn run_exports_resolved_identity_environment_before_non_root_handoff() {
     if container_init_core::PosixSystem::new().current_ids().0 != 0 {
         return;

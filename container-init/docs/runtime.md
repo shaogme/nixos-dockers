@@ -4,6 +4,7 @@
 
 ```text
 container-init [OPTIONS] run [--] [COMMAND...]
+container-init [OPTIONS] exec [--] [COMMAND...]
 container-init [OPTIONS] plan [--json]
 container-init [OPTIONS] doctor [--json]
 container-init [OPTIONS] version
@@ -104,6 +105,26 @@ container-init --profile coding-images run -- tool --flag 'value with spaces'
 中记录 warning。
 
 如果 profile 没有显式 `handoff.exec`，执行器仍会根据 `[bootstrap.handoff]` 生成 handoff。显式 action 主要用于让 handoff 出现在计划和 receipt 的 action 轨迹中。
+
+### `exec`
+
+```bash
+# 无显式 command，runtime 使用 shell_prefix
+container-init --profile coding-images exec
+
+# 有显式 command，runtime 使用 exec_prefix
+container-init --profile coding-images exec -- tool --flag 'value with spaces'
+```
+
+`exec` 是专用于容器运行时并发调用的无锁权限转交入口（供 `dev-env shim` 或并发 `docker exec` 使用）。它会：
+
+1. 加载 profile 并根据 workspace 和 runtime input 解析目标身份；
+2. 将当前工作目录切换到 runtime workspace；
+3. 如果当前进程是 root 且目标不是 root/root service，安全降权（`drop_privileges`）到目标用户；
+4. 将 `HOME`、`USER`、`LOGNAME` 设置为目标值；
+5. 用 `exec` 替换当前进程为 handoff runtime。
+
+与 `run` 相比，`exec` **不获取 bootstrap lock**、**不执行任何 bootstrap action**（不修改 `/etc/passwd`/`/etc/group`，不创建文件/目录，不生成 SSH 密钥）、**不写 receipt**。它假定容器此前已通过 `run` 完成初始化，因此各并行命令可以完全无阻塞、零锁冲突并发执行。
 
 ### `version`
 

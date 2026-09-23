@@ -158,7 +158,7 @@ impl BootstrapPaths {
 
     fn build_command(&self, args: &[OsString]) -> Result<CommandLine, CliError> {
         let mut bootstrap_args = Vec::with_capacity(args.len() + 3);
-        bootstrap_args.push(OsString::from("run"));
+        bootstrap_args.push(OsString::from("exec"));
         bootstrap_args.push(OsString::from("--"));
         bootstrap_args.push(self.real_shell.clone().into_os_string());
         bootstrap_args.extend(args.iter().cloned());

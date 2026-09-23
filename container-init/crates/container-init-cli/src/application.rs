@@ -79,6 +79,12 @@ where
                 .execute_and_handoff(loaded.plan(), &command)?;
             Ok(())
         }
+        CliCommand::Exec { command } => {
+            let loaded = config::load(&cli.options)?;
+            let context = config::runtime_context(&cli.options, true)?;
+            PlanExecutor::new(loaded.config().clone(), context).exec_and_handoff(&command)?;
+            Ok(())
+        }
     }
 }
 fn parse_error(error: ParseError) -> CliError {

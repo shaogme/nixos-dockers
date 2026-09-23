@@ -521,7 +521,7 @@ fn root_bash_shim_rebootstraps_with_original_argv_and_runtime_inputs() {
     assert_eq!(
         fs::read_to_string(&argv_file).unwrap(),
         format!(
-            "run\n--\n{}\n-l\n-c\nprintf '%s' \"argument\"\nliteral;$(not-a-command)\n",
+            "exec\n--\n{}\n-l\n-c\nprintf '%s' \"argument\"\nliteral;$(not-a-command)\n",
             real_shell.display()
         )
     );

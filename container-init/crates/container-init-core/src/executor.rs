@@ -327,6 +327,37 @@ impl PlanExecutor {
         }
     }
 
+    pub fn prepare_exec(
+        &self,
+        command: &[String],
+    ) -> Result<(ResolvedIdentity, HandoffCommand, bool), CoreError> {
+        self.config.validate().map_err(CoreError::Model)?;
+        let resolver = IdentityResolver::with_posix(self.options.posix.clone());
+        let identity = resolver.resolve(&self.config, &self.context)?;
+        let root_service_handoff = self.is_root_service_handoff(command);
+        let handoff = self.build_handoff_command(command)?;
+        Ok((identity, handoff, root_service_handoff))
+    }
+
+    /// Transition privileges to the resolved identity and replace this process with
+    /// the configured handoff command, without executing any bootstrap actions or
+    /// acquiring the bootstrap lock.
+    pub fn exec_and_handoff(&self, command: &[String]) -> Result<(), CoreError> {
+        let (identity, handoff, root_service_handoff) = self.prepare_exec(command)?;
+        if !root_service_handoff && identity.uid != 0 && !identity.run_as_root {
+            let posix = posix_identity(&identity);
+            self.options
+                .posix
+                .drop_privileges(&posix)
+                .map_err(|error| CoreError::from_posix("drop-privileges", None, error))?;
+        }
+        if root_service_handoff {
+            handoff.exec_as_root_service()
+        } else {
+            handoff.exec_with_identity(Some(&identity))
+        }
+    }
+
     fn validate_plan(&self, plan: &Plan) -> Result<(), CoreError> {
         self.config.validate().map_err(CoreError::Model)?;
         let expected = self.config.build_plan().map_err(CoreError::Model)?;

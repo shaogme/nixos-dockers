@@ -105,9 +105,8 @@ dev-env shim \
 镜像中的 `/bin/bash` 和 `/usr/bin/bash` 是指向 `dev-env` 的 symlink；CLI 根据
 argv0 把它识别为 Bash shim，并使用 `DEVENV_REAL_SHELL` 或默认
 `/usr/local/libexec/dev-env/real/bash`。当 shim 以 root 启动且镜像提供
-`DEVENV_CONTAINER_INIT` 与 `DEVENV_BOOTSTRAP_REAL_SHELL` 时，它会在加载 profile 前
-以继承环境的结构化 argv 委托给 `container-init run -- real-bash ...`，因此不会先
-以 root 物化一次 provider。
+以继承环境的结构化 argv 委托给 `container-init exec -- real-bash ...`，因此不会先
+以 root 物化一次 provider，也不会触发 bootstrap 排他锁冲突。
 
 `--real` 与配置的 shim 路径必须分离。直接将 real shell 配置成 `/bin/bash` 会导致 `/bin/bash` 再回到 dev-env，应该把真实 executable 放在 profile 明确的非 shim 路径。
 

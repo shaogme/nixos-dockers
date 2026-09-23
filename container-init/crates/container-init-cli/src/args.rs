@@ -22,6 +22,7 @@ pub struct CliOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CliCommand {
     Run { command: Vec<String> },
+    Exec { command: Vec<String> },
     Plan { json: bool },
     Doctor { json: bool },
     Version,
@@ -116,7 +117,7 @@ impl Cli {
             }
 
             match command_name.as_deref() {
-                Some("run") if !run_started => {
+                Some("run") | Some("exec") if !run_started => {
                     if is_help(argument) {
                         help = true;
                         index += 1;
@@ -131,7 +132,8 @@ impl Cli {
                         ));
                     } else if argument.starts_with('-') {
                         return Err(ParseError::Invalid(format!(
-                            "unknown run option {argument:?}; use -- before command arguments",
+                            "unknown {} option {argument:?}; use -- before command arguments",
+                            command_name.as_deref().unwrap_or("run")
                         )));
                     } else {
                         run_arguments.push(argument.clone());
@@ -140,7 +142,7 @@ impl Cli {
                         break;
                     }
                 }
-                Some("run") => {
+                Some("run") | Some("exec") => {
                     run_arguments.push(argument.clone());
                     index += 1;
                 }
@@ -187,6 +189,16 @@ impl Cli {
                         ));
                     }
                     CliCommand::Run {
+                        command: run_arguments,
+                    }
+                }
+                Some("exec") => {
+                    if json {
+                        return Err(ParseError::Invalid(
+                            "--json is only valid with plan or doctor".to_owned(),
+                        ));
+                    }
+                    CliCommand::Exec {
                         command: run_arguments,
                     }
                 }
@@ -304,7 +316,7 @@ pub(crate) fn usage(reason: &str) -> String {
         format!("{reason}\n\n")
     };
     format!(
-        "{prefix}usage: container-init [OPTIONS] <run|plan|doctor|version> [ARGS...]\n\n\
+        "{prefix}usage: container-init [OPTIONS] <run|exec|plan|doctor|version> [ARGS...]\n\n\
 options:\n  \
     --profile ID                 select the profile id\n  \
     --profiles-dir PATH          load image profiles from PATH\n  \
@@ -317,6 +329,7 @@ options:\n  \
     -h, --help                   show this help\n\n\
 commands:\n  \
     run [--] [COMMAND...]        execute the plan and hand off\n  \
+    exec [--] [COMMAND...]       transition privileges and hand off without bootstrap\n  \
     plan [--json]                validate and print the side-effect plan\n  \
     doctor [--json]              check the profile and runtime environment\n  \
     version                      print the container-init version"

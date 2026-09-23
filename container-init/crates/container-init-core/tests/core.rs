@@ -441,6 +441,21 @@ fn lock_is_non_blocking_and_handoff_argv_is_structured() {
 }
 
 #[test]
+fn prepare_exec_resolves_identity_and_builds_handoff_without_lock() {
+    let temp = TempDir::new().unwrap();
+    let config = config(temp.path(), vec![]);
+    let (uid, gid) = PosixSystem::new().current_ids();
+    let runner = executor(config);
+    let (identity, command, root_service) = runner
+        .prepare_exec(&["echo".to_owned(), "direct exec".to_owned()])
+        .unwrap();
+    assert_eq!(identity.uid, uid);
+    assert_eq!(identity.gid, gid);
+    assert!(!root_service);
+    assert_eq!(command.argv(), ["/bin/sh", "-c", "echo", "direct exec"]);
+}
+
+#[test]
 fn executor_delegates_privilege_drop_to_the_posix_backend() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
