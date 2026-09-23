@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cli {
@@ -15,6 +16,7 @@ pub struct CliOptions {
     pub default_profile_file: Option<PathBuf>,
     pub workspace: Option<PathBuf>,
     pub lock_path: Option<PathBuf>,
+    pub lock_timeout: Option<Duration>,
     pub receipt_path: Option<PathBuf>,
     pub inputs: Vec<(String, String)>,
 }
@@ -247,6 +249,8 @@ fn parse_common_option(
             | "--workspace"
             | "--cwd"
             | "--lock-path"
+            | "--lock-timeout"
+            | "--lock-timeout-ms"
             | "--receipt-path"
             | "--input"
             | "--set"
@@ -278,6 +282,22 @@ fn parse_common_option(
         }
         "--workspace" | "--cwd" => options.workspace = Some(PathBuf::from(value)),
         "--lock-path" => options.lock_path = Some(PathBuf::from(value)),
+        "--lock-timeout" => {
+            let seconds = value.parse::<u64>().map_err(|_| {
+                ParseError::Invalid(format!(
+                    "option --lock-timeout must be an integer: {value:?}"
+                ))
+            })?;
+            options.lock_timeout = Some(Duration::from_secs(seconds));
+        }
+        "--lock-timeout-ms" => {
+            let ms = value.parse::<u64>().map_err(|_| {
+                ParseError::Invalid(format!(
+                    "option --lock-timeout-ms must be an integer: {value:?}"
+                ))
+            })?;
+            options.lock_timeout = Some(Duration::from_millis(ms));
+        }
         "--receipt-path" => options.receipt_path = Some(PathBuf::from(value)),
         "--input" | "--set" => options.inputs.push(parse_input(&value)?),
         _ => unreachable!("the option table is exhaustive"),

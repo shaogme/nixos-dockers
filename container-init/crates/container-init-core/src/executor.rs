@@ -16,6 +16,7 @@ use container_init_posix::{ActionChange, PosixIdentity, PosixSystem};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Actions can be executed through this alias by callers that do not need to
 /// distinguish the plan-oriented name.
@@ -24,6 +25,7 @@ pub type ActionExecutor = PlanExecutor;
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionOptions {
     pub lock_path: Option<PathBuf>,
+    pub lock_timeout: Option<Duration>,
     pub receipt_path: Option<PathBuf>,
     pub posix: PosixSystem,
     pub ssh: Option<SshCapability>,
@@ -32,6 +34,11 @@ pub struct ExecutionOptions {
 impl ExecutionOptions {
     pub fn with_lock_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.lock_path = Some(path.into());
+        self
+    }
+
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = Some(timeout);
         self
     }
 
@@ -383,7 +390,10 @@ impl PlanExecutor {
         self.options
             .lock_path
             .as_ref()
-            .map(|path| BootstrapLock::acquire(path.clone()))
+            .map(|path| match self.options.lock_timeout {
+                Some(timeout) => BootstrapLock::acquire_with_timeout(path.clone(), timeout),
+                None => BootstrapLock::acquire(path.clone()),
+            })
             .transpose()
     }
 

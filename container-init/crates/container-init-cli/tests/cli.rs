@@ -281,6 +281,53 @@ fn exec_supports_parallel_execution_without_lock_contention() {
 }
 
 #[test]
+fn run_supports_parallel_execution_with_lock_timeout_retry() {
+    let (temp, profiles, workspace, _marker, _handoff) = profile_fixture();
+    let lock = temp.path().join("lock");
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let profiles = profiles.clone();
+        let workspace = workspace.clone();
+        let lock = lock.clone();
+        let out_file = temp.path().join(format!("parallel-run-{i}"));
+        handles.push(std::thread::spawn(move || {
+            let script = format!("printf '{i}\\n' > {}", out_file.display());
+            let output = Command::new(binary())
+                .args(common_args(&profiles, &workspace, &lock))
+                .args(["run", "--"])
+                .arg(script)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "parallel run {i} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read_to_string(&out_file).unwrap(), format!("{i}\n"));
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn run_fails_with_exit_code_70_when_timeout_zero_and_lock_held() {
+    let (temp, profiles, workspace, _marker, _handoff) = profile_fixture();
+    let lock = temp.path().join("lock");
+    let held = container_init_posix::PosixLock::acquire(&lock).unwrap();
+    let output = Command::new(binary())
+        .args(common_args(&profiles, &workspace, &lock))
+        .args(["--lock-timeout", "0", "run", "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("another container-init process owns the lock"));
+    drop(held);
+}
+
+#[test]
 fn run_exports_resolved_identity_environment_before_non_root_handoff() {
     if container_init_core::PosixSystem::new().current_ids().0 != 0 {
         return;

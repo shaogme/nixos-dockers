@@ -65,25 +65,6 @@ wait_for_running() {
     return 1
 }
 
-docker_exec_wait_for_bootstrap() {
-    local output status attempt
-    for attempt in {1..30}; do
-        if output="$(docker exec "$@" 2>&1)"; then
-            printf '%s' "$output"
-            return 0
-        else
-            status=$?
-        fi
-        if [[ "$output" != *"bootstrap lock"* ]]; then
-            printf '%s\n' "$output" >&2
-            return "$status"
-        fi
-        sleep 1
-    done
-    printf '%s\n' "$output" >&2
-    return "$status"
-}
-
 test_loaded_image() {
     local attr="$1"
     local archive="$tmp_dir/${attr//\//_}.tar.gz"
@@ -162,15 +143,15 @@ test_loaded_image() {
         "$attr:latest" /bin/sleep 300 >/dev/null
     wait_for_running "$exec_container"
 
-    exec_output="$(docker_exec_wait_for_bootstrap --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" bash -lc \
+    exec_output="$(docker exec --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" bash -lc \
         'test "$USER" = dev && test "$HOME" = /home/user && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID" && test "$(stat -c %u:%g /home/user)" = "$EXPECTED_UID:$EXPECTED_GID"')"
     [[ -z "$exec_output" ]]
 
-    exec_output="$(docker_exec_wait_for_bootstrap --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" /bin/bash -lc \
+    exec_output="$(docker exec --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" /bin/bash -lc \
         'test "$USER" = dev && test "$HOME" = /home/user && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID" && test "$(stat -c %u:%g /home/user)" = "$EXPECTED_UID:$EXPECTED_GID"')"
     [[ -z "$exec_output" ]]
 
-    root_output="$(docker_exec_wait_for_bootstrap -e RUN_AS_ROOT=1 "$exec_container" bash -lc \
+    root_output="$(docker exec -e RUN_AS_ROOT=1 "$exec_container" bash -lc \
         'test "$USER" = root && test "$HOME" = /home/user && test "$(id -u)" = 0 && test "$(id -g)" = 0 && test "$(stat -c %u:%g /home/user)" = "0:0" && test "$(stat -c %U /home/user)" = root')"
     [[ -z "$root_output" ]]
 

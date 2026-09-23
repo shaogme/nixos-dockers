@@ -79,6 +79,9 @@ fn build_execution_options(
     let lock_path = lock::path(options, loaded.profile(), context.cwd());
     lock::ensure_parent(&lock_path)?;
     let mut execution_options = ExecutionOptions::default().with_lock_path(lock_path);
+    if let Some(timeout) = options.lock_timeout {
+        execution_options = execution_options.with_lock_timeout(timeout);
+    }
     if loaded
         .plan()
         .actions()

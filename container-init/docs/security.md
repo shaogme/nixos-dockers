@@ -135,7 +135,7 @@ SSH private key 不会进入 plan effect 或 receipt。仍应将 host key 目录
 | 67 | 身份错误 | UID/GID/HOME 输入或 POSIX identity 无法解析 |
 | 68 | action 错误 | 文件、账户、SSH 或其他 bootstrap action 执行失败 |
 | 69 | handoff 错误 | runtime exec 失败 |
-| 70 | lock 错误 | lock 被其他 container-init 占用或 lock IO 失败 |
+| 70 | lock 错误 | lock 超时未能获取或 lock IO 失败 |
 
 错误文本通常包括 action id、路径、来源和修复提示；JSON 错误会包含 `class`、`kind`、`action`/`path` 等结构化字段。`doctor` 发现 fail 时使用检查对应的错误分类；只有无法进一步分类时才使用 65。
 

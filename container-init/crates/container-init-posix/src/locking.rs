@@ -5,14 +5,68 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// A non-blocking advisory lock backed by a POSIX file descriptor.
+use std::thread;
+use std::time::{Duration, Instant};
+
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+pub fn default_lock_timeout() -> Duration {
+    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_TIMEOUT_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_TIMEOUT_SECS") {
+        if let Ok(secs) = val.parse::<u64>() {
+            return Duration::from_secs(secs);
+        }
+    }
+    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_TIMEOUT") {
+        if let Ok(secs) = val.parse::<u64>() {
+            return Duration::from_secs(secs);
+        }
+    }
+    DEFAULT_LOCK_TIMEOUT
+}
+
+pub fn default_poll_interval() -> Duration {
+    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_POLL_INTERVAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    DEFAULT_POLL_INTERVAL
+}
+
+/// An advisory lock backed by a POSIX file descriptor with timeout and retry support.
 #[derive(Debug)]
 pub struct PosixLock {
     file: File,
 }
 
 impl PosixLock {
+    /// Acquire an exclusive lock with the default timeout and polling interval.
     pub fn acquire(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::acquire_with_timeout(path, default_lock_timeout())
+    }
+
+    /// Try to acquire an exclusive lock immediately without waiting.
+    pub fn try_acquire(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::acquire_with_retry(path, Duration::ZERO, Duration::ZERO)
+    }
+
+    /// Acquire an exclusive lock with a specific timeout, using the default polling interval.
+    pub fn acquire_with_timeout(path: impl AsRef<Path>, timeout: Duration) -> io::Result<Self> {
+        Self::acquire_with_retry(path, timeout, default_poll_interval())
+    }
+
+    /// Acquire an exclusive lock with a specific timeout and polling interval.
+    pub fn acquire_with_retry(
+        path: impl AsRef<Path>,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -20,11 +74,39 @@ impl PosixLock {
             .truncate(false)
             .mode(0o600)
             .open(path)?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
+
+        let started = Instant::now();
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Self { file });
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                if started.elapsed() >= timeout {
+                    return Err(err);
+                }
+                continue;
+            }
+            if err.raw_os_error() != Some(libc::EWOULDBLOCK)
+                && err.raw_os_error() != Some(libc::EAGAIN)
+            {
+                return Err(err);
+            }
+            if started.elapsed() >= timeout {
+                return Err(err);
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let sleep_duration = if poll_interval.is_zero() {
+                remaining
+            } else {
+                poll_interval.min(remaining)
+            };
+            if sleep_duration.is_zero() {
+                return Err(err);
+            }
+            thread::sleep(sleep_duration);
         }
-        Ok(Self { file })
     }
 
     pub fn file_mut(&mut self) -> &mut File {

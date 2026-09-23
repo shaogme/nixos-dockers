@@ -423,11 +423,11 @@ fn passwd_mapping_shell_update_and_receipt_are_auditable() {
 }
 
 #[test]
-fn lock_is_non_blocking_and_handoff_argv_is_structured() {
+fn lock_supports_timeout_and_retry_and_handoff_argv_is_structured() {
     let temp = TempDir::new().unwrap();
     let lock_path = temp.path().join("bootstrap.lock");
     let lock = container_init_core::BootstrapLock::acquire(&lock_path).unwrap();
-    let second = container_init_core::BootstrapLock::acquire(&lock_path).unwrap_err();
+    let second = container_init_core::BootstrapLock::try_acquire(&lock_path).unwrap_err();
     assert_eq!(second.class(), container_init_core::ErrorClass::Lock);
     drop(lock);
     let _lock = container_init_core::BootstrapLock::acquire(&lock_path).unwrap();
@@ -438,6 +438,28 @@ fn lock_is_non_blocking_and_handoff_argv_is_structured() {
         .build_handoff_command(&["echo".to_owned(), "safe value".to_owned()])
         .unwrap();
     assert_eq!(command.argv(), ["/bin/sh", "-c", "echo", "safe value"]);
+}
+
+#[test]
+fn bootstrap_lock_retries_and_succeeds_when_released() {
+    let temp = TempDir::new().unwrap();
+    let lock_path = temp.path().join("bootstrap-retry.lock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_path = lock_path.clone();
+
+    let handle = std::thread::spawn(move || {
+        let lock = container_init_core::BootstrapLock::acquire(&thread_path).unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(lock);
+    });
+
+    rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    let lock = container_init_core::BootstrapLock::acquire(&lock_path).unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+    drop(lock);
+    handle.join().unwrap();
 }
 
 #[test]

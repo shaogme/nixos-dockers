@@ -25,7 +25,9 @@ impl std::fmt::Display for LockOperation {
     }
 }
 
-/// A non-blocking, process-scoped bootstrap lock.
+use std::time::Duration;
+
+/// A process-scoped bootstrap lock with timeout and retry support.
 ///
 /// The caller chooses the lock location so the CLI can use a runtime directory
 /// or a persistent workspace-specific location according to its policy.
@@ -38,11 +40,39 @@ pub struct BootstrapLock {
 impl BootstrapLock {
     pub fn acquire(path: impl Into<PathBuf>) -> Result<Self, CoreError> {
         let path = path.into();
-        let mut lock = PosixLock::acquire(&path).map_err(|source| CoreError::Lock {
+        let lock = PosixLock::acquire(&path).map_err(|source| CoreError::Lock {
             path: path.clone(),
             operation: LockOperation::Acquire,
             source,
         })?;
+        Self::initialize(path, lock)
+    }
+
+    pub fn try_acquire(path: impl Into<PathBuf>) -> Result<Self, CoreError> {
+        let path = path.into();
+        let lock = PosixLock::try_acquire(&path).map_err(|source| CoreError::Lock {
+            path: path.clone(),
+            operation: LockOperation::Acquire,
+            source,
+        })?;
+        Self::initialize(path, lock)
+    }
+
+    pub fn acquire_with_timeout(
+        path: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Result<Self, CoreError> {
+        let path = path.into();
+        let lock =
+            PosixLock::acquire_with_timeout(&path, timeout).map_err(|source| CoreError::Lock {
+                path: path.clone(),
+                operation: LockOperation::Acquire,
+                source,
+            })?;
+        Self::initialize(path, lock)
+    }
+
+    fn initialize(path: PathBuf, mut lock: PosixLock) -> Result<Self, CoreError> {
         let file = lock.file_mut();
         file.set_len(0).map_err(|source| CoreError::Lock {
             path: path.clone(),

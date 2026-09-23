@@ -10,7 +10,10 @@ mod types;
 
 pub use error::PosixError;
 pub use filesystem::{mode, parse_mode, set_mode};
-pub use locking::{is_writable, PosixLock};
+pub use locking::{
+    default_lock_timeout, default_poll_interval, is_writable, PosixLock, DEFAULT_LOCK_TIMEOUT,
+    DEFAULT_POLL_INTERVAL,
+};
 pub use namespace::{
     bind_mount, mount_cgroup2, parse_mountinfo, unshare_user_and_mount_namespaces, IdMapEntry,
     MountInfoEntry, NamespaceMap,

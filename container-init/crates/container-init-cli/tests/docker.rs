@@ -695,4 +695,31 @@ depends_on = ["resolve"]
         !receipt.exists(),
         "Exec with no drift must not run bootstrap actions or write receipt"
     );
+
+    // 7. Concurrent slow-path exec commands (identity drift to root concurrently)
+    let bin = &binary;
+    let args = common_args;
+    std::thread::scope(|s| {
+        for i in 0..4 {
+            s.spawn(move || {
+                let output = Command::new(bin)
+                    .args(args)
+                    .env("RUN_AS_ROOT", "1")
+                    .args(["exec", "--", "true"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "concurrent slow path {i} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            });
+        }
+    });
+    let meta_root3 = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_root3.uid(), meta_root3.gid()),
+        (0, 0),
+        "Home must be reconciled to root (0:0) after concurrent slow path"
+    );
 }

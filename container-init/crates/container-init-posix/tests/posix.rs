@@ -126,13 +126,48 @@ fn ownership_modes_and_locking_use_real_posix_primitives() {
 
     let lock_path = temp.path().join("bootstrap.lock");
     let lock = PosixLock::acquire(&lock_path).unwrap();
-    let error = PosixLock::acquire(&lock_path).unwrap_err();
+    let error = PosixLock::try_acquire(&lock_path).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     drop(lock);
     let _lock = PosixLock::acquire(&lock_path).unwrap();
 
     assert!(is_writable(temp.path()));
     assert!(is_writable(&temp.path().join("not-created-yet")));
+}
+
+#[test]
+fn posix_lock_retries_and_acquires_after_release() {
+    let temp = TempDir::new().unwrap();
+    let lock_path = temp.path().join("retry.lock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_lock_path = lock_path.clone();
+
+    let handle = std::thread::spawn(move || {
+        let lock = PosixLock::acquire(&thread_lock_path).unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(lock);
+    });
+
+    rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    let lock = PosixLock::acquire(&lock_path).unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+    drop(lock);
+    handle.join().unwrap();
+}
+
+#[test]
+fn posix_lock_times_out_when_held() {
+    let temp = TempDir::new().unwrap();
+    let lock_path = temp.path().join("timeout.lock");
+    let lock = PosixLock::acquire(&lock_path).unwrap();
+    let started = std::time::Instant::now();
+    let error = PosixLock::acquire_with_timeout(&lock_path, std::time::Duration::from_millis(50))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+    drop(lock);
 }
 
 #[test]

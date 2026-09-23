@@ -146,6 +146,8 @@ container-init --version
 | `--workspace PATH` / `--cwd PATH` | runtime workspace |
 | `--input NAME=VALUE` / `--set NAME=VALUE` | 设置一个已声明的 typed bootstrap 输入，可重复 |
 | `--lock-path PATH` | 覆盖 bootstrap lock 路径 |
+| `--lock-timeout SECONDS` | 覆盖 bootstrap lock 等待超时（秒，0 表示非阻塞） |
+| `--lock-timeout-ms MS` | 覆盖 bootstrap lock 等待超时（毫秒） |
 | `--receipt-path PATH` | 写执行 receipt 的路径 |
 | `--json` | 仅 `plan`/`doctor` 支持 |
 | `-h` / `--help` | 打印帮助 |
@@ -176,6 +178,9 @@ CLI 环境变量的发现顺序如下；同一类配置中，命令行选项优�
 | `CONTAINER_INIT_WORKSPACE` | workspace | — |
 | `WORKSPACE` | workspace 的通用回退变量 | 当前目录 |
 | `CONTAINER_INIT_LOCK_PATH` | lock 路径 | 自动计算 |
+| `CONTAINER_INIT_LOCK_TIMEOUT_SECS` / `CONTAINER_INIT_LOCK_TIMEOUT` | lock 等待超时（秒） | 10 |
+| `CONTAINER_INIT_LOCK_TIMEOUT_MS` | lock 等待超时（毫秒） | 10000 |
+| `CONTAINER_INIT_LOCK_POLL_INTERVAL_MS` | lock 重试轮询间隔（毫秒） | 20 |
 
 profile 的 typed input 不是由 container-init 读取全部环境变量，而是仅读取 `bootstrap.inputs` 中声明的名字和 aliases。其他 ambient 环境值只会在条件或路径显式使用 `env.NAME` 时被引用。
 
@@ -262,7 +267,7 @@ CLI 的默认 lock 路径优先级：
 4. root 进程使用 `/run/container-init/bootstrap-<key>.lock`；
 5. 非 root 进程使用 `<workspace>/.container-init/bootstrap-<key>.lock`。
 
-`<key>` 是基于 profile id、canonical workspace、目标用户名、UID 和 GID 的稳定 FNV-1a 风格哈希。CLI 会在执行前创建 lock 父目录。lock 使用 POSIX non-blocking `flock`，同一 key 的并发 run 不会等待，而是以 lock 错误退出；释放进程后下一次 run 可再次获取。
+`<key>` 是基于 profile id、canonical workspace 的稳定 FNV-1a 风格哈希。CLI 会在执行前创建 lock 父目录。lock 使用带超时轮询等待的 POSIX `flock`（默认超时 10 秒，轮询间隔 20ms，可通过 `--lock-timeout`、`CONTAINER_INIT_LOCK_TIMEOUT_SECS` 或 `CONTAINER_INIT_LOCK_TIMEOUT_MS` 配置）。同一 key 的并发 run 会短暂轮询等待前序进程释放 lock，超时后才会以 lock 错误退出；释放进程后下一次 run 可再次获取。
 
 `plan` 和 `doctor` 不获取 lock，因此用于诊断时不会创建运行时目录或 lock 文件。库调用 `PlanExecutor` 时只有在 `ExecutionOptions` 设置 `lock_path` 后才启用 lock；CLI 会自动设置。
 
