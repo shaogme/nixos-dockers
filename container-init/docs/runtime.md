@@ -7,6 +7,7 @@ container-init [OPTIONS] run [--] [COMMAND...]
 container-init [OPTIONS] exec [--] [COMMAND...]
 container-init [OPTIONS] plan [--json]
 container-init [OPTIONS] doctor [--json]
+container-init [OPTIONS] status [--json]
 container-init [OPTIONS] version
 ```
 
@@ -21,12 +22,12 @@ container-init --profile coding-images plan
 container-init --profile coding-images plan --json
 ```
 
-`plan` 读取 profile、解析继承图、完成 schema/trust/model 校验，并输出静态 action plan。它不会：
+`plan` 优先读取运行中 backend 持有的不可变 snapshot；没有 backend 时才离线读取 profile、解析继承图、完成 schema/trust/model 校验。离线结果会标记 `offline`，不会：
 
 - 解析环境变量中的 typed runtime input；
 - 读取或修改 passwd/group；
 - 创建目录、文件或软链接；
-- 获取 bootstrap lock；
+- 启动 backend 或获取实例锁；
 - 检查 runtime 是否真实可执行；
 - 执行 SSH keygen 或 handoff。
 
@@ -89,15 +90,13 @@ container-init --profile coding-images run
 container-init --profile coding-images run -- tool --flag 'value with spaces'
 ```
 
-执行顺序是：
+`run` 是每个容器唯一的 backend 启动入口。执行顺序是：
 
-1. 加载 image/admin profile 目录并选择 profile；
-2. 构建静态 plan；
-3. 根据 workspace 和 runtime input 解析身份；
-4. 计算并获取 bootstrap lock；
-5. 按 plan 执行 action；
-6. 按需写 receipt；
-7. 将 `HOME`、`USER`、`LOGNAME` 设置为目标值，并用 `exec` 替换当前进程为 handoff runtime。
+1. 获取固定 backend 实例 `flock`；已有实例只返回状态，不再加载 profile；
+2. 加载 image/admin profile 目录并选择 profile，构建不可变 snapshot；
+3. 完成启动 reconcile，创建 Unix socket 并启动初始 handoff 子进程；
+4. backend 监督初始子进程，初始子进程退出码成为容器退出码；
+5. 收到终止信号时转发给 handoff，回收子进程并清理 socket。
 
 `run` 会先把当前工作目录切换到 runtime workspace。目标身份解析通过 Linux
 `/proc/self/mountinfo` 确认 workspace 挂载事实后才读取其属主；镜像构建时预创建的
@@ -110,21 +109,24 @@ container-init --profile coding-images run -- tool --flag 'value with spaces'
 
 ```bash
 # 无显式 command，runtime 使用 shell_prefix
-container-init --profile coding-images exec
+container-init exec
 
 # 有显式 command，runtime 使用 exec_prefix
-container-init --profile coding-images exec -- tool --flag 'value with spaces'
+container-init exec -- tool --flag 'value with spaces'
 ```
 
-`exec` 是专用于容器运行时并发调用的无锁权限转交入口（供 `dev-env shim` 或并发 `docker exec` 使用）。它会：
+`exec` 是连接运行中 backend 的并发权限转交入口（供 `dev-env shim` 或并发 `docker exec` 使用）。它会：
 
-1. 加载 profile 并根据 workspace 和 runtime input 解析目标身份；
-2. 将当前工作目录切换到 runtime workspace；
-3. 如果当前进程是 root 且目标不是 root/root service，安全降权（`drop_privileges`）到目标用户；
-4. 将 `HOME`、`USER`、`LOGNAME` 设置为目标值；
-5. 用 `exec` 替换当前进程为 handoff runtime。
+1. 通过 Unix socket 向 backend 请求快照中的 handoff 和身份 reconciliation；
+2. 发送绝对 cwd、显式 runtime input 和 schema 允许的环境值；
+3. 在调用进程的 handoff 子进程中一次性应用 UID/GID/supplementary groups；
+4. 将 `HOME`、`USER`、`LOGNAME` 设置为目标值并执行 handoff runtime。
 
-与 `run` 相比，`exec` **不获取 bootstrap lock**、**不执行任何 bootstrap action**（不修改 `/etc/passwd`/`/etc/group`，不创建文件/目录，不生成 SSH 密钥）、**不写 receipt**。它假定容器此前已通过 `run` 完成初始化，因此各并行命令可以完全无阻塞、零锁冲突并发执行。
+`exec` 不接收 profile、profiles-dir、workspace 或旧 bootstrap lock 参数；它不会重新读取 profile。请求只会执行受限 identity action 集合，启动 filesystem、SSH、cgroup 和 service action 只在 backend 启动时执行。
+
+### `status`
+
+`status` 查询 backend 的状态、profile id、snapshot id、backend PID、初始子进程 PID 和活跃请求数，不显示 runtime input 值。
 
 ### `version`
 
@@ -145,11 +147,10 @@ container-init --version
 | `--default-profile PATH` / `--default-profile-file PATH` | 默认 profile id 文件 |
 | `--workspace PATH` / `--cwd PATH` | runtime workspace |
 | `--input NAME=VALUE` / `--set NAME=VALUE` | 设置一个已声明的 typed bootstrap 输入，可重复 |
-| `--lock-path PATH` | 覆盖 bootstrap lock 路径 |
-| `--lock-timeout SECONDS` | 覆盖 bootstrap lock 等待超时（秒，0 表示非阻塞） |
-| `--lock-timeout-ms MS` | 覆盖 bootstrap lock 等待超时（毫秒） |
+| `--backend-socket PATH` | 覆盖 backend Unix socket 路径 |
+| `--request-timeout-ms MS` | backend 请求/启动连接超时 |
 | `--receipt-path PATH` | 写执行 receipt 的路径 |
-| `--json` | 仅 `plan`/`doctor` 支持 |
+| `--json` | `plan`/`doctor`/`status` 支持 |
 | `-h` / `--help` | 打印帮助 |
 
 通用选项可以位于 command 名之前，也可以位于 `run` 后、最终 command 之前。`run` 的最终 command 推荐放在 `--` 后面；否则第一个非选项参数会被视为 command 的开始，之后参数全部原样转发。
@@ -177,10 +178,8 @@ CLI 环境变量的发现顺序如下；同一类配置中，命令行选项优�
 | `CONTAINER_INIT_DEFAULT_PROFILE_FILE` | 默认 profile 文件的兼容名称 | — |
 | `CONTAINER_INIT_WORKSPACE` | workspace | — |
 | `WORKSPACE` | workspace 的通用回退变量 | 当前目录 |
-| `CONTAINER_INIT_LOCK_PATH` | lock 路径 | 自动计算 |
-| `CONTAINER_INIT_LOCK_TIMEOUT_SECS` / `CONTAINER_INIT_LOCK_TIMEOUT` | lock 等待超时（秒） | 10 |
-| `CONTAINER_INIT_LOCK_TIMEOUT_MS` | lock 等待超时（毫秒） | 10000 |
-| `CONTAINER_INIT_LOCK_POLL_INTERVAL_MS` | lock 重试轮询间隔（毫秒） | 20 |
+| `CONTAINER_INIT_BACKEND_SOCKET` | backend Unix socket | root: `/run/container-init/backend.sock` |
+| `CONTAINER_INIT_BACKEND_TIMEOUT_MS` | backend 请求/启动连接超时 | 5000 |
 
 profile 的 typed input 不是由 container-init 读取全部环境变量，而是仅读取 `bootstrap.inputs` 中声明的名字和 aliases。其他 ambient 环境值只会在条件或路径显式使用 `env.NAME` 时被引用。
 
@@ -257,19 +256,11 @@ profile 的 typed input 不是由 container-init 读取全部环境变量，而�
 
 条件为假会记录 `skipped_condition`，同样不满足依赖成功条件。
 
-## 6. Lock
+## 6. Backend 生命周期和锁
 
-CLI 的默认 lock 路径优先级：
+backend 在 socket 同目录持有固定实例 `flock`。锁只防止同一容器启动第二个 backend，不参与 action 调度；action 使用按账户、路径、cgroup 和 namespace 推导的资源锁。backend 退出时内核释放 `flock`，下次 `run` 才能清理经过 `lstat` 类型校验的陈旧 socket。
 
-1. `--lock-path`；
-2. `CONTAINER_INIT_LOCK_PATH`；
-3. `XDG_RUNTIME_DIR/container-init/bootstrap-<key>.lock`；
-4. root 进程使用 `/run/container-init/bootstrap-<key>.lock`；
-5. 非 root 进程使用 `<workspace>/.container-init/bootstrap-<key>.lock`。
-
-`<key>` 是基于 profile id、canonical workspace 的稳定 FNV-1a 风格哈希。CLI 会在执行前创建 lock 父目录。lock 使用带超时轮询等待的 POSIX `flock`（默认超时 10 秒，轮询间隔 20ms，可通过 `--lock-timeout`、`CONTAINER_INIT_LOCK_TIMEOUT_SECS` 或 `CONTAINER_INIT_LOCK_TIMEOUT_MS` 配置）。同一 key 的并发 run 会短暂轮询等待前序进程释放 lock，超时后才会以 lock 错误退出；释放进程后下一次 run 可再次获取。
-
-`plan` 和 `doctor` 不获取 lock，因此用于诊断时不会创建运行时目录或 lock 文件。库调用 `PlanExecutor` 时只有在 `ExecutionOptions` 设置 `lock_path` 后才启用 lock；CLI 会自动设置。
+socket 父目录拒绝 symlink 和不安全权限；Linux 使用 `SO_PEERCRED` 检查 peer。backend 不接收 profile 文本、action 描述或任意 spawn 命令，错误请求不会执行 bootstrap action。
 
 ## 7. Receipt
 

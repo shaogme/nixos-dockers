@@ -12,6 +12,7 @@ pub enum CliError {
     Loader(LoaderError),
     Model(ModelError),
     Configuration(String),
+    Backend(String),
     Core(CoreError),
     Io {
         operation: String,
@@ -36,6 +37,7 @@ impl CliError {
                 _ => 65,
             },
             Self::Model(_) | Self::Configuration(_) | Self::Output(_) => 65,
+            Self::Backend(_) => 69,
             Self::DoctorFailed { source, .. } => {
                 source.as_deref().map(CoreError::exit_code).unwrap_or(65)
             }
@@ -63,6 +65,7 @@ impl fmt::Display for CliError {
             Self::Arguments(message) => write!(formatter, "{message}"),
             Self::Loader(error) => error.fmt(formatter),
             Self::Configuration(message) => write!(formatter, "configuration error: {message}"),
+            Self::Backend(message) => write!(formatter, "backend error: {message}"),
             Self::Core(error) => error.fmt(formatter),
             Self::Io {
                 operation,
@@ -103,7 +106,7 @@ impl Error for CliError {
             Self::DoctorFailed { source, .. } => source
                 .as_deref()
                 .map(|error| error as &(dyn Error + 'static)),
-            Self::Arguments(_) | Self::Configuration(_) => None,
+            Self::Arguments(_) | Self::Configuration(_) | Self::Backend(_) => None,
         }
     }
 }

@@ -423,43 +423,14 @@ fn passwd_mapping_shell_update_and_receipt_are_auditable() {
 }
 
 #[test]
-fn lock_supports_timeout_and_retry_and_handoff_argv_is_structured() {
+fn handoff_argv_is_structured() {
     let temp = TempDir::new().unwrap();
-    let lock_path = temp.path().join("bootstrap.lock");
-    let lock = container_init_core::BootstrapLock::acquire(&lock_path).unwrap();
-    let second = container_init_core::BootstrapLock::try_acquire(&lock_path).unwrap_err();
-    assert_eq!(second.class(), container_init_core::ErrorClass::Lock);
-    drop(lock);
-    let _lock = container_init_core::BootstrapLock::acquire(&lock_path).unwrap();
-
     let config = config(temp.path(), vec![]);
     let runner = executor(config);
     let command = runner
         .build_handoff_command(&["echo".to_owned(), "safe value".to_owned()])
         .unwrap();
     assert_eq!(command.argv(), ["/bin/sh", "-c", "echo", "safe value"]);
-}
-
-#[test]
-fn bootstrap_lock_retries_and_succeeds_when_released() {
-    let temp = TempDir::new().unwrap();
-    let lock_path = temp.path().join("bootstrap-retry.lock");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let thread_path = lock_path.clone();
-
-    let handle = std::thread::spawn(move || {
-        let lock = container_init_core::BootstrapLock::acquire(&thread_path).unwrap();
-        tx.send(()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        drop(lock);
-    });
-
-    rx.recv().unwrap();
-    let started = std::time::Instant::now();
-    let lock = container_init_core::BootstrapLock::acquire(&lock_path).unwrap();
-    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
-    drop(lock);
-    handle.join().unwrap();
 }
 
 #[test]
@@ -727,6 +698,40 @@ fn cgroup_v2_init_delegates_controllers_and_moves_processes() {
     // Idempotency: execute again
     let report2 = executor(config).execute_plan(&plan).unwrap();
     assert!(report2.succeeded());
+}
+
+#[test]
+fn cgroup_v2_init_can_preserve_the_supervisor_process() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let cgroup_dir = temp.path().join("cgroup");
+    fs::create_dir_all(&cgroup_dir).unwrap();
+    fs::write(cgroup_dir.join("cgroup.controllers"), "cpu\n").unwrap();
+    fs::write(
+        cgroup_dir.join("cgroup.procs"),
+        format!("{}\n1001\n", std::process::id()),
+    )
+    .unwrap();
+    fs::write(cgroup_dir.join("cgroup.subtree_control"), "cpu ").unwrap();
+
+    let mut action = root_action("cg", ActionKind::CgroupV2Init);
+    action.path = Some(cgroup_dir.display().to_string());
+    action.controllers = Some(vec!["cpu".to_owned()]);
+    let config = config(temp.path(), vec![action]);
+    let plan = config.build_plan().unwrap();
+    executor(config)
+        .with_options(ExecutionOptions::default().preserve_current_process_in_cgroup())
+        .execute_plan(&plan)
+        .unwrap();
+
+    let subgroup = fs::read_to_string(cgroup_dir.join("init/cgroup.procs")).unwrap();
+    assert!(subgroup.lines().any(|pid| pid == "1001"));
+    assert!(!subgroup
+        .lines()
+        .any(|pid| pid == std::process::id().to_string()));
 }
 
 #[test]

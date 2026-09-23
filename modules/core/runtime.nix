@@ -166,7 +166,7 @@ let
     kind = "filesystem.ensure_dir"
     path = "/run/dev-env/locks"
     mode = "1777"
-    owner = "identity.target"
+    owner = "root"
     run_as = "root"
 
     [[bootstrap.actions]]

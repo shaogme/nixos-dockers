@@ -1,6 +1,6 @@
 # 开发与测试
 
-`container-init` 是 Rust 2021 workspace，最低声明 Rust 版本为 1.74。当前 workspace 包含五个 crate：
+`container-init` 是 Rust 2021 workspace，最低声明 Rust 版本为 1.74。当前 workspace 包含六个 crate：
 
 ```text
 container-init/
@@ -10,6 +10,7 @@ container-init/
     ├── bootstrap-loader/
     ├── container-init-posix/
     ├── container-init-core/
+    ├── container-init-backend/
     └── container-init-cli/
 ```
 
@@ -18,7 +19,7 @@ container-init/
 ```text
 bootstrap-model  ←  bootstrap-loader
        ↑                 ↑
-container-init-posix ← container-init-core ← container-init-cli
+container-init-posix ← container-init-core ← container-init-backend ← container-init-cli
 ```
 
 更具体地说：
@@ -26,8 +27,9 @@ container-init-posix ← container-init-core ← container-init-cli
 - `bootstrap-model` 只包含 serde 数据模型、验证、受限条件 AST、路径模板和静态 plan；不读取文件系统、不访问进程、不依赖 POSIX；
 - `bootstrap-loader` 负责 TOML 和 profile graph，直到得到已验证的 `BootstrapConfig` 为止；不执行 action；
 - `container-init-posix` 封装 passwd/group、UID/GID、文件 owner/mode 和 `flock` 等 POSIX 原语；
-- `container-init-core` 执行 plan，处理 identity、condition、filesystem、SSH、lock、receipt 和 handoff；
-- `container-init-cli` 负责参数解析、配置路径发现和三个运行命令；二进制名称是 `container-init`。
+- `container-init-core` 执行 plan，处理 identity、condition、filesystem、SSH、资源锁、receipt 和 handoff；
+- `container-init-backend` 持有单实例 snapshot，提供版本化 Unix socket RPC 和 PID 1 supervisor；
+- `container-init-cli` 负责参数解析、配置路径发现和 backend 启动/客户端命令；二进制名称是 `container-init`。
 
 保持这个方向很重要：bootstrap 不应反向依赖 dev-env provider、shellenv、mise、Devbox 或镜像特化逻辑。
 
@@ -48,6 +50,7 @@ cargo test --locked -p bootstrap-model
 cargo test --locked -p bootstrap-loader
 cargo test --locked -p container-init-posix
 cargo test --locked -p container-init-core
+cargo test --locked -p container-init-backend
 cargo test --locked -p container-init-cli
 ```
 
@@ -72,7 +75,8 @@ POSIX、core 和 CLI 各有一个 root Linux 容器 fixture：
 对应的 Dockerfile 会构建并运行：
 
 - `container-init-posix`：真实容器中的 root account、权限、owner 和降权；
-- `container-init-core`：真实 POSIX action、SSH fixture、lock 和 privilege boundary；
+- `container-init-core`：真实 POSIX action、SSH fixture、资源锁和 privilege boundary；
+- `container-init-backend`：真实 Unix socket ACL、singleton flock、RPC 和 supervisor；
 - `container-init-cli`：profile 目录读取、plan/doctor/run、runtime handoff 和 SSH capability。
 
 这几项测试要求 Docker 可用，且 fixture 默认以 root 运行。镜像名可以通过各脚本使用的环境变量覆盖：
@@ -103,7 +107,7 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 - passwd/group 原子映射和 login shell 更新；
 - root 到 target 的降权；
 - 条件跳过、失败策略和依赖跳过；
-- lock 非阻塞获取与 handoff argv；
+- 资源锁冲突、FIFO、公平批量获取与 handoff argv；
 - receipt 原子写入和 content 隐藏；
 - SSH host key 生成、重入、半成品拒绝、symlink 拒绝和 authorized keys 冲突。
 
@@ -133,7 +137,7 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 文档内容以源码行为为准，提交前可执行：
 
 ```bash
-rg -n 'kind =|\[bootstrap|CONTAINER_INIT_|--(profile|workspace|input|lock-path)' \
+rg -n 'kind =|\[bootstrap|CONTAINER_INIT_|--(profile|workspace|input|backend-socket)' \
   README.md docs crates
 
 git diff --check

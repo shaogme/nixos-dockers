@@ -17,7 +17,6 @@ pub enum ErrorClass {
     Identity,
     Action,
     Handoff,
-    Lock,
 }
 
 impl ErrorClass {
@@ -29,7 +28,6 @@ impl ErrorClass {
             Self::Identity => 67,
             Self::Action => 68,
             Self::Handoff => 69,
-            Self::Lock => 70,
         }
     }
 }
@@ -58,11 +56,6 @@ pub enum CoreError {
         path: Option<PathBuf>,
         source: io::Error,
     },
-    Lock {
-        path: PathBuf,
-        operation: LockOperation,
-        source: io::Error,
-    },
     Serialization {
         operation: String,
         source: serde_json::Error,
@@ -86,7 +79,6 @@ impl CoreError {
             Self::Identity { .. } => ErrorClass::Identity,
             Self::Permission { .. } => ErrorClass::Trust,
             Self::Action { .. } | Self::Io { .. } => ErrorClass::Action,
-            Self::Lock { .. } => ErrorClass::Lock,
             Self::Serialization { .. } => ErrorClass::Action,
             Self::Handoff { .. } => ErrorClass::Handoff,
             Self::Annotated { source, .. } => source.class(),
@@ -168,27 +160,6 @@ impl fmt::Display for CoreError {
                     None => write!(formatter, "{action} failed: {source}"),
                 }
             }
-            Self::Lock {
-                path,
-                operation,
-                source,
-            } => {
-                if *operation == LockOperation::Acquire
-                    && source.kind() == io::ErrorKind::WouldBlock
-                {
-                    write!(
-                        formatter,
-                        "bootstrap lock at {} failed: another container-init process owns the lock",
-                        path.display()
-                    )
-                } else {
-                    write!(
-                        formatter,
-                        "bootstrap lock at {} failed during {operation}: {source}",
-                        path.display()
-                    )
-                }
-            }
             Self::Serialization { operation, source } => {
                 write!(formatter, "could not {operation}: {source}")
             }
@@ -220,7 +191,6 @@ impl Error for CoreError {
         match self {
             Self::Model(error) => Some(error),
             Self::Io { source, .. } | Self::Handoff { source, .. } => Some(source),
-            Self::Lock { source, .. } => Some(source),
             Self::Serialization { source, .. } => Some(source),
             Self::Annotated { source, .. } => Some(source),
             _ => None,
@@ -275,17 +245,6 @@ impl Serialize for CoreError {
                 value.serialize_field("io_kind", &format_args!("{:?}", source.kind()))?;
                 value.serialize_field("raw_os_error", &source.raw_os_error())?;
             }
-            Self::Lock {
-                path,
-                operation,
-                source,
-            } => {
-                value.serialize_field("kind", "lock")?;
-                value.serialize_field("path", path)?;
-                value.serialize_field("operation", operation)?;
-                value.serialize_field("io_kind", &format_args!("{:?}", source.kind()))?;
-                value.serialize_field("raw_os_error", &source.raw_os_error())?;
-            }
             Self::Serialization { operation, source } => {
                 value.serialize_field("kind", "serialization")?;
                 value.serialize_field("operation", operation)?;
@@ -317,5 +276,3 @@ impl Serialize for CoreError {
         value.end()
     }
 }
-
-use crate::lock::LockOperation;

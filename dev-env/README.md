@@ -149,14 +149,17 @@ cargo clippy --workspace --all-targets --locked
 
 ## 入口一致性
 
-容器的默认 `Entrypoint` 是 `/usr/bin/container-init run --`。`container-init` 在 handoff 前完成 UID/GID namespace 解析、账户和降权，并把规范化的进程身份交给 `dev-env`；环境 provider 不在 `container-init` 中执行。
+容器的默认 `Entrypoint` 是 `/usr/bin/container-init run --`。`container-init` backend 在
+启动时加载一次 profile snapshot，完成 UID/GID namespace 解析、账户和目录 reconcile；
+后续 `dev-env` shim 通过 `container-init exec` 请求同一 snapshot，环境 provider 不在
+`container-init` 中执行。
 
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |
 | Docker 默认命令 | `container-init` → `dev-env exec/shell` | 当前用户、cwd、profile、provider |
 | `docker exec` 非 shell 命令 | `dev-env exec -- <command>` | 重新解析当前会话 |
 | `docker exec` 交互 shell | `dev-env shell` | 重新解析当前会话 |
-| root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | Bootstrap 身份、再物化并转发原始 argv |
+| root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | backend Bootstrap 身份、再物化并转发原始 argv |
 | 非 root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | 直接物化并转发原始 argv |
 | 显式 root | `RUN_AS_ROOT=1 ... bash` | 保留 root，仍物化环境 |
 | SSH 登录 | `/usr/bin/dev-env-login-shell` | 重新解析 SSH 用户的环境 |

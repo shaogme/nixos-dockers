@@ -15,8 +15,10 @@ bootstrap-loader = { path = "../bootstrap-loader" }
 bootstrap-model = { path = "../bootstrap-model" }
 container-init-core = { path = "../container-init-core" }
 container-init-posix = { path = "../container-init-posix" }
+container-init-backend = { path = "../container-init-backend" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = { version = "3", default-features = false }

@@ -8,16 +8,18 @@ use container_init_posix::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn init_v2(
     action: &Action,
     identity: &ResolvedIdentity,
     values: &BTreeMap<String, String>,
     posix_system: &PosixSystem,
+    preserve_pid: Option<u32>,
 ) -> Result<ActionChange, CoreError> {
     let action_id = action.id.as_str();
     let mount_mode = action.cgroup_mount_mode();
+    let preserved_pid = preserve_pid.map(|pid| pid.to_string());
 
     let target_root = match &action.path {
         Some(path_template) => filesystem::render_path(action_id, "path", path_template, values)?,
@@ -32,6 +34,15 @@ pub(crate) fn init_v2(
         // If the shadow path doesn't already have cgroup.controllers, attempt to mount cgroup2
         if !shadow_root.join("cgroup.controllers").exists() {
             if let Err(initial_mount_err) = mount_cgroup2(&shadow_root) {
+                if preserve_pid.is_some() {
+                    return Err(CoreError::action(
+                        action_id,
+                        Some(shadow_root),
+                        format!(
+                            "backend cannot perform cgroup mount fallback in its own namespace: {initial_mount_err}"
+                        ),
+                    ));
+                }
                 if !identity.run_as_root && identity.uid != 0 {
                     // In an unprivileged container where target is non-root, entering a single-user
                     // namespace would prevent subsequent drop_privileges to target UID.
@@ -114,6 +125,9 @@ pub(crate) fn init_v2(
                     if pid.is_empty() {
                         continue;
                     }
+                    if preserved_pid.as_deref() == Some(pid) {
+                        continue;
+                    }
                     let write_res = OpenOptions::new()
                         .append(true)
                         .open(&subgroup_procs_file)
@@ -160,6 +174,26 @@ pub(crate) fn init_v2(
         BTreeSet::new()
     };
 
+    // cgroup v2 refuses enabling a controller while the parent cgroup still
+    // contains processes. The backend supervisor must remain outside the
+    // delegated subgroup, so move it only for this short kernel operation and
+    // restore it before any later action or handoff runs.
+    let preserved_process = preserve_pid
+        .filter(|pid| {
+            !is_bind_mount
+                && target_controllers
+                    .iter()
+                    .any(|controller| !currently_enabled.contains(controller))
+                && fs::read_to_string(&root_procs_file)
+                    .ok()
+                    .is_some_and(|procs| procs.lines().any(|line| line.trim() == pid.to_string()))
+        })
+        .map(|pid| PreservedProcess::enter(&root_procs_file, &subgroup_procs_file, pid.to_string()))
+        .transpose()
+        .map_err(|source| {
+            CoreError::io(Some(action_id), Some(subgroup_procs_file.clone()), source)
+        })?;
+
     let mut enabled_controllers = Vec::new();
     for controller in &target_controllers {
         if !currently_enabled.contains(controller) {
@@ -172,10 +206,24 @@ pub(crate) fn init_v2(
             // If EBUSY, drain any newly spawned processes in root cgroup.procs and retry
             if let Err(ref err) = write_result {
                 if err.raw_os_error() == Some(16) {
+                    if preserve_pid.is_some() && is_bind_mount {
+                        // A freshly mounted shadow hierarchy may not contain
+                        // the backend process, so moving it there would fail
+                        // with EINVAL. Reporting success here would claim that
+                        // delegation happened when the controller is still
+                        // disabled; backend startup must fail closed instead.
+                        return Err(CoreError::action(
+                            action_id,
+                            Some(subtree_control_file.clone()),
+                            format!(
+                                "cannot enable cgroup controller {controller:?} while preserving the backend supervisor in bind-mount mode"
+                            ),
+                        ));
+                    }
                     if let Ok(procs_content) = fs::read_to_string(&root_procs_file) {
                         for line in procs_content.lines() {
                             let pid = line.trim();
-                            if !pid.is_empty() {
+                            if !pid.is_empty() && preserved_pid.as_deref() != Some(pid) {
                                 let _ = OpenOptions::new()
                                     .append(true)
                                     .open(&subgroup_procs_file)
@@ -200,6 +248,7 @@ pub(crate) fn init_v2(
             enabled_controllers.push(controller.clone());
         }
     }
+    drop(preserved_process);
 
     // 4. If an owner is specified, reconcile ownership of the subgroup directory
     if let Some(owner) = &action.owner {
@@ -253,4 +302,32 @@ pub(crate) fn init_v2(
     };
 
     Ok(ActionChange::new(message))
+}
+
+struct PreservedProcess {
+    root_procs: PathBuf,
+    pid: String,
+}
+
+impl PreservedProcess {
+    fn enter(root_procs: &Path, subgroup_procs: &Path, pid: String) -> std::io::Result<Self> {
+        append_pid(subgroup_procs, &pid)?;
+        Ok(Self {
+            root_procs: root_procs.to_path_buf(),
+            pid,
+        })
+    }
+}
+
+impl Drop for PreservedProcess {
+    fn drop(&mut self) {
+        let _ = append_pid(&self.root_procs, &self.pid);
+    }
+}
+
+fn append_pid(path: &Path, pid: &str) -> std::io::Result<()> {
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{pid}"))
 }

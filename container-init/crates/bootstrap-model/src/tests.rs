@@ -166,6 +166,44 @@ fn condition_parser_only_accepts_restricted_forms() {
 }
 
 #[test]
+fn startup_actions_reject_runtime_inputs_identity_and_environment() {
+    let mut input_action = action("input-path", ActionKind::FilesystemEnsureDir);
+    input_action.path = Some("${input.CONTAINER_HOME}/cache".to_owned());
+    input_action.run_as = RunAs::Root;
+    let error = config(vec![input_action]).validate().unwrap_err();
+    assert!(matches!(
+        error,
+        ModelError::Invalid { ref location, ref message }
+            if location == "bootstrap.actions.input-path.path"
+                && message.contains("runtime input CONTAINER_HOME")
+    ));
+
+    let mut identity_action = action("identity-owner", ActionKind::FilesystemEnsureDir);
+    identity_action.path = Some("/run/example".to_owned());
+    identity_action.owner = Some("identity.target".to_owned());
+    identity_action.run_as = RunAs::Root;
+    let error = config(vec![identity_action]).validate().unwrap_err();
+    assert!(matches!(
+        error,
+        ModelError::Invalid { ref location, ref message }
+            if location == "bootstrap.actions.identity-owner.owner"
+                && message.contains("request identity")
+    ));
+
+    let mut environment_action = action("environment-condition", ActionKind::FilesystemEnsureDir);
+    environment_action.path = Some("/run/example".to_owned());
+    environment_action.when = Some("env.ENABLE == '1'".to_owned());
+    environment_action.run_as = RunAs::Root;
+    let error = config(vec![environment_action]).validate().unwrap_err();
+    assert!(matches!(
+        error,
+        ModelError::Invalid { ref location, ref message }
+            if location == "bootstrap.actions.environment-condition.when"
+                && message.contains("runtime environment env.ENABLE")
+    ));
+}
+
+#[test]
 fn plan_adds_identity_dependency_and_orders_phases_deterministically() {
     let mut identity = action("identity", ActionKind::IdentityResolve);
     identity.run_as = RunAs::Root;
@@ -173,12 +211,17 @@ fn plan_adds_identity_dependency_and_orders_phases_deterministically() {
     link.link = Some("${identity.home}/.config/app".to_owned());
     link.target = Some("/data/app".to_owned());
     link.run_as = RunAs::Target;
+    link.origin = Origin::workspace("workspace");
     let mut workspace = action("workspace", ActionKind::FilesystemEnsureDir);
     workspace.path = Some("/workspace".to_owned());
     workspace.run_as = RunAs::Root;
-    let plan = config(vec![link, workspace, identity])
-        .build_plan()
-        .unwrap();
+    let mut bootstrap = config(vec![link, workspace, identity]);
+    bootstrap.allow_workspace_overlay = true;
+    bootstrap
+        .policy
+        .workspace_safe_action_kinds
+        .insert(ActionKind::FilesystemEnsureSymlink);
+    let plan = bootstrap.build_plan().unwrap();
     assert_eq!(
         plan.ids().collect::<Vec<_>>(),
         vec!["identity", "workspace", "link"]
@@ -284,7 +327,7 @@ fn ssh_prepare_is_a_root_capability_with_identity_dependency_and_safe_fields() {
     let mut ssh = action("ssh", ActionKind::ServiceSshPrepare);
     ssh.run_as = RunAs::Root;
     ssh.host_key_dir = Some("/etc/ssh".to_owned());
-    ssh.authorized_keys_dir = Some("${identity.home}/.ssh".to_owned());
+    ssh.authorized_keys_dir = Some("/home/user/.ssh".to_owned());
     ssh.runtime_dir = Some("/run/sshd".to_owned());
     ssh.host_key_types = Some(vec!["ed25519".to_owned()]);
     ssh.content = Some("ssh-ed25519 AAAAfixture\n".to_owned());
@@ -299,7 +342,7 @@ fn ssh_prepare_is_a_root_capability_with_identity_dependency_and_safe_fields() {
         plan.actions()[1].effect,
         PlanEffect::ServiceSshPrepare {
             host_key_dir: "/etc/ssh".to_owned(),
-            authorized_keys_dir: "${identity.home}/.ssh".to_owned(),
+            authorized_keys_dir: "/home/user/.ssh".to_owned(),
             runtime_dir: "/run/sshd".to_owned(),
             host_key_types: vec!["ed25519".to_owned()],
             authorized_keys: true,

@@ -315,7 +315,7 @@ run_as = "root"
 depends_on = ["map-user"]
 ```
 
-`identity.map_user` 会保留既有 passwd 内容，reconcile 目标用户的 UID/GID/HOME；目标用户不存在时追加基本条目，默认 shell 为 `/bin/sh`。目标 GID 已存在时，会把目标用户幂等加入所有匹配 group entry；不存在时追加空成员字段的合法 group entry。passwd/group 会先同时校验，再在 bootstrap lock 内分别原子替换。
+`identity.map_user` 会保留既有 passwd 内容，reconcile 目标用户的 UID/GID/HOME；目标用户不存在时追加基本条目，默认 shell 为 `/bin/sh`。目标 GID 已存在时，会把目标用户幂等加入所有匹配 group entry；不存在时追加空成员字段的合法 group entry。passwd/group 会先同时校验，再在账户资源锁内分别原子替换。
 
 ### 6.3 SSH action
 

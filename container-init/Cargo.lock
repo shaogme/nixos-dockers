@@ -26,13 +26,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "container-init-backend"
+version = "0.1.0"
+dependencies = [
+ "bootstrap-model",
+ "container-init-core",
+ "container-init-posix",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "container-init-cli"
 version = "0.1.0"
 dependencies = [
  "bootstrap-loader",
  "bootstrap-model",
+ "container-init-backend",
  "container-init-core",
  "container-init-posix",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -44,6 +59,7 @@ version = "0.1.0"
 dependencies = [
  "bootstrap-model",
  "container-init-posix",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

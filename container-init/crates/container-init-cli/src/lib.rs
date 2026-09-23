@@ -3,7 +3,6 @@ mod args;
 mod config;
 mod doctor;
 mod error;
-mod lock;
 mod output;
 
 pub use application::run;

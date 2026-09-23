@@ -2,13 +2,13 @@ use crate::context::RuntimeContext;
 use crate::error::CoreError;
 use bootstrap_model::{BootstrapConfig, BootstrapInput, InputNamespace, InputValue, ParsedInput};
 use container_init_posix::{PosixSystem, WorkspaceObservation};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const DEFAULT_CONTAINER_HOME: &str = "/home/user";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentitySource {
     RunAsRoot,
@@ -19,7 +19,7 @@ pub enum IdentitySource {
     Current,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceStatus {
     Mounted,
@@ -37,7 +37,7 @@ impl WorkspaceStatus {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResolvedIdentity {
     pub uid: u32,
     pub gid: u32,
@@ -134,6 +134,14 @@ impl IdentityResolver {
         context: &RuntimeContext,
     ) -> Result<ResolvedIdentity, CoreError> {
         config.validate().map_err(CoreError::Model)?;
+        self.resolve_prevalidated(config, context)
+    }
+
+    pub fn resolve_prevalidated(
+        &self,
+        config: &BootstrapConfig,
+        context: &RuntimeContext,
+    ) -> Result<ResolvedIdentity, CoreError> {
         let inputs = self.resolve_inputs(config, context)?;
         let run_as_root = input_bool(
             config,

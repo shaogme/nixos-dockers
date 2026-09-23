@@ -100,7 +100,7 @@ container-init --profile example plan --json
 # 检查 workspace、身份、runtime 和 SSH capability，不执行 action
 container-init --profile example doctor
 
-# 执行引导，然后把当前进程替换为 runtime
+# 启动 backend、执行引导，然后监督初始 runtime
 container-init --profile example run -- 'printf "ready\n"'
 ```
 
@@ -122,7 +122,7 @@ Docker daemon 不会为已运行容器重新执行 Entrypoint，因此它不会�
 ```text
 dev-env Bash shim
   → container-init run -- /usr/local/libexec/dev-env/real/bash <原始 argv>
-  → identity.resolve / map_user / ensure_home / drop_privileges
+  → backend snapshot / startup reconcile
   → dev-env exec -- /usr/local/libexec/dev-env/real/bash <原始 argv>
 ```
 
@@ -208,13 +208,11 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
     ↓
 解析输入和目标身份
     ↓
-获取非阻塞 bootstrap lock
+获取 backend 实例 flock
     ↓
-按静态 plan 执行 action
+按静态 plan 执行启动 action
     ↓
-写入可选 receipt
-    ↓
-设置 HOME/USER/LOGNAME，并 exec handoff runtime
+发布 Unix socket 并监督 handoff child
 ```
 
 计划由 `bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。`plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统。
@@ -233,7 +231,7 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 - 可选 `cgroup.v2_init`，自动化 cgroup v2 根进程子组迁移与控制器（`cpu`、`io`、`memory`、`pids`）委托，支持默认就地模式与只读环境下的挂载覆挂重定向（bind-mount shadowing），供嵌套容器引擎使用；
 - `plan --json`、`doctor --json`、结构化错误、非阻塞锁和原子 receipt；
 - Linux mountinfo workspace 挂载证据、UID/GID namespace 映射和 group 成员 reconcile；
-- 独立的 `bootstrap-model`、`bootstrap-loader`、`container-init-core`、`container-init-posix` 和 `container-init-cli` crate。
+- 独立的 `bootstrap-model`、`bootstrap-loader`、`container-init-core`、`container-init-posix`、`container-init-backend` 和 `container-init-cli` crate。
 
 当前 CLI/源码没有实现或不负责：
 
@@ -251,8 +249,9 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 | 模型与计划 | [`crates/bootstrap-model`](crates/bootstrap-model) | DSL 类型、字段校验、条件 AST、路径模板、依赖图和静态计划 |
 | 加载与合并 | [`crates/bootstrap-loader`](crates/bootstrap-loader) | TOML 解析、action kind 归一化、继承、来源和信任、冲突处理 |
 | POSIX 边界 | [`crates/container-init-posix`](crates/container-init-posix) | passwd/group、UID/GID、`chown`、权限、`flock` 等系统原语 |
-| 执行核心 | [`crates/container-init-core`](crates/container-init-core) | 身份解析、条件求值、文件 action、SSH capability、receipt 和 handoff |
-| CLI | [`crates/container-init-cli`](crates/container-init-cli) | 参数解析、profile 路径发现、lock 路径、`run/plan/doctor/version` |
+| 执行核心 | [`crates/container-init-core`](crates/container-init-core) | 身份解析、条件求值、文件 action、SSH capability、资源锁、receipt 和 handoff |
+| Backend | [`crates/container-init-backend`](crates/container-init-backend) | 单实例 snapshot、Unix socket RPC、实例 flock 和 PID 1 supervisor |
+| CLI | [`crates/container-init-cli`](crates/container-init-cli) | 参数解析、profile 路径发现、backend `run/exec/plan/doctor/status/version` |
 
 几个关键入口：
 

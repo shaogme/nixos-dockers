@@ -15,9 +15,9 @@ pub struct CliOptions {
     pub admin_profiles_dir: Option<PathBuf>,
     pub default_profile_file: Option<PathBuf>,
     pub workspace: Option<PathBuf>,
-    pub lock_path: Option<PathBuf>,
-    pub lock_timeout: Option<Duration>,
     pub receipt_path: Option<PathBuf>,
+    pub backend_socket: Option<PathBuf>,
+    pub request_timeout: Option<Duration>,
     pub inputs: Vec<(String, String)>,
 }
 
@@ -27,6 +27,7 @@ pub enum CliCommand {
     Exec { command: Vec<String> },
     Plan { json: bool },
     Doctor { json: bool },
+    Status { json: bool },
     Version,
     Help,
 }
@@ -130,7 +131,7 @@ impl Cli {
                         // The option parser advances index past its value.
                     } else if argument == "--json" {
                         return Err(ParseError::Invalid(
-                            "--json is only valid with plan or doctor".to_owned(),
+                            "--json is only valid with plan, doctor, or status".to_owned(),
                         ));
                     } else if argument.starts_with('-') {
                         return Err(ParseError::Invalid(format!(
@@ -148,7 +149,7 @@ impl Cli {
                     run_arguments.push(argument.clone());
                     index += 1;
                 }
-                Some("plan") | Some("doctor") => {
+                Some("plan") | Some("doctor") | Some("status") => {
                     if is_help(argument) {
                         help = true;
                         index += 1;
@@ -187,7 +188,7 @@ impl Cli {
                 Some("run") => {
                     if json {
                         return Err(ParseError::Invalid(
-                            "--json is only valid with plan or doctor".to_owned(),
+                            "--json is only valid with plan, doctor, or status".to_owned(),
                         ));
                     }
                     CliCommand::Run {
@@ -197,7 +198,7 @@ impl Cli {
                 Some("exec") => {
                     if json {
                         return Err(ParseError::Invalid(
-                            "--json is only valid with plan or doctor".to_owned(),
+                            "--json is only valid with plan, doctor, or status".to_owned(),
                         ));
                     }
                     CliCommand::Exec {
@@ -206,6 +207,7 @@ impl Cli {
                 }
                 Some("plan") => CliCommand::Plan { json },
                 Some("doctor") => CliCommand::Doctor { json },
+                Some("status") => CliCommand::Status { json },
                 Some("version") => {
                     if json {
                         return Err(ParseError::Invalid(
@@ -224,6 +226,7 @@ impl Cli {
             }
         };
 
+        validate_command_options(&options, &command)?;
         Ok(Self { options, command })
     }
 }
@@ -248,12 +251,11 @@ fn parse_common_option(
             | "--default-profile-file"
             | "--workspace"
             | "--cwd"
-            | "--lock-path"
-            | "--lock-timeout"
-            | "--lock-timeout-ms"
             | "--receipt-path"
             | "--input"
             | "--set"
+            | "--backend-socket"
+            | "--request-timeout-ms"
     );
     if !expects_value {
         return Ok(false);
@@ -281,22 +283,14 @@ fn parse_common_option(
             options.default_profile_file = Some(PathBuf::from(value))
         }
         "--workspace" | "--cwd" => options.workspace = Some(PathBuf::from(value)),
-        "--lock-path" => options.lock_path = Some(PathBuf::from(value)),
-        "--lock-timeout" => {
-            let seconds = value.parse::<u64>().map_err(|_| {
-                ParseError::Invalid(format!(
-                    "option --lock-timeout must be an integer: {value:?}"
-                ))
-            })?;
-            options.lock_timeout = Some(Duration::from_secs(seconds));
-        }
-        "--lock-timeout-ms" => {
+        "--backend-socket" => options.backend_socket = Some(PathBuf::from(value)),
+        "--request-timeout-ms" => {
             let ms = value.parse::<u64>().map_err(|_| {
                 ParseError::Invalid(format!(
-                    "option --lock-timeout-ms must be an integer: {value:?}"
+                    "option --request-timeout-ms must be an integer: {value:?}"
                 ))
             })?;
-            options.lock_timeout = Some(Duration::from_millis(ms));
+            options.request_timeout = Some(Duration::from_millis(ms));
         }
         "--receipt-path" => options.receipt_path = Some(PathBuf::from(value)),
         "--input" | "--set" => options.inputs.push(parse_input(&value)?),
@@ -318,6 +312,33 @@ fn parse_input(value: &str) -> Result<(String, String), ParseError> {
     Ok((name.to_owned(), value.to_owned()))
 }
 
+fn validate_command_options(options: &CliOptions, command: &CliCommand) -> Result<(), ParseError> {
+    let has_config_options = options.profile.is_some()
+        || options.profiles_dir.is_some()
+        || options.admin_profiles_dir.is_some()
+        || options.default_profile_file.is_some()
+        || options.workspace.is_some()
+        || options.receipt_path.is_some();
+    let valid = match command {
+        CliCommand::Run { .. } | CliCommand::Plan { .. } | CliCommand::Doctor { .. } => true,
+        CliCommand::Exec { .. } => !has_config_options,
+        CliCommand::Status { .. } => !has_config_options && options.inputs.is_empty(),
+        CliCommand::Version | CliCommand::Help => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ParseError::Invalid(match command {
+            CliCommand::Exec { .. } => {
+                "exec accepts only backend options, runtime inputs, and handoff arguments"
+                    .to_owned()
+            }
+            CliCommand::Status { .. } => "status accepts only backend options".to_owned(),
+            _ => "options are not valid for this command".to_owned(),
+        }))
+    }
+}
+
 fn is_environment_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().all(|character| {
@@ -336,7 +357,7 @@ pub(crate) fn usage(reason: &str) -> String {
         format!("{reason}\n\n")
     };
     format!(
-        "{prefix}usage: container-init [OPTIONS] <run|exec|plan|doctor|version> [ARGS...]\n\n\
+        "{prefix}usage: container-init [OPTIONS] <run|exec|plan|doctor|status|version> [ARGS...]\n\n\
 options:\n  \
     --profile ID                 select the profile id\n  \
     --profiles-dir PATH          load image profiles from PATH\n  \
@@ -344,14 +365,16 @@ options:\n  \
     --default-profile PATH       read the default profile id from PATH\n  \
     --workspace PATH             use PATH as the runtime working directory\n  \
     --input NAME=VALUE           set a declared bootstrap runtime input (--set is an alias)\n  \
-    --lock-path PATH             override the bootstrap lock path\n  \
+    --backend-socket PATH        connect to the backend socket\n  \
+    --request-timeout-ms N       bound backend connection time\n  \
     --receipt-path PATH          write an execution receipt to PATH\n  \
     -h, --help                   show this help\n\n\
 commands:\n  \
-    run [--] [COMMAND...]        execute the plan and hand off\n  \
-    exec [--] [COMMAND...]       transition privileges and hand off without bootstrap\n  \
-    plan [--json]                validate and print the side-effect plan\n  \
-    doctor [--json]              check the profile and runtime environment\n  \
+    run [--] [COMMAND...]        start the backend and initial handoff\n  \
+    exec [--] [COMMAND...]       request a handoff from the running backend\n  \
+    plan [--json]                show the live plan or an offline plan\n  \
+    doctor [--json]              inspect the live backend or local profile\n  \
+    status [--json]              show the running backend status\n  \
     version                      print the container-init version"
     )
 }

@@ -13,8 +13,8 @@ mod executor;
 mod filesystem;
 mod handoff;
 mod identity;
-mod lock;
 mod receipt;
+mod resource_lock;
 mod ssh;
 
 pub use condition::ConditionContext;
@@ -30,5 +30,7 @@ pub use identity::{
     IdentityResolver, IdentitySource, ParsedRuntimeInput, ResolvedIdentity, ResolvedInputs,
     RuntimeInput, WorkspaceStatus,
 };
-pub use lock::{BootstrapLock, LockOperation};
+pub use resource_lock::{
+    PathScope, ProcessNamespace, ResourceKey, ResourceLockGuard, ResourceLockManager,
+};
 pub use ssh::SshCapability;

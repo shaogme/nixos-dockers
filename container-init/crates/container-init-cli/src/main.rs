@@ -2,7 +2,7 @@ use std::process;
 
 fn main() {
     let exit_code = match container_init_cli::run(std::env::args_os()) {
-        Ok(()) => 0,
+        Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("container-init: {error}");
             error.exit_code()

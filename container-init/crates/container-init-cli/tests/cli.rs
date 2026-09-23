@@ -1,11 +1,14 @@
 use bootstrap_loader::LoaderError;
 use bootstrap_model::ModelError;
+use container_init_backend::BackendClient;
 use container_init_cli::{Cli, CliCommand, CliError};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn binary() -> PathBuf {
@@ -75,6 +78,7 @@ run_as = "root"
 }
 
 fn common_args(profiles: &Path, workspace: &Path, lock: &Path) -> Vec<String> {
+    let socket = lock.with_file_name("backend.sock");
     vec![
         "--profiles-dir".to_owned(),
         profiles.display().to_string(),
@@ -82,9 +86,51 @@ fn common_args(profiles: &Path, workspace: &Path, lock: &Path) -> Vec<String> {
         "fixture".to_owned(),
         "--workspace".to_owned(),
         workspace.display().to_string(),
-        "--lock-path".to_owned(),
-        lock.display().to_string(),
+        "--backend-socket".to_owned(),
+        socket.display().to_string(),
     ]
+}
+
+fn start_backend(
+    profiles: &Path,
+    workspace: &Path,
+    socket: &Path,
+    initial_command: &str,
+) -> std::process::Child {
+    Command::new(binary())
+        .args([
+            "--profiles-dir",
+            profiles.to_str().unwrap(),
+            "--profile",
+            "fixture",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "run",
+            "--",
+            initial_command,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_for_backend(child: &mut std::process::Child, socket: &Path) {
+    let client = BackendClient::new(socket, Duration::from_millis(500));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(status) = client.status() {
+            assert_eq!(status.state, container_init_backend::BackendState::Ready);
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("backend exited before becoming ready: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("backend did not become ready");
 }
 
 #[test]
@@ -202,11 +248,77 @@ fn run_executes_actions_then_handoffs_to_the_declared_runtime() {
 }
 
 #[test]
+fn startup_failure_exits_without_publishing_a_backend_socket() {
+    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let profiles = temp.path().join("profiles");
+    let workspace = temp.path().join("workspace");
+    let socket = temp.path().join("backend.sock");
+    let handoff = workspace.join("handoff");
+    fs::create_dir(&profiles).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    fs::write(
+        profiles.join("broken.toml"),
+        format!(
+            r#"
+schema = 1
+id = "broken"
+
+[bootstrap]
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "root"
+default_uid = 0
+default_gid = 0
+auto_mapping = false
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "broken-cgroup"
+kind = "cgroup.v2_init"
+path = "{}"
+run_as = "root"
+"#,
+            workspace.display(),
+            workspace.join("missing-cgroup").display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(binary())
+        .args([
+            "--profiles-dir",
+            profiles.to_str().unwrap(),
+            "--profile",
+            "broken",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "run",
+            "--",
+            &format!("printf handoff > {}", handoff.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!socket.exists());
+    assert!(!handoff.exists());
+}
+
+#[test]
 fn parser_parses_exec_command_with_double_dash_and_arguments() {
     let cli = Cli::parse_strings([
         "container-init",
-        "--profiles-dir",
-        "/profiles",
+        "--backend-socket",
+        "/run/container-init/backend.sock",
         "exec",
         "--",
         "tool",
@@ -214,7 +326,10 @@ fn parser_parses_exec_command_with_double_dash_and_arguments() {
         "value",
     ])
     .unwrap();
-    assert_eq!(cli.options.profiles_dir, Some(PathBuf::from("/profiles")));
+    assert_eq!(
+        cli.options.backend_socket,
+        Some(PathBuf::from("/run/container-init/backend.sock"))
+    );
     assert_eq!(
         cli.command,
         CliCommand::Exec {
@@ -224,14 +339,22 @@ fn parser_parses_exec_command_with_double_dash_and_arguments() {
 }
 
 #[test]
-fn exec_hands_off_without_bootstrap_actions_or_lock_or_receipt() {
+fn exec_hands_off_through_the_running_backend() {
+    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
     let (temp, profiles, workspace, marker, handoff) = profile_fixture();
-    let lock = temp.path().join("lock");
-    let receipt = temp.path().join("receipt.json");
+    let socket = temp.path().join("backend.sock");
+    let mut backend = start_backend(
+        &profiles,
+        &workspace,
+        &socket,
+        "trap 'exit 0' TERM; while :; do sleep 1; done",
+    );
+    wait_for_backend(&mut backend, &socket);
     let script = format!("printf 'exec-handoff\\n' > {}", handoff.display());
     let output = Command::new(binary())
-        .args(common_args(&profiles, &workspace, &lock))
-        .args(["--receipt-path", receipt.to_str().unwrap(), "exec", "--"])
+        .args(["--backend-socket", socket.to_str().unwrap(), "exec", "--"])
         .arg(script)
         .output()
         .unwrap();
@@ -240,30 +363,35 @@ fn exec_hands_off_without_bootstrap_actions_or_lock_or_receipt() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!marker.exists(), "exec must not execute bootstrap actions");
-    assert!(
-        !receipt.exists(),
-        "exec must not write an execution receipt"
-    );
-    assert!(!lock.exists(), "exec must not create or acquire a lock");
+    assert!(marker.exists(), "startup actions belong to run");
     assert_eq!(fs::read_to_string(&handoff).unwrap(), "exec-handoff\n");
+    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+    assert!(!socket.exists());
 }
 
 #[test]
 fn exec_supports_parallel_execution_without_lock_contention() {
-    let (temp, profiles, workspace, _marker, _handoff) = profile_fixture();
-    let lock = temp.path().join("lock");
+    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let (temp, profiles, workspace, _, _) = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let mut backend = start_backend(
+        &profiles,
+        &workspace,
+        &socket,
+        "trap 'exit 0' TERM; while :; do sleep 1; done",
+    );
+    wait_for_backend(&mut backend, &socket);
     let mut handles = Vec::new();
     for i in 0..4 {
-        let profiles = profiles.clone();
-        let workspace = workspace.clone();
-        let lock = lock.clone();
+        let socket = socket.clone();
         let out_file = temp.path().join(format!("parallel-{i}"));
         handles.push(std::thread::spawn(move || {
             let script = format!("printf '{i}\\n' > {}", out_file.display());
             let output = Command::new(binary())
-                .args(common_args(&profiles, &workspace, &lock))
-                .args(["exec", "--"])
+                .args(["--backend-socket", socket.to_str().unwrap(), "exec", "--"])
                 .arg(script)
                 .output()
                 .unwrap();
@@ -278,53 +406,58 @@ fn exec_supports_parallel_execution_without_lock_contention() {
     for handle in handles {
         handle.join().unwrap();
     }
+    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
 }
 
 #[test]
-fn run_supports_parallel_execution_with_lock_timeout_retry() {
-    let (temp, profiles, workspace, _marker, _handoff) = profile_fixture();
-    let lock = temp.path().join("lock");
-    let mut handles = Vec::new();
-    for i in 0..4 {
-        let profiles = profiles.clone();
-        let workspace = workspace.clone();
-        let lock = lock.clone();
-        let out_file = temp.path().join(format!("parallel-run-{i}"));
-        handles.push(std::thread::spawn(move || {
-            let script = format!("printf '{i}\\n' > {}", out_file.display());
-            let output = Command::new(binary())
-                .args(common_args(&profiles, &workspace, &lock))
-                .args(["run", "--"])
-                .arg(script)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "parallel run {i} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(fs::read_to_string(&out_file).unwrap(), format!("{i}\n"));
-        }));
+fn duplicate_run_uses_the_existing_backend_without_reloading_config() {
+    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+        return;
     }
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
-#[test]
-fn run_fails_with_exit_code_70_when_timeout_zero_and_lock_held() {
-    let (temp, profiles, workspace, _marker, _handoff) = profile_fixture();
-    let lock = temp.path().join("lock");
-    let held = container_init_posix::PosixLock::acquire(&lock).unwrap();
+    let (temp, profiles, workspace, marker, _) = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let mut backend = start_backend(
+        &profiles,
+        &workspace,
+        &socket,
+        "trap 'exit 0' TERM; while :; do sleep 1; done",
+    );
+    wait_for_backend(&mut backend, &socket);
     let output = Command::new(binary())
-        .args(common_args(&profiles, &workspace, &lock))
-        .args(["--lock-timeout", "0", "run", "--", "true"])
+        .args([
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "--profiles-dir",
+            temp.path().join("missing").to_str().unwrap(),
+            "--profile",
+            "missing",
+            "run",
+            "--",
+            "exit 88",
+        ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(70));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("another container-init process owns the lock"));
-    drop(held);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("backend already running"));
+    assert!(marker.exists());
+    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn removed_bootstrap_lock_option_is_rejected() {
+    let output = Command::new(binary())
+        .args(["--lock-path", "/tmp/old.lock", "run", "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option"));
 }
 
 #[test]
@@ -411,7 +544,7 @@ depends_on = ["drop"]
             "identity",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--lock-path",
+            "--backend-socket",
             lock.to_str().unwrap(),
             "run",
             "--",
@@ -504,7 +637,7 @@ content = "ssh-ed25519 AAAAcli-test\n"
         "ssh",
         "--workspace",
         workspace.to_str().unwrap(),
-        "--lock-path",
+        "--backend-socket",
         lock.to_str().unwrap(),
     ];
     let plan = Command::new(binary())
@@ -677,7 +810,7 @@ run_as = "root"
             "fixture-cgroup",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--lock-path",
+            "--backend-socket",
             lock.to_str().unwrap(),
             "plan",
             "--json",
@@ -753,7 +886,7 @@ run_as = "root"
             "fixture-cgroup-bind",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--lock-path",
+            "--backend-socket",
             lock.to_str().unwrap(),
             "plan",
             "--json",

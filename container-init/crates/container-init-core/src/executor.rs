@@ -5,8 +5,10 @@ use crate::error::CoreError;
 use crate::filesystem;
 use crate::handoff::HandoffCommand;
 use crate::identity::{IdentityResolver, ResolvedIdentity, ResolvedInputs, WorkspaceStatus};
-use crate::lock::BootstrapLock;
 use crate::receipt;
+use crate::resource_lock::{
+    PathScope, ProcessNamespace, ResourceKey, ResourceLockGuard, ResourceLockManager,
+};
 use crate::ssh::{self, SshCapability};
 use bootstrap_model::{
     Action, ActionKind, BootstrapConfig, FailurePolicy, Origin, Plan, PlanPhase, PlannedAction,
@@ -16,7 +18,7 @@ use container_init_posix::{ActionChange, PosixIdentity, PosixSystem};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
 
 /// Actions can be executed through this alias by callers that do not need to
 /// distinguish the plan-oriented name.
@@ -24,24 +26,14 @@ pub type ActionExecutor = PlanExecutor;
 
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionOptions {
-    pub lock_path: Option<PathBuf>,
-    pub lock_timeout: Option<Duration>,
     pub receipt_path: Option<PathBuf>,
     pub posix: PosixSystem,
     pub ssh: Option<SshCapability>,
+    pub resource_locks: ResourceLockManager,
+    pub preserve_current_process_in_cgroup: bool,
 }
 
 impl ExecutionOptions {
-    pub fn with_lock_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.lock_path = Some(path.into());
-        self
-    }
-
-    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
-        self.lock_timeout = Some(timeout);
-        self
-    }
-
     pub fn with_receipt_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.receipt_path = Some(path.into());
         self
@@ -54,6 +46,16 @@ impl ExecutionOptions {
 
     pub fn with_ssh(mut self, capability: SshCapability) -> Self {
         self.ssh = Some(capability);
+        self
+    }
+
+    pub fn with_resource_locks(mut self, manager: ResourceLockManager) -> Self {
+        self.resource_locks = manager;
+        self
+    }
+
+    pub fn preserve_current_process_in_cgroup(mut self) -> Self {
+        self.preserve_current_process_in_cgroup = true;
         self
     }
 }
@@ -108,13 +110,17 @@ impl ExecutionReport {
 }
 
 pub struct PlanExecutor {
-    config: BootstrapConfig,
+    config: Arc<BootstrapConfig>,
     context: RuntimeContext,
     options: ExecutionOptions,
 }
 
 impl PlanExecutor {
     pub fn new(config: BootstrapConfig, context: RuntimeContext) -> Self {
+        Self::with_shared_config(Arc::new(config), context)
+    }
+
+    pub fn with_shared_config(config: Arc<BootstrapConfig>, context: RuntimeContext) -> Self {
         Self {
             config,
             context,
@@ -128,7 +134,7 @@ impl PlanExecutor {
     }
 
     pub fn config(&self) -> &BootstrapConfig {
-        &self.config
+        self.config.as_ref()
     }
 
     pub fn context(&self) -> &RuntimeContext {
@@ -136,8 +142,15 @@ impl PlanExecutor {
     }
 
     pub fn resolve_identity(&self) -> Result<ResolvedIdentity, CoreError> {
+        let _account_locks = self.acquire_account_locks()?;
         IdentityResolver::with_posix(self.options.posix.clone())
             .resolve(&self.config, &self.context)
+    }
+
+    pub fn resolve_identity_prevalidated(&self) -> Result<ResolvedIdentity, CoreError> {
+        let _account_locks = self.acquire_account_locks()?;
+        IdentityResolver::with_posix(self.options.posix.clone())
+            .resolve_prevalidated(&self.config, &self.context)
     }
 
     /// Execute every action in a pre-built static plan. The command is only
@@ -145,9 +158,21 @@ impl PlanExecutor {
     /// process. Use execute_and_handoff for the production run path.
     pub fn execute(&self, plan: &Plan, command: &[String]) -> Result<ExecutionReport, CoreError> {
         self.validate_plan(plan)?;
-        let _lock = self.acquire_lock()?;
+        self.execute_prevalidated(plan, command)
+    }
+
+    /// Execute a plan already validated against this immutable configuration
+    /// snapshot. Backend callers build the request plan once at startup.
+    pub fn execute_prevalidated(
+        &self,
+        plan: &Plan,
+        command: &[String],
+    ) -> Result<ExecutionReport, CoreError> {
         let resolver = IdentityResolver::with_posix(self.options.posix.clone());
-        let identity = resolver.resolve(&self.config, &self.context)?;
+        let identity = {
+            let _account_locks = self.acquire_account_locks()?;
+            resolver.resolve_prevalidated(&self.config, &self.context)?
+        };
         let root_service_handoff = self.is_root_service_handoff(command);
         let warnings = identity_warnings(&self.config, &identity);
         let inputs = resolver.resolve_inputs(&self.config, &self.context)?;
@@ -258,7 +283,15 @@ impl PlanExecutor {
 
             self.check_run_as(action.run_as, &identity, planned)
                 .map_err(|error| annotate_action_error(error, action))?;
-            match self.execute_action(action, &identity, &values, command) {
+            let action_result = {
+                let keys = self.action_resource_keys(action, &identity, &values)?;
+                let _resource_locks =
+                    self.options.resource_locks.acquire(keys).map_err(|error| {
+                        CoreError::action("resource-lock", None, error.to_string())
+                    })?;
+                self.execute_action(action, &identity, &values, command)
+            };
+            match action_result {
                 Ok((change, prepared_handoff)) => {
                     if let Some(command) = prepared_handoff {
                         handoff = Some(command);
@@ -340,7 +373,10 @@ impl PlanExecutor {
     ) -> Result<(ResolvedIdentity, HandoffCommand, bool), CoreError> {
         self.config.validate().map_err(CoreError::Model)?;
         let resolver = IdentityResolver::with_posix(self.options.posix.clone());
-        let identity = resolver.resolve(&self.config, &self.context)?;
+        let identity = {
+            let _account_locks = self.acquire_account_locks()?;
+            resolver.resolve_prevalidated(&self.config, &self.context)?
+        };
         let root_service_handoff = self.is_root_service_handoff(command);
         let handoff = self.build_handoff_command(command)?;
         Ok((identity, handoff, root_service_handoff))
@@ -368,7 +404,7 @@ impl PlanExecutor {
 
     /// Transition privileges to the resolved identity and replace this process with
     /// the configured handoff command, without executing any bootstrap actions or
-    /// acquiring the bootstrap lock.
+    /// acquiring process-wide bootstrap state.
     pub fn exec_and_handoff(&self, command: &[String]) -> Result<(), CoreError> {
         let (identity, handoff, root_service_handoff) = self.prepare_exec(command)?;
         self.exec_prepared(&identity, handoff, root_service_handoff)
@@ -386,15 +422,141 @@ impl PlanExecutor {
         Ok(())
     }
 
-    fn acquire_lock(&self) -> Result<Option<BootstrapLock>, CoreError> {
+    fn acquire_account_locks(&self) -> Result<ResourceLockGuard, CoreError> {
         self.options
-            .lock_path
-            .as_ref()
-            .map(|path| match self.options.lock_timeout {
-                Some(timeout) => BootstrapLock::acquire_with_timeout(path.clone(), timeout),
-                None => BootstrapLock::acquire(path.clone()),
-            })
-            .transpose()
+            .resource_locks
+            .acquire([ResourceKey::accounts([
+                self.options.posix.passwd_path().to_path_buf(),
+                self.options.posix.group_path().to_path_buf(),
+            ])])
+            .map_err(|error| CoreError::action("resource-lock", None, error.to_string()))
+    }
+
+    fn action_resource_keys(
+        &self,
+        action: &Action,
+        identity: &ResolvedIdentity,
+        values: &BTreeMap<String, String>,
+    ) -> Result<Vec<ResourceKey>, CoreError> {
+        let mut keys = Vec::new();
+        let mut add_path = |path: PathBuf, scope: PathScope, parent_entry: bool| {
+            if parent_entry {
+                if let Some(parent) = path.parent() {
+                    keys.push(ResourceKey::path(parent.to_path_buf(), PathScope::Exact));
+                }
+            }
+            keys.push(ResourceKey::path(path, scope));
+        };
+        let render = |field: &str, value: Option<&String>| {
+            value
+                .ok_or_else(|| CoreError::Invalid {
+                    location: format!("bootstrap.actions.{}.{field}", action.id),
+                    message: "field is required".to_owned(),
+                })
+                .and_then(|value| filesystem::render_path(&action.id, field, value, values))
+        };
+
+        match action.kind {
+            ActionKind::IdentityMapUser => keys.push(ResourceKey::accounts([
+                self.options.posix.passwd_path().to_path_buf(),
+                self.options.posix.group_path().to_path_buf(),
+            ])),
+            ActionKind::ProcessSetUserShell => keys.push(ResourceKey::accounts([self
+                .options
+                .posix
+                .passwd_path()
+                .to_path_buf()])),
+            ActionKind::IdentityEnsureHome => {
+                let path = action
+                    .path
+                    .as_ref()
+                    .map(|value| filesystem::render_path(&action.id, "path", value, values))
+                    .transpose()?
+                    .unwrap_or_else(|| identity.home.clone());
+                add_path(path, PathScope::Subtree, true);
+            }
+            ActionKind::FilesystemEnsureDir => {
+                add_path(
+                    render("path", action.path.as_ref())?,
+                    PathScope::Subtree,
+                    true,
+                );
+            }
+            ActionKind::FilesystemEnsureFile => {
+                add_path(
+                    render("path", action.path.as_ref())?,
+                    PathScope::Exact,
+                    true,
+                );
+            }
+            ActionKind::FilesystemEnsureSymlink => {
+                add_path(
+                    render("link", action.link.as_ref())?,
+                    PathScope::Exact,
+                    true,
+                );
+            }
+            ActionKind::FilesystemChown | ActionKind::FilesystemChmod => {
+                add_path(
+                    render("path", action.path.as_ref())?,
+                    if action.recursive {
+                        PathScope::Subtree
+                    } else {
+                        PathScope::Exact
+                    },
+                    false,
+                );
+            }
+            ActionKind::ServiceSshPrepare => {
+                for (field, value) in [
+                    ("host_key_dir", action.ssh_host_key_dir()),
+                    ("authorized_keys_dir", action.ssh_authorized_keys_dir()),
+                    ("runtime_dir", action.ssh_runtime_dir()),
+                ] {
+                    if let Some(value) = value {
+                        let path = filesystem::render_path(&action.id, field, value, values)?;
+                        add_path(path, PathScope::Subtree, true);
+                    }
+                }
+                if let Some(source) = &action.authorized_keys_source {
+                    add_path(
+                        render("authorized_keys_source", Some(source))?,
+                        PathScope::Exact,
+                        false,
+                    );
+                }
+            }
+            ActionKind::CgroupV2Init => {
+                let hierarchy = if action.cgroup_mount_mode() == "bind_mount" {
+                    action
+                        .shadow_path
+                        .as_ref()
+                        .map(|value| {
+                            filesystem::render_path(&action.id, "shadow_path", value, values)
+                        })
+                        .transpose()?
+                        .unwrap_or_else(|| PathBuf::from("/run/cgroup"))
+                } else {
+                    action
+                        .path
+                        .as_ref()
+                        .map(|value| filesystem::render_path(&action.id, "path", value, values))
+                        .transpose()?
+                        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"))
+                };
+                keys.push(ResourceKey::cgroup(
+                    hierarchy,
+                    action.controllers.clone().unwrap_or_default(),
+                ));
+                keys.push(ResourceKey::ProcessNamespace(
+                    ProcessNamespace::UserAndMount,
+                ));
+            }
+            ActionKind::IdentityResolve
+            | ActionKind::ProcessDropPrivileges
+            | ActionKind::HandoffExec => {}
+        }
+        Ok(keys)
     }
 
     fn check_run_as(
@@ -560,9 +722,15 @@ impl PlanExecutor {
                 })?;
                 ssh::prepare(action, identity, values, &self.options.posix, capability)
             }
-            ActionKind::CgroupV2Init => {
-                cgroup::init_v2(action, identity, values, &self.options.posix)
-            }
+            ActionKind::CgroupV2Init => cgroup::init_v2(
+                action,
+                identity,
+                values,
+                &self.options.posix,
+                self.options
+                    .preserve_current_process_in_cgroup
+                    .then_some(std::process::id()),
+            ),
             ActionKind::HandoffExec => unreachable!("handled before the action match"),
         };
         result.map(|change| (change, None))
@@ -570,6 +738,21 @@ impl PlanExecutor {
 
     fn write_receipt(&self, report: &ExecutionReport) -> Result<(), CoreError> {
         if let Some(path) = &self.options.receipt_path {
+            let _resource_locks = self
+                .options
+                .resource_locks
+                .acquire([
+                    ResourceKey::path(path.clone(), PathScope::Exact),
+                    ResourceKey::path(
+                        path.parent()
+                            .unwrap_or_else(|| Path::new("/"))
+                            .to_path_buf(),
+                        PathScope::Exact,
+                    ),
+                ])
+                .map_err(|error| {
+                    CoreError::action("resource-lock", Some(path.clone()), error.to_string())
+                })?;
             receipt::write(path, report)?;
         }
         Ok(())
@@ -588,32 +771,6 @@ impl PlanExecutor {
                 #[cfg(not(unix))]
                 Path::new(&self.config.workspace_root).join(".container-init")
             })
-    }
-
-    pub fn is_reconciled(&self, identity: &ResolvedIdentity) -> bool {
-        let has_ensure_home = self
-            .config
-            .actions
-            .iter()
-            .any(|action| action.kind == ActionKind::IdentityEnsureHome);
-        if has_ensure_home {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                match std::fs::metadata(&identity.home) {
-                    Ok(meta) => {
-                        if meta.uid() != identity.uid || meta.gid() != identity.gid {
-                            return false;
-                        }
-                    }
-                    Err(_) => {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
     }
 }
 

@@ -105,8 +105,9 @@ dev-env shim \
 镜像中的 `/bin/bash` 和 `/usr/bin/bash` 是指向 `dev-env` 的 symlink；CLI 根据
 argv0 把它识别为 Bash shim，并使用 `DEVENV_REAL_SHELL` 或默认
 `/usr/local/libexec/dev-env/real/bash`。当 shim 以 root 启动且镜像提供
-以继承环境的结构化 argv 委托给 `container-init exec -- real-bash ...`，因此不会先
-以 root 物化一次 provider，也不会触发 bootstrap 排他锁冲突。
+以继承环境的结构化 argv 委托给 `container-init exec -- real-bash ...`。`exec` 连接
+容器启动时持有 profile snapshot 的 backend，只执行受限 identity reconciliation；它不
+重新读取 profile，也不会触发启动 action 或覆盖启动 receipt。
 
 `--real` 与配置的 shim 路径必须分离。直接将 real shell 配置成 `/bin/bash` 会导致 `/bin/bash` 再回到 dev-env，应该把真实 executable 放在 profile 明确的非 shim 路径。
 
@@ -203,7 +204,8 @@ exec(program, original argv)
 ENTRYPOINT ["/usr/bin/container-init", "run", "--"]
 ```
 
-`container-init` 先做 bootstrap namespace 的 identity/filesystem/SSH action，再通过 handoff：
+`container-init` backend 先做一次 bootstrap namespace 的 identity/filesystem/SSH action，
+然后通过 Unix socket 为后续 handoff 提供同一份 snapshot：
 
 ```text
 无显式 command: /usr/bin/dev-env shell

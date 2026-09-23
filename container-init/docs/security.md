@@ -135,7 +135,7 @@ SSH private key 不会进入 plan effect 或 receipt。仍应将 host key 目录
 | 67 | 身份错误 | UID/GID/HOME 输入或 POSIX identity 无法解析 |
 | 68 | action 错误 | 文件、账户、SSH 或其他 bootstrap action 执行失败 |
 | 69 | handoff 错误 | runtime exec 失败 |
-| 70 | lock 错误 | lock 超时未能获取或 lock IO 失败 |
+| 69 | backend 错误 | Unix socket、singleton flock 或 handoff RPC 失败 |
 
 错误文本通常包括 action id、路径、来源和修复提示；JSON 错误会包含 `class`、`kind`、`action`/`path` 等结构化字段。`doctor` 发现 fail 时使用检查对应的错误分类；只有无法进一步分类时才使用 65。
 
@@ -148,7 +148,7 @@ SSH private key 不会进入 plan effect 或 receipt。仍应将 host key 目录
 - image 中不存在不必要的 `service.ssh.prepare`；
 - `allow_outside_workspace` 仅用于明确需要的 HOME，并且路径来自可信输入；
 - `filesystem.ensure_symlink` 的 link 不会覆盖 volume mount 或真实配置目录；
-- lock 路径位于合适的 runtime/workspace 目录，并能被 root/container 用户创建；
+- backend socket 和 singleton lock 位于合适的 runtime/workspace 目录，并通过 owner/mode/type 校验；
 - receipt 目录权限足够严格；
 - workspace 不会被当作 bootstrap trusted profile 加载；
 - 镜像、admin profile 和 handoff runtime 的变更都有对应测试。

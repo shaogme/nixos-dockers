@@ -12,30 +12,10 @@ pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub fn default_lock_timeout() -> Duration {
-    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_TIMEOUT_MS") {
-        if let Ok(ms) = val.parse::<u64>() {
-            return Duration::from_millis(ms);
-        }
-    }
-    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_TIMEOUT_SECS") {
-        if let Ok(secs) = val.parse::<u64>() {
-            return Duration::from_secs(secs);
-        }
-    }
-    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_TIMEOUT") {
-        if let Ok(secs) = val.parse::<u64>() {
-            return Duration::from_secs(secs);
-        }
-    }
     DEFAULT_LOCK_TIMEOUT
 }
 
 pub fn default_poll_interval() -> Duration {
-    if let Ok(val) = std::env::var("CONTAINER_INIT_LOCK_POLL_INTERVAL_MS") {
-        if let Ok(ms) = val.parse::<u64>() {
-            return Duration::from_millis(ms);
-        }
-    }
     DEFAULT_POLL_INTERVAL
 }
 
@@ -73,6 +53,7 @@ impl PosixLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)?;
 
         let started = Instant::now();

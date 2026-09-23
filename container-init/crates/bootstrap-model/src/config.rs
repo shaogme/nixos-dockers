@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::action::{Action, ActionKind};
+use crate::condition::{Condition, ConditionValue};
 use crate::error::ModelError;
 use crate::input::BootstrapInput;
 use crate::validation::{
@@ -129,7 +130,153 @@ impl BootstrapConfig {
             action.validate(self)?;
         }
 
+        self.validate_runtime_invariance()?;
+
         Ok(())
+    }
+
+    fn validate_runtime_invariance(&self) -> Result<(), ModelError> {
+        let runtime_inputs = self
+            .inputs
+            .iter()
+            .filter(|(_, input)| input.runtime)
+            .flat_map(|(name, input)| {
+                std::iter::once(name.as_str()).chain(input.aliases.iter().map(String::as_str))
+            })
+            .collect::<BTreeSet<_>>();
+
+        for action in &self.actions {
+            // Workspace overlays are request-scoped target actions. The
+            // backend deliberately reruns them during identity reconciliation.
+            if action.origin.source.is_workspace() {
+                continue;
+            }
+            if matches!(
+                action.kind,
+                ActionKind::IdentityResolve
+                    | ActionKind::IdentityMapUser
+                    | ActionKind::IdentityEnsureHome
+                    | ActionKind::ProcessSetUserShell
+                    | ActionKind::ProcessDropPrivileges
+                    | ActionKind::HandoffExec
+            ) {
+                continue;
+            }
+
+            let fields = [
+                ("path", action.path.as_deref()),
+                ("link", action.link.as_deref()),
+                ("target", action.target.as_deref()),
+                ("mode", action.mode.as_deref()),
+                ("parent_mode", action.parent_mode.as_deref()),
+                ("owner", action.owner.as_deref()),
+                ("user", action.user.as_deref()),
+                ("shell", action.shell.as_deref()),
+                ("content", action.content.as_deref()),
+                ("host_key_dir", action.host_key_dir.as_deref()),
+                ("authorized_keys_dir", action.authorized_keys_dir.as_deref()),
+                (
+                    "authorized_keys_source",
+                    action.authorized_keys_source.as_deref(),
+                ),
+                ("runtime_dir", action.runtime_dir.as_deref()),
+                ("ssh_keygen", action.ssh_keygen.as_deref()),
+                ("subgroup", action.subgroup.as_deref()),
+                ("shadow_path", action.shadow_path.as_deref()),
+            ];
+            for (field, value) in fields
+                .into_iter()
+                .filter_map(|(field, value)| value.map(|value| (field, value)))
+            {
+                if let Some(reference) = runtime_reference(value, &runtime_inputs) {
+                    return Err(ModelError::Invalid {
+                        location: format!("bootstrap.actions.{}.{}", action.id, field),
+                        message: format!(
+                            "startup action depends on {reference}, but request reconciliation does not rerun it"
+                        ),
+                    });
+                }
+            }
+
+            if let Some(condition) = action.when.as_deref() {
+                let condition = Condition::parse(condition)?;
+                if let Some(reference) = condition_runtime_reference(&condition, &runtime_inputs) {
+                    return Err(ModelError::Invalid {
+                        location: format!("bootstrap.actions.{}.when", action.id),
+                        message: format!(
+                            "startup action condition depends on {reference}, but request reconciliation does not rerun it"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn runtime_reference(value: &str, runtime_inputs: &BTreeSet<&str>) -> Option<String> {
+    if value == "identity.target" || value.contains("identity.") {
+        return Some("request identity".to_owned());
+    }
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let end = after.find('}')?;
+        let reference = &after[..end];
+        if let Some(name) = reference.strip_prefix("input.") {
+            if runtime_inputs.contains(name) {
+                return Some(format!("runtime input {name}"));
+            }
+        } else if reference.starts_with("env.") {
+            return Some(format!("runtime environment {reference}"));
+        } else if reference.starts_with("identity.") {
+            return Some("request identity".to_owned());
+        }
+        rest = &after[end + 1..];
+    }
+    None
+}
+
+fn condition_runtime_reference(
+    condition: &Condition,
+    runtime_inputs: &BTreeSet<&str>,
+) -> Option<String> {
+    fn value_reference(value: &ConditionValue, runtime_inputs: &BTreeSet<&str>) -> Option<String> {
+        let ConditionValue::Reference(reference) = value else {
+            return None;
+        };
+        if reference.starts_with("identity.") {
+            return Some("request identity".to_owned());
+        }
+        if let Some(name) = reference.strip_prefix("input.") {
+            if runtime_inputs.contains(name) {
+                return Some(format!("runtime input {name}"));
+            }
+        }
+        if reference.starts_with("env.") {
+            return Some(format!("runtime environment {reference}"));
+        }
+        None
+    }
+
+    match condition {
+        Condition::Equal(left, right) | Condition::NotEqual(left, right) => {
+            value_reference(left, runtime_inputs).or_else(|| value_reference(right, runtime_inputs))
+        }
+        Condition::And(parts) | Condition::Or(parts) => parts
+            .iter()
+            .find_map(|part| condition_runtime_reference(part, runtime_inputs)),
+        Condition::Not(part) => condition_runtime_reference(part, runtime_inputs),
+        Condition::Exists(path) | Condition::Writable(path) => {
+            runtime_reference(path.as_str(), runtime_inputs)
+        }
+        Condition::InputSet(name) => runtime_inputs
+            .contains(name.as_str())
+            .then(|| format!("runtime input {name}")),
+        Condition::Always
+        | Condition::Boolean(_)
+        | Condition::ContextPathExistsOrCreate
+        | Condition::Feature(_) => None,
     }
 }
 

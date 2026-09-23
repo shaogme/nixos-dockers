@@ -127,10 +127,10 @@ workspace 挂载属主自动解析，需要覆盖时请传入 `$(id -u):$(id -g)
 
 镜像的 Docker `Entrypoint` 固定为 `/usr/bin/container-init run --`。运行时分为两个独立阶段：
 
-1. `container-init` 执行镜像 profile 声明的 UID/GID、目录、软链接和 SSH action，然后按 handoff 配置交给 `dev-env`。
+1. `container-init` backend 加载镜像 profile snapshot，执行声明的 UID/GID、目录、软链接和 SSH action，然后按 handoff 配置交给 `dev-env`。
 2. `dev-env` 加载 `/etc/dev-env/profiles.d`，物化 mise、Devbox、Rust 和其他 provider 的环境，并以同一份环境启动命令、shell 或 SSH login shell。
 
-`HOST_UID=uid[:gid]`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT=1` 是声明式 runtime input。默认家目录统一为 `/home/user`，并在容器启动期由 `container-init` 自动校准所有权。`/bin/bash` 与 `/usr/bin/bash` 是兼容 shim；root 的 `docker exec ... bash` 会先重新进入 `container-init` 身份 Bootstrap，非 root 则直接物化环境，真实 Bash 位于 `/usr/local/libexec/dev-env/real/bash`。需要 root 身份时直接传入 `RUN_AS_ROOT=1`，无需额外调整 `$HOME`。镜像不再包含旧的 `/bin/entrypoint.sh`。
+`HOST_UID=uid[:gid]`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT=1` 是声明式 runtime input。默认家目录统一为 `/home/user`，并在容器启动期由 `container-init` 自动校准所有权。`/bin/bash` 与 `/usr/bin/bash` 是兼容 shim；root 的 `docker exec ... bash` 会通过 backend `container-init exec` 请求身份 reconciliation，非 root 则直接物化环境，真实 Bash 位于 `/usr/local/libexec/dev-env/real/bash`。需要 root 身份时直接传入 `RUN_AS_ROOT=1`，无需额外调整 `$HOME`。镜像不再包含旧的 `/bin/entrypoint.sh`。
 
 ### 编写自定义 Dockerfile 示例
 

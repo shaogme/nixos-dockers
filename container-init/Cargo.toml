@@ -4,6 +4,7 @@ members = [
     "crates/bootstrap-loader",
     "crates/container-init-posix",
     "crates/container-init-core",
+    "crates/container-init-backend",
     "crates/container-init-cli",
 ]
 resolver = "2"
