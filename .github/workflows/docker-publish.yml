@@ -23,33 +23,65 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      runtime_matrix: ${{ steps.set-matrix.outputs.runtime_matrix }}
+      builder_matrix: ${{ steps.set-matrix.outputs.builder_matrix }}
     steps:
       - uses: actions/checkout@main
       - id: set-matrix
         run: |
-          # Find directories containing image.nix under images/, format as matrix items with CLI and vscode variants
-          MATRIX=$(find images -maxdepth 2 -name "image.nix" | sort | jq -R . | jq -s -c '
+          # Every image definition publishes CLI, vscode, and builder roles.
+          IMAGE_NAMES=$(find images -maxdepth 2 -name "image.nix" | sort | jq -R . | jq -s -c '
+            map(capture("images/(?<name>[^/]+)/image.nix"))
+          ')
+          RUNTIME_MATRIX=$(echo "$IMAGE_NAMES" | jq -c '
             map(
-              capture("images/(?<name>[^/]+)/image.nix") |
+              . as $image |
               [
-                { file: "images/\(.name)/image.nix", attr: .name, name: .name },
-                { file: "images/\(.name)/image.nix", attr: "vscode-\(.name)", name: "vscode-\(.name)" }
+                { file: "images/\($image.name)/image.nix", attr: $image.name, name: $image.name },
+                { file: "images/\($image.name)/image.nix", attr: "vscode-\($image.name)", name: "vscode-\($image.name)" }
               ]
             ) | flatten
           ')
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          BUILDER_MATRIX=$(echo "$IMAGE_NAMES" | jq -c '
+            map(
+              . as $image |
+              [{
+                file: "images/\($image.name)/image.nix",
+                attr: "\($image.name)-builder",
+                name: "\($image.name)-builder"
+              }]
+            ) | flatten
+          ')
+          echo "runtime_matrix=$RUNTIME_MATRIX" >> $GITHUB_OUTPUT
+          echo "builder_matrix=$BUILDER_MATRIX" >> $GITHUB_OUTPUT
 
-  build-and-publish:
+  build-and-publish-builders:
     needs: discover
-    if: ${{ needs.discover.outputs.matrix != '[]' && needs.discover.outputs.matrix != '' }}
+    if: ${{ needs.discover.outputs.builder_matrix != '[]' && needs.discover.outputs.builder_matrix != '' }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJson(needs.discover.outputs.matrix) }}
+        target: ${{ fromJson(needs.discover.outputs.builder_matrix) }}
+    uses: ./.github/workflows/build-image.yml
+    with:
+      file: ${{ matrix.target.file }}
+      attr: ${{ matrix.target.attr }}
+      name: ${{ matrix.target.name }}
+    secrets: inherit
+
+  build-and-publish-runtimes:
+    needs: [discover, build-and-publish-builders]
+    if: ${{ needs.discover.outputs.runtime_matrix != '[]' && needs.discover.outputs.runtime_matrix != '' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.discover.outputs.runtime_matrix) }}
     uses: ./.github/workflows/build-image.yml
     with:
       file: ${{ matrix.target.file }}

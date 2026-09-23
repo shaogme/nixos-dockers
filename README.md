@@ -143,6 +143,30 @@ RUN nix profile add nixpkgs#bun
 COPY .config/dev-env.toml /etc/dev-env/profiles.d/50-project.toml
 ```
 
+若需要在 Docker 构建阶段执行 `mise lock` 或 `mise install`，必须使用独立的
+`mise-builder` stage，并只将工具缓存复制到 runtime stage：
+
+```dockerfile
+ARG NIXOS_DOCKERS_VERSION
+
+FROM ghcr.io/shaogme/nixos-dockers/mise-builder:${NIXOS_DOCKERS_VERSION} AS mise-tools
+COPY .mise.toml /etc/mise/mise.toml
+COPY conf.d/ /etc/mise/conf.d/
+RUN mise trust --all \
+    && mise lock --global --platform linux-x64,linux-arm64 \
+    && mise install \
+    && chmod -R a+rwX /etc/mise /usr/local/share/mise /data/cache/mise
+
+FROM ghcr.io/shaogme/nixos-dockers/mise:${NIXOS_DOCKERS_VERSION}
+COPY --from=mise-tools /etc/mise /etc/mise
+COPY --from=mise-tools /usr/local/share/mise /usr/local/share/mise
+COPY --from=mise-tools /data/cache/mise /data/cache/mise
+```
+
+运行时 stage 不执行工具安装命令，也不复制 builder 的 `/root`、临时目录或构建凭据。
+`mise-builder` 与 runtime image 使用相同版本标签，并由 CI 分别发布 amd64 和 arm64
+manifest。
+
 自定义运行时初始化也应使用 Bootstrap DSL action；不要复制或链式调用旧 entrypoint。需要让新 profile 成为默认 profile 时，显式写入 `/etc/dev-env/default-profile`，并保持其 `extends` 链包含基础 profile。
 
 > [!TIP]
@@ -176,6 +200,9 @@ nix-build images/rust/image.nix -A vscode-rust
 
 # 3. 构建该目录下所有镜像变体
 nix-build images/rust/image.nix
+
+# Mise 构建阶段镜像（仅用于 Docker build stage）
+nix-build images/mise/image.nix -A mise-builder
 ```
 
 构建完成后，使用 `docker load < result` 即可将镜像导入本地 Docker。
@@ -199,7 +226,7 @@ CI 会对 `mise`、`npins`、`rust` 三个 image 运行相同测试。`coding-im
 ├── images/                # Docker 镜像定义目录 (每个定义同时产出 CLI 与 VS Code 镜像)
 │   ├── npins/             # 基础通用镜像 (npins, vscode-npins)
 │   ├── rust/              # Rust 专用镜像 (rust, vscode-rust)
-│   └── mise/              # Mise 专用镜像 (mise, vscode-mise) -> 详见 [Mise 文档](images/mise/README.md)
+│   └── mise/              # Mise 专用镜像 (mise, vscode-mise, mise-builder) -> 详见 [Mise 文档](images/mise/README.md)
 │       └── example/       # 生产级派生开发容器示例 (Dockerfile, compose, entrypoint)
 ├── modules/               # 统一 NixOS 模块系统
 │   ├── core/              # 核心构建器、系统配置与 container-init/dev-env runtime

@@ -42,6 +42,18 @@ let
       ] ++ modules;
     }).config.docker.build;
 
+  buildBuilderImage = { name, modules ? [ ], specialArgs ? { } }:
+    (evalContainer {
+      inherit specialArgs;
+      modules = [
+        {
+          docker.name = lib.mkDefault "${name}-builder";
+          docker.role = "builder";
+          services.openssh.enable = false;
+        }
+      ] ++ modules;
+    }).config.docker.build;
+
   buildImages = { name, modules ? [ ], specialArgs ? { } }: {
     ${name} = buildImage {
       inherit specialArgs;
@@ -59,8 +71,12 @@ let
         }
       ] ++ modules;
     };
+    "${name}-builder" = buildBuilderImage {
+      inherit name specialArgs;
+      modules = modules;
+    };
   };
 in
 {
-  inherit coreModules evalContainer buildImage buildVscodeImage buildImages;
+  inherit coreModules evalContainer buildImage buildVscodeImage buildBuilderImage buildImages;
 }

@@ -6,10 +6,7 @@
 let
   builder = import ../../modules { inherit pkgs sources system; };
   miseRepo = import sources.mise-nixcache { inherit pkgs; };
-in
-builder.buildImages {
-  inherit name;
-  modules = [
+  miseModules = [
     {
       profiles.mise = {
         enable = true;
@@ -17,5 +14,8 @@ builder.buildImages {
       };
     }
   ];
+in
+builder.buildImages {
+  inherit name;
+  modules = miseModules;
 }
-

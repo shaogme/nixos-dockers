@@ -42,6 +42,12 @@ let
 in
 {
   options.docker = {
+    role = lib.mkOption {
+      type = lib.types.enum [ "runtime" "builder" ];
+      default = "runtime";
+      description = "Image role used to select runtime or build-stage defaults.";
+    };
+
     name = lib.mkOption {
       type = lib.types.str;
       description = "Docker image repository name.";

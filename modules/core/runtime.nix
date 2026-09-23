@@ -207,15 +207,15 @@ in
   options.runtime = {
     enable = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      default = config.docker.role != "builder";
       description = "Install the container-init and dev-env runtimes and their base profile.";
     };
   };
 
   config = lib.mkIf config.runtime.enable {
     environment.variables = {
-      DEVENV_CONTAINER_INIT = lib.mkForce containerInitPath;
-      DEVENV_BOOTSTRAP_REAL_SHELL = lib.mkForce bootstrapRealShellPath;
+      DEVENV_CONTAINER_INIT = containerInitPath;
+      DEVENV_BOOTSTRAP_REAL_SHELL = bootstrapRealShellPath;
     };
     docker.extraContents = [ runtimeContents profile defaultProfile ];
     docker.extraCommands = ''

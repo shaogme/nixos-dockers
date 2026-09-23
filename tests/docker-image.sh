@@ -181,7 +181,53 @@ test_loaded_image() {
     fi
 }
 
+test_builder_image() {
+    local attr="${image}-builder"
+    local archive="$tmp_dir/${attr//\//_}.tar.gz"
+    local entrypoint tool tool_output
+
+    echo "==> evaluating $image#$attr"
+    nix-instantiate --eval --strict "$image_file" -A "$attr.imageVersion" >/dev/null
+
+    local runtime_version builder_version
+    runtime_version="$(nix-instantiate --eval --raw "$image_file" -A "$image.imageVersion")"
+    builder_version="$(nix-instantiate --eval --raw "$image_file" -A "$attr.imageVersion")"
+    [[ "$runtime_version" == "$builder_version" ]]
+
+    echo "==> building $image#$attr"
+    nix-build --no-out-link "$image_file" -A "$attr" -o "$archive"
+
+    echo "==> loading $attr:latest"
+    docker load --input "$archive"
+
+    echo "==> validating builder metadata"
+    entrypoint="$(docker inspect --format '{{json .Config.Entrypoint}}' "$attr:latest")"
+    [[ "$entrypoint" == "null" || "$entrypoint" == "[]" ]]
+
+    case "$image" in
+        mise) tool=mise ;;
+        npins) tool=npins ;;
+        rust) tool=rustc ;;
+    esac
+    echo "==> validating builder tool ($tool)"
+    tool_output="$(docker run --rm --entrypoint /bin/bash "$attr:latest" -c "
+        set -euo pipefail
+        test \"\$(readlink -f /bin/bash)\" != /usr/bin/dev-env
+        test \"\$(readlink -f /usr/bin/bash)\" != /usr/bin/dev-env
+        test ! -e /usr/bin/container-init
+        test ! -e /usr/bin/dev-env
+        command -v $tool
+        $tool --version
+        printf '%s\\n' '#!/usr/bin/env bash' 'set -eu' 'printf builder-shebang' > /tmp/builder-shebang
+        chmod +x /tmp/builder-shebang
+        /tmp/builder-shebang
+    ")"
+    assert_contains "$tool_output" "$tool"
+    assert_contains "$tool_output" builder-shebang
+}
+
 test_loaded_image "$image"
 test_loaded_image "vscode-$image"
+test_builder_image
 
 echo "Docker image tests passed: $image and vscode-$image"
