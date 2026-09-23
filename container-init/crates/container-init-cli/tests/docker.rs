@@ -638,4 +638,61 @@ depends_on = ["resolve"]
         (1000, 1000),
         "Home must be reconciled back to dev (1000:1000)"
     );
+
+    // 4. Exec with RUN_AS_ROOT=1 (exec promotes because of identity drift)
+    let exec_root = Command::new(&binary)
+        .args(common_args)
+        .env("RUN_AS_ROOT", "1")
+        .args(["exec", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        exec_root.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exec_root.stderr)
+    );
+    let meta_root2 = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_root2.uid(), meta_root2.gid()),
+        (0, 0),
+        "Exec must reconcile home to root (0:0) on identity drift"
+    );
+
+    // 5. Exec with RUN_AS_ROOT=0 (exec promotes because identity drifted to dev)
+    let exec_dev = Command::new(&binary)
+        .args(common_args)
+        .env("RUN_AS_ROOT", "0")
+        .args(["exec", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        exec_dev.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exec_dev.stderr)
+    );
+    let meta_dev3 = fs::metadata(&user_home).unwrap();
+    assert_eq!(
+        (meta_dev3.uid(), meta_dev3.gid()),
+        (1000, 1000),
+        "Exec must reconcile home back to dev (1000:1000) on identity drift"
+    );
+
+    // 6. Exec again with RUN_AS_ROOT=0 (no drift: already dev)
+    // Remove receipt first to prove it wasn't regenerated / actions were skipped
+    fs::remove_file(&receipt).unwrap();
+    let exec_dev_nodrift = Command::new(&binary)
+        .args(common_args)
+        .env("RUN_AS_ROOT", "0")
+        .args(["exec", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(
+        exec_dev_nodrift.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exec_dev_nodrift.stderr)
+    );
+    assert!(
+        !receipt.exists(),
+        "Exec with no drift must not run bootstrap actions or write receipt"
+    );
 }

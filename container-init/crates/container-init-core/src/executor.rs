@@ -303,6 +303,7 @@ impl PlanExecutor {
             warnings,
         };
         self.write_receipt(&report)?;
+        self.write_active_identity(&report.identity)?;
         Ok(report)
     }
 
@@ -339,13 +340,14 @@ impl PlanExecutor {
         Ok((identity, handoff, root_service_handoff))
     }
 
-    /// Transition privileges to the resolved identity and replace this process with
-    /// the configured handoff command, without executing any bootstrap actions or
-    /// acquiring the bootstrap lock.
-    pub fn exec_and_handoff(&self, command: &[String]) -> Result<(), CoreError> {
-        let (identity, handoff, root_service_handoff) = self.prepare_exec(command)?;
+    pub fn exec_prepared(
+        &self,
+        identity: &ResolvedIdentity,
+        handoff: HandoffCommand,
+        root_service_handoff: bool,
+    ) -> Result<(), CoreError> {
         if !root_service_handoff && identity.uid != 0 && !identity.run_as_root {
-            let posix = posix_identity(&identity);
+            let posix = posix_identity(identity);
             self.options
                 .posix
                 .drop_privileges(&posix)
@@ -354,8 +356,16 @@ impl PlanExecutor {
         if root_service_handoff {
             handoff.exec_as_root_service()
         } else {
-            handoff.exec_with_identity(Some(&identity))
+            handoff.exec_with_identity(Some(identity))
         }
+    }
+
+    /// Transition privileges to the resolved identity and replace this process with
+    /// the configured handoff command, without executing any bootstrap actions or
+    /// acquiring the bootstrap lock.
+    pub fn exec_and_handoff(&self, command: &[String]) -> Result<(), CoreError> {
+        let (identity, handoff, root_service_handoff) = self.prepare_exec(command)?;
+        self.exec_prepared(&identity, handoff, root_service_handoff)
     }
 
     fn validate_plan(&self, plan: &Plan) -> Result<(), CoreError> {
@@ -553,6 +563,75 @@ impl PlanExecutor {
         if let Some(path) = &self.options.receipt_path {
             receipt::write(path, report)?;
         }
+        Ok(())
+    }
+
+    pub fn runtime_dir(&self) -> PathBuf {
+        std::env::var_os("CONTAINER_INIT_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                #[cfg(unix)]
+                if self.options.posix.current_ids().0 == 0 {
+                    PathBuf::from("/run/container-init")
+                } else {
+                    Path::new(&self.config.workspace_root).join(".container-init")
+                }
+                #[cfg(not(unix))]
+                Path::new(&self.config.workspace_root).join(".container-init")
+            })
+    }
+
+    pub fn is_reconciled(&self, identity: &ResolvedIdentity) -> bool {
+        // 1. If active-identity marker file exists, check if it matches the current identity
+        let runtime_dir = self.runtime_dir();
+        let active_path = runtime_dir.join("active-identity");
+        if let Ok(content) = std::fs::read_to_string(&active_path) {
+            let trimmed = content.trim();
+            if let Some((uid_str, gid_str)) = trimmed.split_once(':') {
+                if let (Ok(uid), Ok(gid)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>()) {
+                    if uid != identity.uid || gid != identity.gid {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        // 2. If the bootstrap configuration contains IdentityEnsureHome, verify home directory ownership
+        let has_ensure_home = self
+            .config
+            .actions
+            .iter()
+            .any(|action| action.kind == ActionKind::IdentityEnsureHome);
+        if has_ensure_home {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                match std::fs::metadata(&identity.home) {
+                    Ok(meta) => {
+                        if meta.uid() != identity.uid || meta.gid() != identity.gid {
+                            return false;
+                        }
+                    }
+                    Err(_) => {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn write_active_identity(&self, identity: &ResolvedIdentity) -> Result<(), CoreError> {
+        let dir = self.runtime_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("active-identity");
+        let content = format!("{}:{}\n", identity.uid, identity.gid);
+        let _ = std::fs::write(&path, content);
         Ok(())
     }
 }

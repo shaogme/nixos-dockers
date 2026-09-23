@@ -4,7 +4,10 @@ use crate::doctor;
 use crate::error::CliError;
 use crate::lock;
 use crate::output;
-use container_init_core::{ExecutionOptions, IdentityResolver, PlanExecutor, SshCapability};
+use container_init_core::{
+    ExecutionOptions, IdentityResolver, PlanExecutor, ResolvedIdentity, RuntimeContext,
+    SshCapability,
+};
 use std::env;
 use std::path::PathBuf;
 
@@ -48,32 +51,8 @@ where
             let loaded = config::load(&cli.options)?;
             let context = config::runtime_context(&cli.options, true)?;
             let identity = IdentityResolver::new().resolve(loaded.config(), &context)?;
-            let lock_path = lock::path(&cli.options, loaded.profile(), context.cwd(), &identity);
-            lock::ensure_parent(&lock_path)?;
-            let mut execution_options = ExecutionOptions::default().with_lock_path(lock_path);
-            if loaded
-                .plan()
-                .actions()
-                .iter()
-                .any(|action| action.kind == bootstrap_model::ActionKind::ServiceSshPrepare)
-            {
-                let keygen = loaded
-                    .config()
-                    .actions
-                    .iter()
-                    .find(|action| action.kind == bootstrap_model::ActionKind::ServiceSshPrepare)
-                    .and_then(|action| action.ssh_keygen.clone())
-                    .unwrap_or_else(|| SshCapability::default().keygen().display().to_string());
-                execution_options = execution_options.with_ssh(SshCapability::new(keygen));
-            }
-            if let Some(path) = cli
-                .options
-                .receipt_path
-                .clone()
-                .or_else(|| env::var_os("CONTAINER_INIT_RECEIPT_PATH").map(PathBuf::from))
-            {
-                execution_options = execution_options.with_receipt_path(path);
-            }
+            let execution_options =
+                build_execution_options(&cli.options, &loaded, &context, &identity)?;
             PlanExecutor::new(loaded.config().clone(), context)
                 .with_options(execution_options)
                 .execute_and_handoff(loaded.plan(), &command)?;
@@ -82,10 +61,54 @@ where
         CliCommand::Exec { command } => {
             let loaded = config::load(&cli.options)?;
             let context = config::runtime_context(&cli.options, true)?;
-            PlanExecutor::new(loaded.config().clone(), context).exec_and_handoff(&command)?;
+            let executor = PlanExecutor::new(loaded.config().clone(), context.clone());
+            let (identity, handoff, root_service_handoff) = executor.prepare_exec(&command)?;
+            if executor.is_reconciled(&identity) {
+                executor.exec_prepared(&identity, handoff, root_service_handoff)?;
+            } else {
+                let execution_options =
+                    build_execution_options(&cli.options, &loaded, &context, &identity)?;
+                executor
+                    .with_options(execution_options)
+                    .execute_and_handoff(loaded.plan(), &command)?;
+            }
             Ok(())
         }
     }
+}
+
+fn build_execution_options(
+    options: &crate::args::CliOptions,
+    loaded: &crate::config::LoadedConfig,
+    context: &RuntimeContext,
+    identity: &ResolvedIdentity,
+) -> Result<ExecutionOptions, CliError> {
+    let lock_path = lock::path(options, loaded.profile(), context.cwd(), identity);
+    lock::ensure_parent(&lock_path)?;
+    let mut execution_options = ExecutionOptions::default().with_lock_path(lock_path);
+    if loaded
+        .plan()
+        .actions()
+        .iter()
+        .any(|action| action.kind == bootstrap_model::ActionKind::ServiceSshPrepare)
+    {
+        let keygen = loaded
+            .config()
+            .actions
+            .iter()
+            .find(|action| action.kind == bootstrap_model::ActionKind::ServiceSshPrepare)
+            .and_then(|action| action.ssh_keygen.clone())
+            .unwrap_or_else(|| SshCapability::default().keygen().display().to_string());
+        execution_options = execution_options.with_ssh(SshCapability::new(keygen));
+    }
+    if let Some(path) = options
+        .receipt_path
+        .clone()
+        .or_else(|| env::var_os("CONTAINER_INIT_RECEIPT_PATH").map(PathBuf::from))
+    {
+        execution_options = execution_options.with_receipt_path(path);
+    }
+    Ok(execution_options)
 }
 fn parse_error(error: ParseError) -> CliError {
     match error {

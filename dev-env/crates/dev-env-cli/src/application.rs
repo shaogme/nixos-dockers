@@ -7,7 +7,7 @@ use dev_env_model::ShellConfig;
 use dev_env_shell::{build_invocation, CommandLine, ConfiguredShellAdapter, ShellInvocation, Shim};
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn run<I>(arguments: I) -> Result<i32, CliError>
 where
@@ -121,8 +121,8 @@ const CONTAINER_INIT_ENV: &str = "DEVENV_CONTAINER_INIT";
 const BOOTSTRAP_REAL_SHELL_ENV: &str = "DEVENV_BOOTSTRAP_REAL_SHELL";
 
 struct BootstrapPaths {
-    container_init: std::path::PathBuf,
-    real_shell: std::path::PathBuf,
+    container_init: PathBuf,
+    real_shell: PathBuf,
 }
 
 impl BootstrapPaths {
@@ -137,12 +137,12 @@ impl BootstrapPaths {
             .ok_or(BootstrapError::MissingVariable {
                 variable: CONTAINER_INIT_ENV,
             })
-            .map(std::path::PathBuf::from)?;
+            .map(PathBuf::from)?;
         let real_shell = real_shell
             .ok_or(BootstrapError::MissingVariable {
                 variable: BOOTSTRAP_REAL_SHELL_ENV,
             })
-            .map(std::path::PathBuf::from)?;
+            .map(PathBuf::from)?;
 
         validate_bootstrap_executable(CONTAINER_INIT_ENV, &container_init)?;
         validate_bootstrap_executable(BOOTSTRAP_REAL_SHELL_ENV, &real_shell)?;
