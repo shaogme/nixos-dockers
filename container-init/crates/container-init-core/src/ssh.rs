@@ -277,7 +277,16 @@ fn install_key_pair(
     public: &Path,
     posix_system: &PosixSystem,
 ) -> Result<(), CoreError> {
-    if regular_file_state(action, private)? || regular_file_state(action, public)? {
+    let private_state = regular_file_state(action, private)?;
+    let public_state = regular_file_state(action, public)?;
+    if private_state || public_state {
+        if private_state && public_state {
+            let _ = fs::remove_file(temporary);
+            let _ = fs::remove_file(temporary_public);
+            reconcile_key_file(action, private, 0o600, posix_system)?;
+            reconcile_key_file(action, public, 0o644, posix_system)?;
+            return Ok(());
+        }
         return Err(CoreError::action(
             action,
             Some(private.to_path_buf()),

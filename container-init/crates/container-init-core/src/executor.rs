@@ -303,7 +303,6 @@ impl PlanExecutor {
             warnings,
         };
         self.write_receipt(&report)?;
-        self.write_active_identity(&report.identity)?;
         Ok(report)
     }
 
@@ -582,25 +581,6 @@ impl PlanExecutor {
     }
 
     pub fn is_reconciled(&self, identity: &ResolvedIdentity) -> bool {
-        // 1. If active-identity marker file exists, check if it matches the current identity
-        let runtime_dir = self.runtime_dir();
-        let active_path = runtime_dir.join("active-identity");
-        if let Ok(content) = std::fs::read_to_string(&active_path) {
-            let trimmed = content.trim();
-            if let Some((uid_str, gid_str)) = trimmed.split_once(':') {
-                if let (Ok(uid), Ok(gid)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>()) {
-                    if uid != identity.uid || gid != identity.gid {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-
-        // 2. If the bootstrap configuration contains IdentityEnsureHome, verify home directory ownership
         let has_ensure_home = self
             .config
             .actions
@@ -624,15 +604,6 @@ impl PlanExecutor {
         }
 
         true
-    }
-
-    fn write_active_identity(&self, identity: &ResolvedIdentity) -> Result<(), CoreError> {
-        let dir = self.runtime_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("active-identity");
-        let content = format!("{}:{}\n", identity.uid, identity.gid);
-        let _ = std::fs::write(&path, content);
-        Ok(())
     }
 }
 

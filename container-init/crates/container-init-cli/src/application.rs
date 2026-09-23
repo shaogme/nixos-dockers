@@ -4,10 +4,7 @@ use crate::doctor;
 use crate::error::CliError;
 use crate::lock;
 use crate::output;
-use container_init_core::{
-    ExecutionOptions, IdentityResolver, PlanExecutor, ResolvedIdentity, RuntimeContext,
-    SshCapability,
-};
+use container_init_core::{ExecutionOptions, PlanExecutor, RuntimeContext, SshCapability};
 use std::env;
 use std::path::PathBuf;
 
@@ -50,9 +47,7 @@ where
         CliCommand::Run { command } => {
             let loaded = config::load(&cli.options)?;
             let context = config::runtime_context(&cli.options, true)?;
-            let identity = IdentityResolver::new().resolve(loaded.config(), &context)?;
-            let execution_options =
-                build_execution_options(&cli.options, &loaded, &context, &identity)?;
+            let execution_options = build_execution_options(&cli.options, &loaded, &context)?;
             PlanExecutor::new(loaded.config().clone(), context)
                 .with_options(execution_options)
                 .execute_and_handoff(loaded.plan(), &command)?;
@@ -66,8 +61,7 @@ where
             if executor.is_reconciled(&identity) {
                 executor.exec_prepared(&identity, handoff, root_service_handoff)?;
             } else {
-                let execution_options =
-                    build_execution_options(&cli.options, &loaded, &context, &identity)?;
+                let execution_options = build_execution_options(&cli.options, &loaded, &context)?;
                 executor
                     .with_options(execution_options)
                     .execute_and_handoff(loaded.plan(), &command)?;
@@ -81,9 +75,8 @@ fn build_execution_options(
     options: &crate::args::CliOptions,
     loaded: &crate::config::LoadedConfig,
     context: &RuntimeContext,
-    identity: &ResolvedIdentity,
 ) -> Result<ExecutionOptions, CliError> {
-    let lock_path = lock::path(options, loaded.profile(), context.cwd(), identity);
+    let lock_path = lock::path(options, loaded.profile(), context.cwd());
     lock::ensure_parent(&lock_path)?;
     let mut execution_options = ExecutionOptions::default().with_lock_path(lock_path);
     if loaded

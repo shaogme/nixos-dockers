@@ -1,16 +1,11 @@
 use crate::args::CliOptions;
 use crate::error::CliError;
-use container_init_core::{PosixSystem, ResolvedIdentity};
+use container_init_core::PosixSystem;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn path(
-    options: &CliOptions,
-    profile: &str,
-    workspace: &Path,
-    identity: &ResolvedIdentity,
-) -> PathBuf {
+pub fn path(options: &CliOptions, profile: &str, workspace: &Path) -> PathBuf {
     if let Some(path) = &options.lock_path {
         return path.clone();
     }
@@ -32,10 +27,7 @@ pub fn path(
             workspace.join(".container-init")
         }
     };
-    base.join(format!(
-        "bootstrap-{}.lock",
-        stable_key(profile, workspace, identity)
-    ))
+    base.join(format!("bootstrap-{}.lock", stable_key(profile, workspace)))
 }
 
 pub fn ensure_parent(path: &Path) -> Result<(), CliError> {
@@ -51,16 +43,13 @@ pub fn ensure_parent(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn stable_key(profile: &str, workspace: &Path, identity: &ResolvedIdentity) -> String {
+fn stable_key(profile: &str, workspace: &Path) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     let canonical_workspace =
         fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     for part in [
         profile.as_bytes(),
         canonical_workspace.as_os_str().as_encoded_bytes(),
-        identity.user.as_bytes(),
-        identity.uid.to_string().as_bytes(),
-        identity.gid.to_string().as_bytes(),
     ] {
         for byte in part {
             hash ^= u64::from(*byte);
