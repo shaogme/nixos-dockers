@@ -81,26 +81,28 @@ services:
     environment:
       # 已确认 /workspace 为挂载点时自动探测属主；需要显式覆盖时传入真实宿主 ID：
       # - HOST_UID
-      - CONTAINER_HOME=${CONTAINER_HOME:-/home/user}
     ports:
       - "2222:22"
     volumes:
       - .:/workspace
-      - cargo-cache:${CONTAINER_HOME:-/home/user}/.cargo
+      - cargo:/data/cargo
     restart: unless-stopped
+
+volumes:
+  cargo:
 ```
 
 > [!TIP]
-> **统一用户家目录与自适应权限**：
-> 容器统一使用 `/home/user` 作为默认 `$HOME`（无论运行身份为 root 还是非 root 开发用户）。
-> 启动时容器引导层（`container-init`）会自动校准 `/home/user` 的所有权，确保当前运行身份始终拥有完全读写权限。
+> **分离用户家目录与自适应权限**：
+> 非 root 开发用户使用 `/home/dev`，root 使用 `/root` 作为 `$HOME`。
+> 启动时容器引导层（`container-init`）会根据目标身份校准对应家目录及其私有配置目录的所有权和权限。
 > 若需切换为 root 身份运行，只需在启动时传入环境变量：
 >
 > ```bash
 > RUN_AS_ROOT=1 docker compose up -d
 > ```
 >
-> 持久化卷统一挂载至 `/home/user/.xxx`，在 root 与非 root 用户间无缝共享，彻底消除身份切换导致的属主倒挂与缓存失效。
+> Codex、Claude、Gemini 和 OpenCode 配置在两个 HOME 下保持相同的共享链接；Rust Cargo registry 和 git checkout 统一持久化在 `/data/cargo`，并从两个 HOME 的 `.cargo` 目录链接过去。
 
 不要使用 `${HOST_UID:-1000:1000}` 作为通用默认值。`HOST_UID`/`HOST_GID` 按宿主
 namespace 映射，rootless 容器可能映射宿主 UID 1000 但未映射 GID 1000；未设置时让
@@ -130,7 +132,7 @@ workspace 挂载属主自动解析，需要覆盖时请传入 `$(id -u):$(id -g)
 1. `container-init` backend 加载镜像 profile snapshot，执行声明的 UID/GID、目录、软链接和 SSH action，然后按 handoff 配置交给 `dev-env`。
 2. `dev-env` 加载 `/etc/dev-env/profiles.d`，物化 mise、Devbox、Rust 和其他 provider 的环境，并以同一份环境启动命令、shell 或 SSH login shell。
 
-`HOST_UID=uid[:gid]`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT=1` 是声明式 runtime input。默认家目录统一为 `/home/user`，并在容器启动期由 `container-init` 自动校准所有权。`/bin/bash` 与 `/usr/bin/bash` 是兼容 shim；root 的 `docker exec ... bash` 会通过 backend `container-init exec` 请求身份 reconciliation，非 root 则直接物化环境，真实 Bash 位于 `/usr/local/libexec/dev-env/real/bash`。需要 root 身份时直接传入 `RUN_AS_ROOT=1`，无需额外调整 `$HOME`。镜像不再包含旧的 `/bin/entrypoint.sh`。
+`HOST_UID=uid[:gid]`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT=1` 是声明式 runtime input。未设置 `CONTAINER_HOME` 时，普通开发用户使用 `/home/dev`，root 使用 `/root`；`container-init` 会在启动期原生校准对应家目录的所有权和权限。`/bin/bash` 与 `/usr/bin/bash` 是兼容 shim；root 的 `docker exec ... bash` 会通过 backend `container-init exec` 请求身份 reconciliation，非 root 则直接物化环境，真实 Bash 位于 `/usr/local/libexec/dev-env/real/bash`。需要 root 身份时直接传入 `RUN_AS_ROOT=1`。镜像不再包含旧的 `/bin/entrypoint.sh`。
 
 ### 编写自定义 Dockerfile 示例
 

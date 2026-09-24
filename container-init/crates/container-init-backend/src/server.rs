@@ -918,7 +918,6 @@ fn prepare_exec(
         supplementary_groups(&report.identity)
             .map_err(|_| backend_error("identity", false, "supplementary groups unavailable"))?
             .into_iter()
-            .map(|group| group as u32)
             .collect()
     };
     let login_environment = BTreeMap::from([
@@ -1023,7 +1022,7 @@ fn accessible_cwd(path: &Path, peer: PeerCredentials) -> io::Result<PathBuf> {
     let path = fs::canonicalize(path)?;
     if !fs::metadata(&path)?.is_dir() {
         return Err(io::Error::new(
-            io::ErrorKind::NotADirectory,
+            io::ErrorKind::InvalidInput,
             "cwd is not a directory",
         ));
     }

@@ -328,7 +328,7 @@ fn executes_real_home_ownership_reconciliation_between_root_and_dev() {
     );
 
     let temp = TempDir::new().unwrap();
-    let user_home = temp.path().join("home/user");
+    let user_home = temp.path().join("home/dev");
 
     // 1. Bootstrap as dev (UID 1000, GID 1000)
     let mut resolve_dev = action("resolve", ActionKind::IdentityResolve);
@@ -351,7 +351,7 @@ fn executes_real_home_ownership_reconciliation_between_root_and_dev() {
     let report_dev = runner_dev.execute_plan(&plan_dev).unwrap();
     assert!(report_dev.succeeded());
 
-    // Verify /home/user is owned by dev (1000:1000)
+    // Verify /home/dev is owned by dev (1000:1000)
     let meta_dev = fs::metadata(&user_home).unwrap();
     assert_eq!(
         (meta_dev.uid(), meta_dev.gid()),
@@ -380,7 +380,7 @@ fn executes_real_home_ownership_reconciliation_between_root_and_dev() {
     let report_root = runner_root.execute_plan(&plan_root).unwrap();
     assert!(report_root.succeeded());
 
-    // Verify /home/user is now automatically reconciled and owned by root (0:0)
+    // Verify /home/dev is now automatically reconciled and owned by root (0:0)
     let meta_root = fs::metadata(&user_home).unwrap();
     assert_eq!(
         (meta_root.uid(), meta_root.gid()),

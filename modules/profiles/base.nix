@@ -51,6 +51,9 @@
       p7zip
       zstd
 
+      # Advanced Productivity Utilities
+      (perl.withPackages (p: with p; [ JSON ]))
+
       # Network, Git & System Diagnostics
       curl
       iproute2

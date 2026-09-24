@@ -207,7 +207,7 @@ profile 的 typed input 不是由 container-init 读取全部环境变量，而�
   "uid": 1000,
   "gid": 1000,
   "user": "dev",
-  "home": "/home/user",
+  "home": "/home/dev",
   "run_as_root": false,
   "uid_source": "profile_default",
   "gid_source": "profile_default",

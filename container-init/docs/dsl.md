@@ -52,7 +52,6 @@ shell_prefix = ["shell"]
 ```toml
 [bootstrap.identity]
 default_user = "dev"
-default_home = "/home/user"
 default_uid = 1000
 default_gid = 1000
 auto_mapping = true
@@ -67,7 +66,7 @@ home_input = "CONTAINER_HOME"
 | 字段 | 类型 | 作用 |
 | --- | --- | --- |
 | `default_user` | POSIX 用户名 | 没有更具体结果时使用的用户名；允许尚未存在，配合 `identity.map_user` 创建/映射 |
-| `default_home` | 绝对路径 | 默认家目录路径；未显式通过 `home_input` 覆盖时，无论 root 还是非 root 用户均使用该默认路径（缺省为 `/home/user`） |
+| `default_home` | 绝对路径 | 可选的统一默认家目录；未设置且未显式通过 `home_input` 覆盖时，root 使用 `/root`，普通用户优先使用 passwd 中的 home，否则使用 `/home/<user>` |
 | `default_uid` | `0..=u32::MAX` | 默认 UID |
 | `default_gid` | `0..=u32::MAX` | 默认 GID |
 | `auto_mapping` | 布尔值 | 无 UID 输入时是否优先探测已确认挂载的 workspace 属主；普通 rootfs 目录不参与 |

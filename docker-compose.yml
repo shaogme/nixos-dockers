@@ -4,7 +4,6 @@ x-app-base: &app-base
   environment:
     - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
     - HOST_UID # Set HOST_UID=host_uid[:host_gid] explicitly; otherwise infer the mounted workspace owner
-    - CONTAINER_HOME=${CONTAINER_HOME:-/home/user} # Unified container home path for root and non-root users
   security_opt:
     - seccomp:unconfined # Required for some low-level operations
   cap_add:
@@ -28,5 +27,6 @@ services:
       - coding-config:/data/coding-config
 
 volumes:
+  cargo:
   devbox-data:
   coding-config:

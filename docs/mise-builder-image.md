@@ -183,7 +183,8 @@ FROM ghcr.io/shaogme/nixos-dockers/mise-builder:${NIXOS_DOCKERS_VERSION} AS mise
 COPY .mise.toml /etc/mise/mise.toml
 COPY conf.d/ /etc/mise/conf.d/
 
-RUN --mount=type=secret,id=GITHUB_TOKEN,env=GITHUB_TOKEN,required=false \
+RUN --mount=type=secret,id=GITHUB_TOKEN,required=false \
+    if [ -f /run/secrets/GITHUB_TOKEN ]; then export GITHUB_TOKEN="$(cat /run/secrets/GITHUB_TOKEN)"; fi; \
     set -eu; \
     mise trust --all; \
     mise lock --global --platform linux-x64,linux-arm64; \

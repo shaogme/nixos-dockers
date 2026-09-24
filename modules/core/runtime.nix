@@ -119,7 +119,6 @@ let
     default_user = "dev"
     default_uid = 1000
     default_gid = 1000
-    default_home = "/home/user"
     auto_mapping = true
     run_as_root_input = "RUN_AS_ROOT"
     uid_input = "HOST_UID"

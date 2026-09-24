@@ -135,7 +135,7 @@ fn mapped_host_root_is_canonical_root_and_unmapped_ids_fail() {
     assert_eq!((identity.uid, identity.gid), (0, 0));
     assert_eq!(
         (identity.user, identity.home),
-        ("root".to_owned(), Path::new("/home/user").to_path_buf())
+        ("root".to_owned(), Path::new("/root").to_path_buf())
     );
 
     let error = IdentityResolver::with_posix(posix)
@@ -151,13 +151,22 @@ fn mapped_host_root_is_canonical_root_and_unmapped_ids_fail() {
 #[test]
 fn workspace_owner_is_used_only_when_mount_observation_is_explicitly_mounted() {
     let temp = TempDir::new().unwrap();
+    let passwd = temp.path().join("passwd");
+    let group = temp.path().join("group");
+    fs::write(
+        &passwd,
+        "root:x:0:0::/root:/bin/sh\ndev:x:1000:1000::/home/dev:/bin/sh\n",
+    )
+    .unwrap();
+    fs::write(&group, "root:x:0:\ndev:x:1000:\n").unwrap();
+    let resolver = IdentityResolver::with_posix(PosixSystem::with_account_files(&passwd, &group));
     let mut config = config(temp.path(), Vec::new());
     config.identity.default_user = Some("dev".to_owned());
     config.identity.default_uid = Some(1000);
     config.identity.default_gid = Some(1000);
     config.identity.auto_mapping = true;
 
-    let not_mounted = IdentityResolver::new()
+    let not_mounted = resolver
         .resolve(
             &config,
             &RuntimeContext::new(temp.path()).with_workspace_observation(
@@ -169,8 +178,9 @@ fn workspace_owner_is_used_only_when_mount_observation_is_explicitly_mounted() {
         .unwrap();
     assert_eq!((not_mounted.uid, not_mounted.gid), (1000, 1000));
     assert_eq!(not_mounted.uid_source, IdentitySource::ProfileDefault);
+    assert_eq!(not_mounted.home, Path::new("/home/dev"));
 
-    let mounted = IdentityResolver::new()
+    let mounted = IdentityResolver::with_posix(PosixSystem::with_account_files(&passwd, &group))
         .resolve(
             &config,
             &RuntimeContext::new(temp.path())
@@ -179,7 +189,7 @@ fn workspace_owner_is_used_only_when_mount_observation_is_explicitly_mounted() {
         .unwrap();
     assert_eq!((mounted.uid, mounted.gid), (0, 0));
     assert_eq!(mounted.user, "root");
-    assert_eq!(mounted.home, Path::new("/home/user"));
+    assert_eq!(mounted.home, Path::new("/root"));
     assert_eq!(mounted.uid_source, IdentitySource::WorkspaceMount);
 }
 
@@ -413,7 +423,7 @@ fn passwd_mapping_shell_update_and_receipt_are_auditable() {
         .unwrap();
     assert!(report.succeeded());
     let passwd_contents = fs::read_to_string(&passwd).unwrap();
-    assert!(passwd_contents.contains("fixture:x:2100:2101::/home/user:/usr/bin/test-shell"));
+    assert!(passwd_contents.contains("fixture:x:2100:2101::/home/fixture:/usr/bin/test-shell"));
     assert!(fs::read_to_string(&group)
         .unwrap()
         .contains("fixture:x:2101:"));

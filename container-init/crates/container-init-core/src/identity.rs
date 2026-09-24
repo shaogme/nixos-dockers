@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const DEFAULT_CONTAINER_HOME: &str = "/home/user";
+pub const DEFAULT_ROOT_HOME: &str = "/root";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,15 +150,12 @@ impl IdentityResolver {
         )?
         .unwrap_or(false);
 
-        let default_home = config
-            .identity
-            .default_home
-            .as_deref()
-            .unwrap_or(DEFAULT_CONTAINER_HOME);
+        let configured_home = config.identity.default_home.as_deref();
 
         if run_as_root {
             let home = input_home(config, &inputs, config.identity.home_input.as_deref())?
-                .unwrap_or_else(|| PathBuf::from(default_home));
+                .or_else(|| configured_home.map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT_HOME));
             return Ok(ResolvedIdentity {
                 uid: 0,
                 gid: 0,
@@ -301,7 +298,7 @@ impl IdentityResolver {
         };
 
         if uid != 0 {
-            if let Some(owner) = uid_user {
+            if let Some(owner) = uid_user.as_ref() {
                 if owner.name != user {
                     return Err(CoreError::Identity {
                         message: format!(
@@ -314,7 +311,19 @@ impl IdentityResolver {
         }
 
         let home = input_home(config, &inputs, config.identity.home_input.as_deref())?
-            .unwrap_or_else(|| PathBuf::from(default_home));
+            .or_else(|| configured_home.map(PathBuf::from))
+            .or_else(|| {
+                if uid == 0 {
+                    Some(PathBuf::from(DEFAULT_ROOT_HOME))
+                } else {
+                    named_user
+                        .as_ref()
+                        .map(|candidate| candidate.home.clone())
+                        .or_else(|| uid_user.as_ref().map(|candidate| candidate.home.clone()))
+                        .or_else(|| Some(PathBuf::from(format!("/home/{user}"))))
+                }
+            })
+            .expect("identity home fallback always produces a path");
 
         if !home.is_absolute() {
             return Err(CoreError::Identity {
