@@ -149,20 +149,45 @@ pub(crate) fn init_v2(
         .map_err(|source| CoreError::io(Some(action_id), Some(controllers_file.clone()), source))?;
     let available: BTreeSet<&str> = raw_controllers.split_whitespace().collect();
 
-    let target_controllers: Vec<String> = if let Some(configured) = &action.controllers {
+    // `controllers` is the required set. Keep the old default (all visible
+    // controllers required) when neither required nor optional sets are
+    // configured. Once optional controllers are configured, an omitted
+    // required set means that no controller is mandatory.
+    let required_controllers: Vec<String> = match &action.controllers {
+        Some(configured) => {
+            for controller in configured {
+                if !available.contains(controller.as_str()) {
+                    return Err(CoreError::action(
+                        action_id,
+                        Some(controllers_file.clone()),
+                        format!(
+                            "required controller {controller:?} is not available in cgroup.controllers"
+                        ),
+                    ));
+                }
+            }
+            configured.clone()
+        }
+        None if action.optional_controllers.is_some() => Vec::new(),
+        None => available.iter().map(|s| s.to_string()).collect(),
+    };
+
+    let mut skipped_controllers = Vec::new();
+    let mut target_controllers: Vec<(String, bool)> = required_controllers
+        .into_iter()
+        .map(|controller| (controller, true))
+        .collect();
+    if let Some(configured) = &action.optional_controllers {
         for controller in configured {
-            if !available.contains(controller.as_str()) {
-                return Err(CoreError::action(
-                    action_id,
-                    Some(controllers_file),
-                    format!("requested controller {controller:?} is not available in cgroup.controllers"),
+            if available.contains(controller.as_str()) {
+                target_controllers.push((controller.clone(), false));
+            } else {
+                skipped_controllers.push(format!(
+                    "{controller} (not available in cgroup.controllers)"
                 ));
             }
         }
-        configured.clone()
-    } else {
-        available.iter().map(|s| s.to_string()).collect()
-    };
+    }
 
     // 3. Read currently enabled controllers in cgroup.subtree_control
     let subtree_control_file = working_root.join("cgroup.subtree_control");
@@ -183,7 +208,7 @@ pub(crate) fn init_v2(
             !is_bind_mount
                 && target_controllers
                     .iter()
-                    .any(|controller| !currently_enabled.contains(controller))
+                    .any(|(controller, _)| !currently_enabled.contains(controller))
                 && fs::read_to_string(&root_procs_file)
                     .ok()
                     .is_some_and(|procs| procs.lines().any(|line| line.trim() == pid.to_string()))
@@ -195,7 +220,7 @@ pub(crate) fn init_v2(
         })?;
 
     let mut enabled_controllers = Vec::new();
-    for controller in &target_controllers {
+    for (controller, required) in &target_controllers {
         if !currently_enabled.contains(controller) {
             let cmd = format!("+{controller} ");
             let mut write_result = OpenOptions::new()
@@ -209,16 +234,20 @@ pub(crate) fn init_v2(
                     if preserve_pid.is_some() && is_bind_mount {
                         // A freshly mounted shadow hierarchy may not contain
                         // the backend process, so moving it there would fail
-                        // with EINVAL. Reporting success here would claim that
-                        // delegation happened when the controller is still
-                        // disabled; backend startup must fail closed instead.
-                        return Err(CoreError::action(
-                            action_id,
-                            Some(subtree_control_file.clone()),
-                            format!(
-                                "cannot enable cgroup controller {controller:?} while preserving the backend supervisor in bind-mount mode"
-                            ),
-                        ));
+                        // with EINVAL. Required controllers must fail closed;
+                        // optional controllers can be recorded and skipped.
+                        if *required {
+                            return Err(CoreError::action(
+                                action_id,
+                                Some(subtree_control_file.clone()),
+                                format!(
+                                    "cannot enable required cgroup controller {controller:?} while preserving the backend supervisor in bind-mount mode"
+                                ),
+                            ));
+                        }
+                        skipped_controllers
+                            .push(format!("{controller} (busy in bind-mount hierarchy)"));
+                        continue;
                     }
                     if let Ok(procs_content) = fs::read_to_string(&root_procs_file) {
                         for line in procs_content.lines() {
@@ -239,11 +268,15 @@ pub(crate) fn init_v2(
             }
 
             if let Err(source) = write_result {
-                return Err(CoreError::io(
-                    Some(action_id),
-                    Some(subtree_control_file),
-                    source,
-                ));
+                if *required {
+                    return Err(CoreError::io(
+                        Some(action_id),
+                        Some(subtree_control_file.clone()),
+                        source,
+                    ));
+                }
+                skipped_controllers.push(format!("{controller} ({source})"));
+                continue;
             }
             enabled_controllers.push(controller.clone());
         }
@@ -273,7 +306,11 @@ pub(crate) fn init_v2(
         })?;
     }
 
-    let message = if !enabled_controllers.is_empty() {
+    let target_names = target_controllers
+        .iter()
+        .map(|(controller, _)| controller.as_str())
+        .collect::<Vec<_>>();
+    let mut message = if !enabled_controllers.is_empty() {
         if is_bind_mount {
             format!(
                 "delegated cgroup v2 controllers ({}) to subtree_control; moved {moved_pids} procs to {subgroup_name}; shadowed to {}",
@@ -290,16 +327,23 @@ pub(crate) fn init_v2(
         if is_bind_mount {
             format!(
                 "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}; shadowed to {}",
-                target_controllers.join(" "),
+                target_names.join(" "),
                 target_root.display()
             )
         } else {
             format!(
                 "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}",
-                target_controllers.join(" ")
+                target_names.join(" ")
             )
         }
     };
+
+    if !skipped_controllers.is_empty() {
+        message.push_str(&format!(
+            "; skipped optional controllers: {}",
+            skipped_controllers.join(", ")
+        ));
+    }
 
     Ok(ActionChange::new(message))
 }

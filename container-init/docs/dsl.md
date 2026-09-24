@@ -243,7 +243,7 @@ DSL 中使用 dotted 名称，例如 `filesystem.ensure_dir`；下面的“必�
 | `process.set_user_shell` | `user`、`shell` | 更新 passwd 的 login shell 字段 | 仅 trusted image/admin 来源；目标用户必须存在 |
 | `process.drop_privileges` | 无 | `initgroups`/`setgroups` 后执行 `setgid`、`setuid` | 必须 root；最多一个；计划阶段为 handoff |
 | `service.ssh.prepare` | host key、authorized key、runtime 三个目录 | 创建 SSH 目录、生成/校验 host key、可选写入 authorized keys | 必须 root、trusted 来源；需启用 SSH capability |
-| `cgroup.v2_init` | 无（path/subgroup/controllers/mount_mode 均有默认值） | 校验并初始化 cgroup v2、根进程迁移与控制器委托；支持默认就地模式与只读环境下的挂载覆挂重定向 | 必须 root、仅 trusted 来源；计划阶段为 Root |
+| `cgroup.v2_init` | 无（path/subgroup/required_controllers/optional_controllers/mount_mode 均有默认值） | 校验并初始化 cgroup v2、根进程迁移与控制器委托；支持必需和尽力而为控制器，以及默认就地与挂载覆挂模式 | 必须 root、仅 trusted 来源；计划阶段为 Root |
 | `handoff.exec` | 无 | 将最终命令包装成 handoff runtime 命令 | 仅 trusted 来源；最多一个；非幂等、必须位于 handoff 阶段 |
 
 ### 6.1 文件 action 示例
@@ -372,7 +372,8 @@ path = "/sys/fs/cgroup"
 mount_mode = "default" # "default"（默认就地初始化）或 "bind_mount"（挂载覆挂重定向）
 shadow_path = "/run/cgroup" # 仅在 mount_mode = "bind_mount" 时使用，默认 /run/cgroup
 subgroup = "init"
-controllers = ["cpu", "io", "memory", "pids"]
+required_controllers = ["cpu", "pids"]
+optional_controllers = ["io", "memory"] # 委托失败时跳过
 owner = "root"
 run_as = "root"
 ```
@@ -384,7 +385,8 @@ run_as = "root"
 - `shadow_path`：可选。挂载覆挂重定向模式下的独立可写暂存路径，默认 `"/run/cgroup"`。
 - `path`：可选。目标 cgroup 根路径，默认 `"/sys/fs/cgroup"`。
 - `subgroup`：可选。用于移入容器根进程的子组目录名称，默认 `"init"`（对应 `<path>/init`）。
-- `controllers`：可选。要启用到 `cgroup.subtree_control` 的控制器列表。未指定时自动读取目标 cgroup2 层级中 `cgroup.controllers` 的所有可用控制器进行全量委托。若指定控制器不可用，校验会直接报错失败。
+- `required_controllers`：可选。必需启用到 `cgroup.subtree_control` 的控制器列表。指定的控制器不可用或委托失败时，action 失败。`controllers` 和 `cgroup_controllers` 是兼容别名。未指定且同时未指定 `optional_controllers` 时，保持兼容行为：自动读取目标 cgroup2 层级中 `cgroup.controllers` 的所有可用控制器并全部作为必需控制器。
+- `optional_controllers`：可选。尽力而为启用的控制器列表。控制器不可见，或内核拒绝委托（例如私有 cgroup namespace 中常见的 `EOPNOTSUPP`、`EPERM`）时跳过该控制器，action 仍成功，并在结果消息中列出原因。若只配置此字段而省略 `required_controllers`，则没有必需控制器。
 - `owner`：可选。子组目录的属主（例如 `"identity.target"`）。
 - `run_as`：必须为 `"root"`，且仅能来自受信任 profile。
 
@@ -394,7 +396,7 @@ run_as = "root"
    - 若 `mount_mode = "bind_mount"`：基准工作目录为 `shadow_path`（默认 `/run/cgroup`）。若尚未挂载，则在当前私有命名空间（User + Mount + Cgroup Namespace）中挂载 `cgroup2` 文件系统至 `shadow_path`。
 2. **创建子组**：在基准工作目录下创建子组 `<work_dir>/<subgroup>`（默认 `<work_dir>/init`）。
 3. **排空进程**：读取 `<work_dir>/cgroup.procs`，将所有既有进程迁移至 `<work_dir>/<subgroup>/cgroup.procs`，清空根层级的进程占用以满足 cgroup v2 规范。
-4. **委托控制器**：读取已在 `cgroup.subtree_control` 启用的控制器，通过追加写入 `+<controller>` 启用目标控制器（支持 EBUSY 自动重试排空，幂等执行）。
+4. **委托控制器**：读取已在 `cgroup.subtree_control` 启用的控制器，通过追加写入 `+<controller>` 启用目标控制器（支持 EBUSY 自动重试排空，幂等执行）。`required_controllers` 中的控制器委托失败会终止 action；`optional_controllers` 中的控制器委托失败会跳过并记录结果消息。
 5. **属主对齐**：若配置了 `owner`，对子组目录执行属主对齐。
 6. **覆挂重定向**（仅 `mount_mode = "bind_mount"`）：通过 `mount --bind <shadow_path> <path>` 将初始化好的可写 cgroup2 树覆盖挂载至目标 `path`（默认 `/sys/fs/cgroup`），原只读挂载点被新层级覆盖，使下游程序（如 `crun`/`podman`）能够透明读写标准路径。
 

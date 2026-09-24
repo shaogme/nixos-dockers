@@ -452,7 +452,8 @@ extends = ["base"]
 id = "cgroup-init"
 kind = "cgroup.v2_init"
 subgroup = "init"
-controllers = ["cpu", "memory"]
+required_controllers = ["cpu", "memory"]
+optional_controllers = ["io"]
 run_as = "root"
 "#,
         )
@@ -469,5 +470,9 @@ run_as = "root"
     assert_eq!(
         cg_action.controllers.as_deref(),
         Some(&["cpu".to_string(), "memory".to_string()][..])
+    );
+    assert_eq!(
+        cg_action.optional_controllers.as_deref(),
+        Some(&["io".to_string()][..])
     );
 }

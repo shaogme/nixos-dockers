@@ -16,7 +16,7 @@ use bootstrap_model::{
 };
 use container_init_posix::{ActionChange, PosixIdentity, PosixSystem};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -544,10 +544,14 @@ impl PlanExecutor {
                         .transpose()?
                         .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"))
                 };
-                keys.push(ResourceKey::cgroup(
-                    hierarchy,
-                    action.controllers.clone().unwrap_or_default(),
-                ));
+                let controllers = action
+                    .controllers
+                    .iter()
+                    .flatten()
+                    .chain(action.optional_controllers.iter().flatten())
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                keys.push(ResourceKey::cgroup(hierarchy, controllers));
                 keys.push(ResourceKey::ProcessNamespace(
                     ProcessNamespace::UserAndMount,
                 ));

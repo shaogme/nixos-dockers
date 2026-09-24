@@ -70,6 +70,7 @@ pub enum PlanEffect {
         shadow_path: Option<String>,
         subgroup: Option<String>,
         controllers: Option<Vec<String>>,
+        optional_controllers: Option<Vec<String>>,
     },
     HandoffExec,
 }
@@ -141,6 +142,7 @@ impl PlanEffect {
                 shadow_path: action.shadow_path.clone(),
                 subgroup: action.subgroup.clone(),
                 controllers: action.controllers.clone(),
+                optional_controllers: action.optional_controllers.clone(),
             },
             ActionKind::HandoffExec => Self::HandoffExec,
         }

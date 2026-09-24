@@ -383,6 +383,7 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
     cg.path = Some("/sys/fs/cgroup".to_owned());
     cg.subgroup = Some("init".to_owned());
     cg.controllers = Some(vec!["cpu".to_owned(), "memory".to_owned()]);
+    cg.optional_controllers = Some(vec!["io".to_owned()]);
 
     let plan = config(vec![cg])
         .build_plan()
@@ -397,6 +398,7 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
             shadow_path: None,
             subgroup: Some("init".to_owned()),
             controllers: Some(vec!["cpu".to_owned(), "memory".to_owned()]),
+            optional_controllers: Some(vec!["io".to_owned()]),
         }
     );
 
@@ -416,6 +418,7 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
             shadow_path: Some("/run/cgroup".to_owned()),
             subgroup: None,
             controllers: None,
+            optional_controllers: None,
         }
     );
 
@@ -452,5 +455,15 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
     assert!(matches!(
         config(vec![cg_empty_controllers]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("controllers")
+    ));
+
+    // Required and optional sets must not overlap.
+    let mut cg_duplicate_controllers = action("cg", ActionKind::CgroupV2Init);
+    cg_duplicate_controllers.run_as = RunAs::Root;
+    cg_duplicate_controllers.controllers = Some(vec!["cpu".to_owned()]);
+    cg_duplicate_controllers.optional_controllers = Some(vec!["cpu".to_owned()]);
+    assert!(matches!(
+        config(vec![cg_duplicate_controllers]).build_plan(),
+        Err(ModelError::Invalid { message, .. }) if message.contains("duplicate controller")
     ));
 }

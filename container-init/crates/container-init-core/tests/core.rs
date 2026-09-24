@@ -8,6 +8,7 @@ use container_init_core::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -770,6 +771,66 @@ fn cgroup_v2_init_fails_on_unavailable_controller_or_missing_cgroup() {
     let plan2 = cfg2.build_plan().unwrap();
     let err2 = executor(cfg2).execute_plan(&plan2).unwrap_err();
     assert!(err2.to_string().contains("not available"));
+}
+
+#[test]
+fn cgroup_v2_init_skips_unavailable_optional_controllers() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let cgroup_dir = temp.path().join("cgroup");
+    fs::create_dir_all(&cgroup_dir).unwrap();
+    fs::write(cgroup_dir.join("cgroup.controllers"), "cpu pids\n").unwrap();
+    fs::write(cgroup_dir.join("cgroup.procs"), "1001\n").unwrap();
+    fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
+
+    let mut action = root_action("cg", ActionKind::CgroupV2Init);
+    action.path = Some(cgroup_dir.display().to_string());
+    action.controllers = Some(vec!["cpu".to_owned()]);
+    action.optional_controllers = Some(vec!["io".to_owned(), "memory".to_owned()]);
+    let config = config(temp.path(), vec![action]);
+    let plan = config.build_plan().unwrap();
+    let report = executor(config).execute_plan(&plan).unwrap();
+    assert!(report.succeeded());
+    assert!(report
+        .outcome("cg")
+        .unwrap()
+        .message
+        .contains("skipped optional controllers: io (not available in cgroup.controllers), memory (not available in cgroup.controllers)"));
+    let subtree = fs::read_to_string(cgroup_dir.join("cgroup.subtree_control")).unwrap();
+    assert!(subtree.contains("+cpu"));
+    assert!(!subtree.contains("+io"));
+}
+
+#[test]
+fn cgroup_v2_init_skips_optional_controller_write_errors() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let cgroup_dir = temp.path().join("cgroup");
+    fs::create_dir_all(&cgroup_dir).unwrap();
+    fs::write(cgroup_dir.join("cgroup.controllers"), "memory\n").unwrap();
+    fs::write(cgroup_dir.join("cgroup.procs"), "1001\n").unwrap();
+    // A finite, read-only proc file gives the write path a deterministic
+    // error without making the initial subtree_control read block forever.
+    symlink("/proc/uptime", cgroup_dir.join("cgroup.subtree_control")).unwrap();
+
+    let mut action = root_action("cg", ActionKind::CgroupV2Init);
+    action.path = Some(cgroup_dir.display().to_string());
+    action.optional_controllers = Some(vec!["memory".to_owned()]);
+    let config = config(temp.path(), vec![action]);
+    let plan = config.build_plan().unwrap();
+    let report = executor(config).execute_plan(&plan).unwrap();
+    assert!(report.succeeded());
+    assert!(report
+        .outcome("cg")
+        .unwrap()
+        .message
+        .contains("skipped optional controllers: memory"));
 }
 
 #[test]

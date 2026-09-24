@@ -130,8 +130,14 @@ pub struct Action {
     pub ssh_keygen: Option<String>,
     #[serde(alias = "cgroup_subgroup", alias = "init_subgroup")]
     pub subgroup: Option<String>,
-    #[serde(alias = "cgroup_controllers")]
+    #[serde(
+        alias = "cgroup_controllers",
+        alias = "required_controllers",
+        alias = "cgroup_required_controllers"
+    )]
     pub controllers: Option<Vec<String>>,
+    #[serde(alias = "cgroup_optional_controllers")]
+    pub optional_controllers: Option<Vec<String>>,
     #[serde(alias = "cgroup_mount_mode")]
     pub mount_mode: Option<String>,
     #[serde(alias = "cgroup_shadow_path")]
@@ -179,6 +185,7 @@ impl Action {
             ssh_keygen: None,
             subgroup: None,
             controllers: None,
+            optional_controllers: None,
             mount_mode: None,
             shadow_path: None,
             when: None,
@@ -512,10 +519,17 @@ impl Action {
                         });
                     }
                 }
-                if let Some(controllers) = &self.controllers {
+                let mut seen = std::collections::BTreeSet::new();
+                for (field, controllers) in [
+                    ("controllers", self.controllers.as_ref()),
+                    ("optional_controllers", self.optional_controllers.as_ref()),
+                ] {
+                    let Some(controllers) = controllers else {
+                        continue;
+                    };
                     if controllers.is_empty() {
                         return Err(ModelError::Invalid {
-                            location: format!("bootstrap.actions.{}.controllers", self.id),
+                            location: format!("bootstrap.actions.{}.{}", self.id, field),
                             message: "controllers list may not be empty if specified".to_owned(),
                         });
                     }
@@ -525,8 +539,14 @@ impl Action {
                             || controller.contains('\0')
                         {
                             return Err(ModelError::Invalid {
-                                location: format!("bootstrap.actions.{}.controllers", self.id),
+                                location: format!("bootstrap.actions.{}.{}", self.id, field),
                                 message: format!("invalid controller name {controller:?}"),
+                            });
+                        }
+                        if !seen.insert(controller) {
+                            return Err(ModelError::Invalid {
+                                location: format!("bootstrap.actions.{}.{}", self.id, field),
+                                message: format!("duplicate controller name {controller:?}"),
                             });
                         }
                     }
