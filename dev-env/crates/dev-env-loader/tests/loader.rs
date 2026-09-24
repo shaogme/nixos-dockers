@@ -403,7 +403,6 @@ id = "rust"
 extends = ["base"]
 
 [config.environment.variables]
-CARGO_INCREMENTAL = "0"
 CARGO_TARGET_DIR = "/data/.cargo/target"
 SCCACHE_DIR = "/data/cache/sccache"
 
@@ -411,12 +410,16 @@ SCCACHE_DIR = "/data/cache/sccache"
 value = "sccache"
 when = "features.sccache.enabled && !features.sccache.disabled"
 
+[config.environment.conditional_variables.CARGO_INCREMENTAL]
+value = "0"
+when = "!features.sccache.enabled || features.sccache.disabled"
+
 [config.features.sccache]
 enabled = true
 disabled = false
 
 [inputs.CARGO_INCREMENTAL]
-target = "environment.variables.CARGO_INCREMENTAL"
+target = "environment.conditional_variables.CARGO_INCREMENTAL.value"
 type = "enum"
 values = ["0", "1"]
 runtime = true
@@ -457,7 +460,7 @@ runtime = true
         )
         .unwrap();
     assert_eq!(
-        loaded.config().environment.variables["CARGO_INCREMENTAL"],
+        loaded.config().environment.conditional_variables["CARGO_INCREMENTAL"].value,
         "1"
     );
     assert_eq!(

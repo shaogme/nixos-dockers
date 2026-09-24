@@ -217,7 +217,8 @@ ENTRYPOINT ["/usr/bin/container-init", "run", "--"]
 Compose 传入的 `CARGO_INCREMENTAL`、`CARGO_TARGET_DIR`、`SCCACHE_DIR`、
 `SCCACHE_DISABLE` 和 `ENABLE_SCCACHE` 会随 handoff 保留，并由 Rust profile
 声明的 runtime inputs 解析。`SCCACHE_DISABLE=1` 或 `ENABLE_SCCACHE=0` 时，
-`RUSTC_WRAPPER` 不会出现在最终交给 Cargo 的环境中。
+`RUSTC_WRAPPER` 不会出现在最终交给 Cargo 的环境中；sccache 启用时，
+`CARGO_INCREMENTAL` 也会被 profile 条件变量移除，以免 sccache 看到增量编译标志。
 
 ### `docker exec`
 

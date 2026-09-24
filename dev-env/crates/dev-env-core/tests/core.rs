@@ -386,6 +386,13 @@ fn conditional_environment_variables_set_and_remove_sccache_wrapper() {
             when: "features.sccache.enabled && !features.sccache.disabled".to_owned(),
         },
     );
+    config.environment.conditional_variables.insert(
+        "CARGO_INCREMENTAL".to_owned(),
+        ConditionalEnvironmentVariable {
+            value: "0".to_owned(),
+            when: "!features.sccache.enabled || features.sccache.disabled".to_owned(),
+        },
+    );
     config.provenance.insert(
         "environment.conditional_variables.RUSTC_WRAPPER",
         Origin::profile("rust"),
@@ -403,10 +410,14 @@ fn conditional_environment_variables_set_and_remove_sccache_wrapper() {
     enabled_context
         .process_environment
         .insert("RUSTC_WRAPPER".to_owned(), "ambient-wrapper".to_owned());
+    enabled_context
+        .process_environment
+        .insert("CARGO_INCREMENTAL".to_owned(), "1".to_owned());
     let output = Materializer::new(config.clone())
         .materialize(&enabled_context)
         .unwrap();
     assert_eq!(output.environment.values["RUSTC_WRAPPER"].value, "sccache");
+    assert!(!output.environment.values.contains_key("CARGO_INCREMENTAL"));
     assert_eq!(
         output.environment.values["RUSTC_WRAPPER"].origin,
         Some(Origin::profile("rust"))
@@ -423,4 +434,5 @@ fn conditional_environment_variables_set_and_remove_sccache_wrapper() {
         .materialize(&enabled_context)
         .unwrap();
     assert!(!output.environment.values.contains_key("RUSTC_WRAPPER"));
+    assert_eq!(output.environment.values["CARGO_INCREMENTAL"].value, "0");
 }

@@ -75,7 +75,8 @@ Rust 镜像使用这一机制配置 Cargo 和 sccache：
 
 `SCCACHE_DISABLE=1` 或兼容变量 `ENABLE_SCCACHE=0` 会关闭 sccache，并从
 最终 `MaterializedEnv` 删除 `RUSTC_WRAPPER`；关闭信号不会只依赖 sccache
-自身解释。具体 DSL 和优先级见 [Environment DSL 参考](docs/dsl.md) 与
+自身解释。sccache 启用时，Rust profile 同样会从最终环境删除
+`CARGO_INCREMENTAL`；关闭 sccache 后才会应用其默认值或 Compose 覆盖值。具体 DSL 和优先级见 [Environment DSL 参考](docs/dsl.md) 与
 [运行时与 CLI](docs/runtime.md)。
 
 ## 快速开始
