@@ -9,6 +9,8 @@ let
     name = config.docker.name;
     tag = config.docker.tag;
     includeNixDB = true;
+    # Keep derived Docker images below overlayfs' lower-directory limit.
+    maxLayers = 64;
     contents = lib.unique (
       config.environment.systemPackages
       ++ config.environment.runtimeLibraries
