@@ -139,10 +139,16 @@ impl ShellEnvEntry {
         if statement.is_empty() {
             return Ok(None);
         }
+        // Devbox emits this harmless cache refresh after its assignments. It
+        // changes shell state but does not contribute an environment delta.
+        if statement == "hash -r" {
+            return Ok(None);
+        }
         if let Some(name) = statement.strip_prefix("unset ") {
+            let name = name.strip_suffix(';').unwrap_or(name);
             if name.is_empty()
                 || name.chars().any(char::is_whitespace)
-                || !crate::validation::is_env_name(name)
+                || !crate::validation::is_posix_env_name(name)
             {
                 return Err(ShellEnvParseError::InvalidName {
                     name: name.to_owned(),
@@ -159,7 +165,7 @@ impl ShellEnvEntry {
         if name.is_empty() {
             return Err(ShellEnvParseError::EmptyAssignment);
         }
-        if !crate::validation::is_env_name(name) {
+        if !crate::validation::is_posix_env_name(name) {
             return Err(ShellEnvParseError::InvalidName {
                 name: name.to_owned(),
             });
@@ -171,11 +177,59 @@ impl ShellEnvEntry {
     }
 
     pub fn parse(output: &str) -> Result<Vec<Self>, ShellEnvParseError> {
-        output
-            .split('\n')
-            .map(Self::parse_line)
-            .filter_map(|result| result.transpose())
-            .collect()
+        let mut entries = Vec::new();
+        let mut statement = String::new();
+        let mut quote = None;
+
+        for line in output.split('\n') {
+            if !statement.is_empty() {
+                statement.push('\n');
+            }
+            statement.push_str(line);
+            update_quote_state(line, &mut quote);
+            if quote.is_some() {
+                continue;
+            }
+            if let Some(entry) = Self::parse_line(&statement)? {
+                entries.push(entry);
+            }
+            statement.clear();
+        }
+
+        if !statement.is_empty() {
+            if let Some(entry) = Self::parse_line(&statement)? {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+}
+
+fn update_quote_state(text: &str, quote: &mut Option<char>) {
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        match *quote {
+            Some('\'') => {
+                if character == '\'' {
+                    *quote = None;
+                }
+            }
+            Some('"') => {
+                if character == '\\' {
+                    characters.next();
+                } else if character == '"' {
+                    *quote = None;
+                }
+            }
+            None => match character {
+                '\'' | '"' => *quote = Some(character),
+                '\\' => {
+                    characters.next();
+                }
+                _ => {}
+            },
+            Some(_) => unreachable!("only single and double quotes can be opened"),
+        }
     }
 }
 
@@ -223,6 +277,7 @@ fn parse_value(raw: &str) -> Result<String, ShellEnvParseError> {
                     output.push(escaped);
                 }
                 '$' if chars.peek() == Some(&'(') => return Err(ShellEnvParseError::ShellSyntax),
+                ';' if chars.peek().is_none() => break,
                 '`' | ';' | '|' | '&' | '>' | '<' => return Err(ShellEnvParseError::ShellSyntax),
                 character if character.is_whitespace() => {
                     return Err(ShellEnvParseError::ShellSyntax)

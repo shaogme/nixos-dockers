@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::provenance::Origin;
-use crate::validation::validate_env_name;
+use crate::validation::is_posix_env_name;
 use crate::{ModelError, Sensitivity};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,7 +26,12 @@ impl EnvValue {
     }
 
     pub fn validate(&self, name: &str) -> Result<(), ModelError> {
-        validate_env_name(&format!("environment.variables.{name}"), name)?;
+        if !is_posix_env_name(name) {
+            return Err(ModelError::InvalidEnvironmentName {
+                location: format!("environment.variables.{name}"),
+                name: name.to_owned(),
+            });
+        }
         if self.value.contains('\0') {
             return Err(ModelError::InvalidEnvironmentValue {
                 location: format!("environment.variables.{name}"),

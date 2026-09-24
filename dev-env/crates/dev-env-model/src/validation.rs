@@ -10,6 +10,14 @@ pub(crate) fn is_env_name(value: &str) -> bool {
     })
 }
 
+pub(crate) fn is_posix_env_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(
+        characters.next(),
+        Some(character) if character.is_ascii_alphabetic() || character == '_'
+    ) && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 pub(crate) fn validate_env_name(location: &str, value: &str) -> Result<(), ModelError> {
     if !is_env_name(value) || value.contains('=') || value.contains('\0') {
         return Err(ModelError::InvalidEnvironmentName {

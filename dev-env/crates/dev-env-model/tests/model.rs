@@ -349,6 +349,29 @@ fn restricted_condition_and_shellenv_parsers_never_execute_shell_syntax() {
             },
         ]
     );
+    assert_eq!(
+        ShellEnvEntry::parse(
+            "export AR=\"ar\";\nDEVBOX_NIX_ENV_PATH_abcdef='/opt/bin';\nhash -r\n",
+        )
+        .unwrap(),
+        vec![
+            ShellEnvEntry::Set {
+                name: "AR".to_owned(),
+                value: "ar".to_owned(),
+            },
+            ShellEnvEntry::Set {
+                name: "DEVBOX_NIX_ENV_PATH_abcdef".to_owned(),
+                value: "/opt/bin".to_owned(),
+            },
+        ]
+    );
+    assert_eq!(
+        ShellEnvEntry::parse("export BUILD_PHASE=\"line one;\nline two\";\n").unwrap(),
+        vec![ShellEnvEntry::Set {
+            name: "BUILD_PHASE".to_owned(),
+            value: "line one;\nline two".to_owned(),
+        }]
+    );
     for output in [
         "export FOO=$(touch /tmp/pwned)",
         "FOO=ok; touch /tmp/pwned",
