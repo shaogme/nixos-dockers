@@ -53,6 +53,8 @@
 
       # Advanced Productivity Utilities
       (perl.withPackages (p: with p; [ JSON ]))
+      ruby
+      rsync
 
       # Network, Git & System Diagnostics
       curl
