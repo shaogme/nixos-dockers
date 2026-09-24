@@ -128,10 +128,11 @@ pub(crate) fn init_v2(
                     if preserved_pid.as_deref() == Some(pid) {
                         continue;
                     }
-                    let write_res = OpenOptions::new()
-                        .append(true)
-                        .open(&subgroup_procs_file)
-                        .and_then(|mut f| writeln!(f, "{pid}"));
+                    // cgroup.procs parses one complete PID record per write.
+                    // `writeln!` may issue separate writes for the PID and
+                    // newline, making the second write fail with EINVAL on a
+                    // real cgroupfs.
+                    let write_res = append_pid(&subgroup_procs_file, pid);
                     if write_res.is_ok() {
                         drained_in_pass += 1;
                     }
@@ -253,10 +254,7 @@ pub(crate) fn init_v2(
                         for line in procs_content.lines() {
                             let pid = line.trim();
                             if !pid.is_empty() && preserved_pid.as_deref() != Some(pid) {
-                                let _ = OpenOptions::new()
-                                    .append(true)
-                                    .open(&subgroup_procs_file)
-                                    .and_then(|mut f| writeln!(f, "{pid}"));
+                                let _ = append_pid(&subgroup_procs_file, pid);
                             }
                         }
                     }
@@ -370,8 +368,9 @@ impl Drop for PreservedProcess {
 }
 
 fn append_pid(path: &Path, pid: &str) -> std::io::Result<()> {
+    let record = format!("{pid}\n");
     OpenOptions::new()
         .append(true)
         .open(path)
-        .and_then(|mut file| writeln!(file, "{pid}"))
+        .and_then(|mut file| file.write_all(record.as_bytes()))
 }
