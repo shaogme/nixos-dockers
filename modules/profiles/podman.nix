@@ -61,6 +61,31 @@ let
       #!${pkgs.busybox}/bin/sh
       set -eu
 
+      # Docker mounts cgroup2 read-only in ordinary containers. Remount the
+      # namespace-local hierarchy writable so cgroupfs and crun can create
+      # child cgroups without sharing the host cgroup namespace.
+      if [ -e /sys/fs/cgroup/cgroup.subtree_control ]; then
+        if ! ${pkgs.busybox}/bin/mount -o bind,remount,rw /sys/fs/cgroup; then
+          echo "podman engine requires a writable cgroup2 mount" >&2
+          exit 1
+        fi
+
+        # A private namespace starts with PID 1 in its root cgroup. Move the
+        # entrypoint aside before enabling controllers; cgroup v2 rejects
+        # controller delegation from a populated non-leaf cgroup.
+        cgroup_bootstrap=/sys/fs/cgroup/podman-init
+        mkdir -p "$cgroup_bootstrap"
+        echo "$$" > "$cgroup_bootstrap/cgroup.procs"
+        cgroup_controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
+        cgroup_enable=""
+        for controller in $cgroup_controllers; do
+          cgroup_enable="$cgroup_enable +$controller"
+        done
+        if [ -n "$cgroup_enable" ]; then
+          echo "$cgroup_enable" > /sys/fs/cgroup/cgroup.subtree_control
+        fi
+      fi
+
       socket_dir=/run/podman
       socket_path="$socket_dir/podman.sock"
       socket_gid="''${PODMAN_SOCKET_GID:-1000}"

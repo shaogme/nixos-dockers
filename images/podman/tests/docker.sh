@@ -62,6 +62,7 @@ engine_run() {
         --cap-add=CHOWN \
         --cap-add=DAC_OVERRIDE \
         --cap-add=FOWNER \
+        --cap-add=MKNOD \
         --cap-add=NET_ADMIN \
         --cap-add=NET_RAW \
         --cap-add=SETFCAP \
@@ -109,6 +110,11 @@ fi
 engine_cgroup_policy="$(docker exec "$container" /bin/sh -c "grep -E '^(cgroups|cgroupns) =' /etc/containers/containers.conf")"
 assert_contains "$engine_cgroup_policy" 'cgroups = "enabled"'
 assert_contains "$engine_cgroup_policy" 'cgroupns = "private"'
+engine_cgroup_mount="$(docker exec "$container" /bin/sh -c "grep ' /sys/fs/cgroup ' /proc/self/mountinfo")"
+assert_contains "$engine_cgroup_mount" ' rw,'
+engine_cgroup_controllers="$(docker exec "$container" /bin/sh -c "cat /sys/fs/cgroup/cgroup.subtree_control")"
+assert_contains "$engine_cgroup_controllers" 'cpu'
+assert_contains "$engine_cgroup_controllers" 'pids'
 
 echo "==> validating socket permissions and engine configuration"
 socket_stat="$(docker exec "$container" /bin/sh -c "stat -c '%a:%g' /run/podman/podman.sock")"

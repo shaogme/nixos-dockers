@@ -51,8 +51,9 @@ Podman API。它通过 `/run/podman/podman.sock` 提供 Unix socket，存储目�
 引擎只通过 Compose 的 `podman` 服务启动，不监听 TCP；`PODMAN_SOCKET_GID` 必须与
 开发容器的有效 GID 一致。
 引擎以 UID/GID `0:0` 运行 rootful Podman，但宿主容器必须使用私有 cgroup namespace、
-保持 cgroups enabled，并仅授予测试所需的 capability 与 `/dev/fuse`，禁止使用
-特权模式或宿主 cgroup namespace。
+保持 cgroups enabled，并授予 `SYS_ADMIN`、`MKNOD`、网络和 `/dev/fuse` 等测试所需的 capability。
+镜像入口会在私有 namespace 内将 Docker 默认的只读 cgroup2 挂载重新挂载为可写，以便
+crun 启用 controller 并创建子 cgroup。不要使用特权模式或宿主 cgroup namespace。
 镜像自身包含 `/etc/ssl/certs/ca-bundle.crt`，并通过 `SSL_CERT_FILE` 与
 `NIX_SSL_CERT_FILE` 指向该 bundle；registry TLS 校验不依赖宿主机证书挂载，也不会关闭
 证书验证。
