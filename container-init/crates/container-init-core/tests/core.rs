@@ -685,7 +685,7 @@ fn cgroup_v2_init_delegates_controllers_and_moves_processes() {
 
     let mut action = root_action("cg", ActionKind::CgroupV2Init);
     action.path = Some(cgroup_dir.display().to_string());
-    action.subgroup = Some("init".to_string());
+    action.subgroup = Some("libpod_parent".to_string());
     action.controllers = Some(vec!["cpu".to_string(), "memory".to_string()]);
 
     let config = config(temp.path(), vec![action]);
@@ -703,12 +703,72 @@ fn cgroup_v2_init_delegates_controllers_and_moves_processes() {
     assert!(!subtree_content.contains("+io"));
 
     // Verify procs file in subgroup received pids
-    let subgroup_procs = fs::read_to_string(cgroup_dir.join("init/cgroup.procs")).unwrap();
+    let subgroup_procs = fs::read_to_string(cgroup_dir.join("libpod_parent/cgroup.procs")).unwrap();
     assert!(!subgroup_procs.is_empty());
 
     // Idempotency: execute again
     let report2 = executor(config).execute_plan(&plan).unwrap();
     assert!(report2.succeeded());
+}
+
+#[test]
+fn cgroup_v2_init_initializes_explicit_nested_cpuset_parent() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let cgroup_dir = temp.path().join("cgroup");
+    let parent = cgroup_dir.join("libpod_parent");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(cgroup_dir.join("cgroup.controllers"), "cpuset cpu pids\n").unwrap();
+    fs::write(cgroup_dir.join("cgroup.procs"), "").unwrap();
+    fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
+    fs::write(cgroup_dir.join("cpuset.cpus.effective"), "0-3\n").unwrap();
+    fs::write(cgroup_dir.join("cpuset.mems.effective"), "0\n").unwrap();
+    fs::write(parent.join("cgroup.controllers"), "cpuset cpu pids\n").unwrap();
+    fs::write(parent.join("cgroup.procs"), "").unwrap();
+    fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
+    fs::write(parent.join("cgroup.type"), "").unwrap();
+    fs::write(parent.join("cpuset.cpus"), "\n").unwrap();
+    fs::write(parent.join("cpuset.mems"), "\n").unwrap();
+
+    let mut action = root_action("cg", ActionKind::CgroupV2Init);
+    action.path = Some(cgroup_dir.display().to_string());
+    action.subgroup = Some("libpod_parent".to_owned());
+    action.controllers = Some(vec!["cpu".to_owned(), "pids".to_owned()]);
+    action.optional_controllers = Some(vec!["cpuset".to_owned()]);
+    action.subgroup_type = Some("threaded".to_owned());
+    action.subgroup_controllers = Some(vec![
+        "cpuset".to_owned(),
+        "cpu".to_owned(),
+        "pids".to_owned(),
+    ]);
+    action.subgroup_controller_values = Some(BTreeMap::from([
+        ("cpuset.cpus".to_owned(), "cpuset.cpus.effective".to_owned()),
+        ("cpuset.mems".to_owned(), "cpuset.mems.effective".to_owned()),
+    ]));
+
+    let config = config(temp.path(), vec![action]);
+    let plan = config.build_plan().unwrap();
+    executor(config).execute_plan(&plan).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(parent.join("cpuset.cpus")).unwrap(),
+        "0-3\n"
+    );
+    assert_eq!(
+        fs::read_to_string(parent.join("cpuset.mems")).unwrap(),
+        "0\n"
+    );
+    assert_eq!(
+        fs::read_to_string(parent.join("cgroup.type")).unwrap(),
+        "threaded\n"
+    );
+    let subtree = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap();
+    assert!(subtree.contains("+cpuset"));
+    assert!(subtree.contains("+cpu"));
+    assert!(subtree.contains("+pids"));
 }
 
 #[test]
@@ -738,7 +798,7 @@ fn cgroup_v2_init_can_preserve_the_supervisor_process() {
         .execute_plan(&plan)
         .unwrap();
 
-    let subgroup = fs::read_to_string(cgroup_dir.join("init/cgroup.procs")).unwrap();
+    let subgroup = fs::read_to_string(cgroup_dir.join("libpod_parent/cgroup.procs")).unwrap();
     assert!(subgroup.lines().any(|pid| pid == "1001"));
     assert!(!subgroup
         .lines()
@@ -857,7 +917,7 @@ fn cgroup_v2_init_bind_mount_mode_shadows_and_delegates() {
     action.path = Some(target_dir.display().to_string());
     action.shadow_path = Some(shadow_dir.display().to_string());
     action.mount_mode = Some("bind_mount".to_string());
-    action.subgroup = Some("init".to_string());
+    action.subgroup = Some("libpod_parent".to_string());
     action.controllers = Some(vec!["cpu".to_string(), "pids".to_string()]);
 
     let config = config(temp.path(), vec![action]);

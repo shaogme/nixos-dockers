@@ -71,6 +71,9 @@ pub enum PlanEffect {
         subgroup: Option<String>,
         controllers: Option<Vec<String>>,
         optional_controllers: Option<Vec<String>>,
+        subgroup_type: Option<String>,
+        subgroup_controllers: Option<Vec<String>>,
+        subgroup_controller_values: Option<BTreeMap<String, String>>,
     },
     HandoffExec,
 }
@@ -143,6 +146,9 @@ impl PlanEffect {
                 subgroup: action.subgroup.clone(),
                 controllers: action.controllers.clone(),
                 optional_controllers: action.optional_controllers.clone(),
+                subgroup_type: action.subgroup_type.clone(),
+                subgroup_controllers: action.subgroup_controllers.clone(),
+                subgroup_controller_values: action.subgroup_controller_values.clone(),
             },
             ActionKind::HandoffExec => Self::HandoffExec,
         }

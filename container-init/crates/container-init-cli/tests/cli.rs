@@ -793,7 +793,7 @@ shell_prefix = ["-c", "true"]
 id = "cg-init"
 kind = "cgroup.v2_init"
 path = "{}"
-subgroup = "init"
+subgroup = "libpod_parent"
 controllers = ["cpu"]
 run_as = "root"
 "#,
@@ -870,7 +870,7 @@ kind = "cgroup.v2_init"
 mount_mode = "bind_mount"
 shadow_path = "/run/cgroup_custom"
 path = "/sys/fs/cgroup"
-subgroup = "init"
+subgroup = "libpod_parent"
 controllers = ["cpu", "memory"]
 run_as = "root"
 "#,

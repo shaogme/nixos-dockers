@@ -381,7 +381,7 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
     let mut cg = action("cg", ActionKind::CgroupV2Init);
     cg.run_as = RunAs::Root;
     cg.path = Some("/sys/fs/cgroup".to_owned());
-    cg.subgroup = Some("init".to_owned());
+    cg.subgroup = Some("libpod_parent".to_owned());
     cg.controllers = Some(vec!["cpu".to_owned(), "memory".to_owned()]);
     cg.optional_controllers = Some(vec!["io".to_owned()]);
 
@@ -396,9 +396,12 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
             path: Some("/sys/fs/cgroup".to_owned()),
             mount_mode: "default".to_owned(),
             shadow_path: None,
-            subgroup: Some("init".to_owned()),
+            subgroup: Some("libpod_parent".to_owned()),
             controllers: Some(vec!["cpu".to_owned(), "memory".to_owned()]),
             optional_controllers: Some(vec!["io".to_owned()]),
+            subgroup_type: None,
+            subgroup_controllers: None,
+            subgroup_controller_values: None,
         }
     );
 
@@ -419,6 +422,9 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
             subgroup: None,
             controllers: None,
             optional_controllers: None,
+            subgroup_type: None,
+            subgroup_controllers: None,
+            subgroup_controller_values: None,
         }
     );
 

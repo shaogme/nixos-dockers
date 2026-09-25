@@ -182,10 +182,10 @@ fn executes_real_cgroup_v2_init_as_root() {
     let mut resolve = action("resolve", ActionKind::IdentityResolve);
     resolve.run_as = RunAs::Root;
 
-    // Test 1: Real cgroup v2 init on /sys/fs/cgroup with default subgroup "init"
+    // Test 1: Real cgroup v2 init on /sys/fs/cgroup with default subgroup "libpod_parent"
     let mut cg = action("cg-init", ActionKind::CgroupV2Init);
     cg.run_as = RunAs::Root;
-    cg.subgroup = Some("init".to_owned());
+    cg.subgroup = Some("libpod_parent".to_owned());
     cg.depends_on = vec!["resolve".to_owned()];
 
     let config = fixture_config(temp.path(), vec![cg, resolve.clone()]);
@@ -267,7 +267,7 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
     cg.mount_mode = Some("bind_mount".to_owned());
     cg.shadow_path = Some(shadow_path.display().to_string());
     cg.path = Some(target_path.display().to_string());
-    cg.subgroup = Some("init".to_owned());
+    cg.subgroup = Some("libpod_parent".to_owned());
     cg.controllers = Some(vec!["pids".to_owned()]);
     cg.depends_on = vec!["resolve".to_owned()];
 

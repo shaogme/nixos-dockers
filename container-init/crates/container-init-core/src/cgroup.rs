@@ -99,7 +99,7 @@ pub(crate) fn init_v2(
         ));
     }
 
-    let subgroup_name = action.subgroup.as_deref().unwrap_or("init");
+    let subgroup_name = action.subgroup.as_deref().unwrap_or("libpod_parent");
     let subgroup_path = working_root.join(subgroup_name);
     if !subgroup_path.exists() {
         fs::create_dir_all(&subgroup_path).map_err(|source| {
@@ -281,6 +281,13 @@ pub(crate) fn init_v2(
     }
     drop(preserved_process);
 
+    if action.subgroup_type.is_some()
+        || action.subgroup_controllers.is_some()
+        || action.subgroup_controller_values.is_some()
+    {
+        initialize_subgroup(action_id, &working_root, &subgroup_path, action)?;
+    }
+
     // 4. If an owner is specified, reconcile ownership of the subgroup directory
     if let Some(owner) = &action.owner {
         filesystem::chown(
@@ -344,6 +351,96 @@ pub(crate) fn init_v2(
     }
 
     Ok(ActionChange::new(message))
+}
+
+fn initialize_subgroup(
+    action_id: &str,
+    working_root: &Path,
+    subgroup_path: &Path,
+    action: &Action,
+) -> Result<(), CoreError> {
+    let subgroup_controllers = subgroup_path.join("cgroup.controllers");
+    let subgroup_subtree = subgroup_path.join("cgroup.subtree_control");
+    if !subgroup_controllers.exists() || !subgroup_subtree.exists() {
+        return Err(CoreError::action(
+            action_id,
+            Some(subgroup_path.to_path_buf()),
+            "configured subgroup is missing cgroup control files",
+        ));
+    }
+
+    if let Some(subgroup_type) = &action.subgroup_type {
+        write_cgroup_value(action_id, &subgroup_path.join("cgroup.type"), subgroup_type)?;
+    }
+
+    let available: BTreeSet<String> = fs::read_to_string(&subgroup_controllers)
+        .map_err(|source| {
+            CoreError::io(Some(action_id), Some(subgroup_controllers.clone()), source)
+        })?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let delegated: BTreeSet<String> =
+        fs::read_to_string(working_root.join("cgroup.subtree_control"))
+            .map_err(|source| {
+                CoreError::io(
+                    Some(action_id),
+                    Some(working_root.join("cgroup.subtree_control")),
+                    source,
+                )
+            })?
+            .split_whitespace()
+            .map(|controller| controller.trim_start_matches('+').to_owned())
+            .collect();
+    if let Some(values) = &action.subgroup_controller_values {
+        for (target_name, source_name) in values {
+            let source = working_root.join(source_name);
+            let target = subgroup_path.join(target_name);
+            let value = fs::read_to_string(&source).map_err(|source_error| {
+                CoreError::io(Some(action_id), Some(source), source_error)
+            })?;
+            write_cgroup_value(action_id, &target, value.trim())?;
+        }
+    }
+
+    let enabled: BTreeSet<String> = fs::read_to_string(&subgroup_subtree)
+        .map_err(|source| CoreError::io(Some(action_id), Some(subgroup_subtree.clone()), source))?
+        .split_whitespace()
+        .map(|controller| controller.trim_start_matches('+').to_owned())
+        .collect();
+
+    for controller in action.subgroup_controllers.iter().flatten() {
+        if !delegated.contains(controller) || !available.contains(controller) {
+            return Err(CoreError::action(
+                action_id,
+                Some(subgroup_controllers.clone()),
+                format!(
+                    "configured subgroup controller {controller:?} is not delegated or available"
+                ),
+            ));
+        }
+        if !enabled.contains(controller) {
+            append_cgroup_value(action_id, &subgroup_subtree, &format!("+{controller}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_cgroup_value(action_id: &str, path: &Path, value: &str) -> Result<(), CoreError> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(format!("{value}\n").as_bytes()))
+        .map_err(|source| CoreError::io(Some(action_id), Some(path.to_path_buf()), source))
+}
+
+fn append_cgroup_value(action_id: &str, path: &Path, value: &str) -> Result<(), CoreError> {
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(format!("{value}\n").as_bytes()))
+        .map_err(|source| CoreError::io(Some(action_id), Some(path.to_path_buf()), source))
 }
 
 struct PreservedProcess {

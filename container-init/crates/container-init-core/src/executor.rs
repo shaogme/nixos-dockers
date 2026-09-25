@@ -549,6 +549,7 @@ impl PlanExecutor {
                     .iter()
                     .flatten()
                     .chain(action.optional_controllers.iter().flatten())
+                    .chain(action.subgroup_controllers.iter().flatten())
                     .cloned()
                     .collect::<BTreeSet<_>>();
                 keys.push(ResourceKey::cgroup(hierarchy, controllers));

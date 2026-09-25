@@ -371,12 +371,30 @@ kind = "cgroup.v2_init"
 path = "/sys/fs/cgroup"
 mount_mode = "default" # "default"（默认就地初始化）或 "bind_mount"（挂载覆挂重定向）
 shadow_path = "/run/cgroup" # 仅在 mount_mode = "bind_mount" 时使用，默认 /run/cgroup
-subgroup = "init"
+subgroup = "libpod_parent"
 required_controllers = ["cpu", "pids"]
 optional_controllers = ["io", "memory"] # 委托失败时跳过
 owner = "root"
 run_as = "root"
 ```
+
+需要为嵌套运行时准备一个可委托的子组时，必须显式声明子组配置。运行时
+不会根据 controller 名称推断任何文件或 cgroup 类型：
+
+```toml
+subgroup = "libpod_parent"
+subgroup_type = "threaded"
+subgroup_controllers = ["cpuset", "cpu", "pids"]
+subgroup_controller_values = {
+  "cpuset.cpus" = "cpuset.cpus.effective",
+  "cpuset.mems" = "cpuset.mems.effective",
+}
+```
+
+`subgroup_controller_values` 的键是子组内的目标文件，值是父层级中读取的源文件；
+两者都必须是单个相对 cgroup 文件名。`subgroup_controllers` 中的 controller
+必须已经由 action 在父层级委托，并且会按配置顺序写入子组的
+`cgroup.subtree_control`。
 
 字段说明：
 - `mount_mode`（别名 `mode`）：可选。初始化挂载模式，默认 `"default"`：
@@ -384,7 +402,7 @@ run_as = "root"
   - `"bind_mount"`（**挂载覆挂重定向模式**）：在独立可写虚拟内存文件系统（`shadow_path`，默认 `/run/cgroup`）上挂载私有 cgroup2 树并完成子组初始化与控制器委托，随后通过 `mount --bind` 覆挂重定向至目标 `path`（默认 `/sys/fs/cgroup`）。该模式专为只读环境（如 Docker `--read-only` 或受限 `ro` cgroup2 挂载）设计，无需依赖宿主特权即可使 `/sys/fs/cgroup` 变为可写层级，向下游 OCI 运行时无缝提供标准 cgroup 树。
 - `shadow_path`：可选。挂载覆挂重定向模式下的独立可写暂存路径，默认 `"/run/cgroup"`。
 - `path`：可选。目标 cgroup 根路径，默认 `"/sys/fs/cgroup"`。
-- `subgroup`：可选。用于移入容器根进程的子组目录名称，默认 `"init"`（对应 `<path>/init`）。
+- `subgroup`：可选。用于移入容器根进程的子组目录名称，默认 `"libpod_parent"`（对应 `<path>/libpod_parent`）。
 - `required_controllers`：可选。必需启用到 `cgroup.subtree_control` 的控制器列表。指定的控制器不可用或委托失败时，action 失败。`controllers` 和 `cgroup_controllers` 是兼容别名。未指定且同时未指定 `optional_controllers` 时，保持兼容行为：自动读取目标 cgroup2 层级中 `cgroup.controllers` 的所有可用控制器并全部作为必需控制器。
 - `optional_controllers`：可选。尽力而为启用的控制器列表。控制器不可见，或内核拒绝委托（例如私有 cgroup namespace 中常见的 `EOPNOTSUPP`、`EPERM`）时跳过该控制器，action 仍成功，并在结果消息中列出原因。若只配置此字段而省略 `required_controllers`，则没有必需控制器。
 - `owner`：可选。子组目录的属主（例如 `"identity.target"`）。
@@ -394,7 +412,7 @@ run_as = "root"
 1. **模式判定与准备**：
    - 若 `mount_mode = "default"`：基准工作目录为 `path`（默认 `/sys/fs/cgroup`）。校验该路径存在且包含 `cgroup.controllers`。
    - 若 `mount_mode = "bind_mount"`：基准工作目录为 `shadow_path`（默认 `/run/cgroup`）。若尚未挂载，则在当前私有命名空间（User + Mount + Cgroup Namespace）中挂载 `cgroup2` 文件系统至 `shadow_path`。
-2. **创建子组**：在基准工作目录下创建子组 `<work_dir>/<subgroup>`（默认 `<work_dir>/init`）。
+2. **创建子组**：在基准工作目录下创建子组 `<work_dir>/<subgroup>`（默认 `<work_dir>/libpod_parent`）。
 3. **排空进程**：读取 `<work_dir>/cgroup.procs`，将所有既有进程迁移至 `<work_dir>/<subgroup>/cgroup.procs`，清空根层级的进程占用以满足 cgroup v2 规范。
 4. **委托控制器**：读取已在 `cgroup.subtree_control` 启用的控制器，通过追加写入 `+<controller>` 启用目标控制器（支持 EBUSY 自动重试排空，幂等执行）。`required_controllers` 中的控制器委托失败会终止 action；`optional_controllers` 中的控制器委托失败会跳过并记录结果消息。
 5. **属主对齐**：若配置了 `owner`，对子组目录执行属主对齐。

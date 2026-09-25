@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::condition::Condition;
 use crate::config::BootstrapConfig;
@@ -138,6 +139,11 @@ pub struct Action {
     pub controllers: Option<Vec<String>>,
     #[serde(alias = "cgroup_optional_controllers")]
     pub optional_controllers: Option<Vec<String>>,
+    /// Optional explicit configuration for the action's subgroup. These are
+    /// kept separate from the controllers delegated at the hierarchy root.
+    pub subgroup_type: Option<String>,
+    pub subgroup_controllers: Option<Vec<String>>,
+    pub subgroup_controller_values: Option<BTreeMap<String, String>>,
     #[serde(alias = "cgroup_mount_mode")]
     pub mount_mode: Option<String>,
     #[serde(alias = "cgroup_shadow_path")]
@@ -186,6 +192,9 @@ impl Action {
             subgroup: None,
             controllers: None,
             optional_controllers: None,
+            subgroup_type: None,
+            subgroup_controllers: None,
+            subgroup_controller_values: None,
             mount_mode: None,
             shadow_path: None,
             when: None,
@@ -548,6 +557,80 @@ impl Action {
                                 location: format!("bootstrap.actions.{}.{}", self.id, field),
                                 message: format!("duplicate controller name {controller:?}"),
                             });
+                        }
+                    }
+                }
+                if let Some(subgroup_type) = &self.subgroup_type {
+                    if self.subgroup.is_none()
+                        || subgroup_type.is_empty()
+                        || subgroup_type.contains(char::is_whitespace)
+                        || subgroup_type.contains('\0')
+                    {
+                        return Err(ModelError::Invalid {
+                            location: format!(
+                                "bootstrap.actions.{}.subgroup_type",
+                                self.id
+                            ),
+                            message: "subgroup_type requires a subgroup and must be a single non-empty token".to_owned(),
+                        });
+                    }
+                }
+                if let Some(controllers) = &self.subgroup_controllers {
+                    if self.subgroup.is_none() || controllers.is_empty() {
+                        return Err(ModelError::Invalid {
+                            location: format!("bootstrap.actions.{}.subgroup_controllers", self.id),
+                            message: "subgroup_controllers requires a non-empty subgroup list"
+                                .to_owned(),
+                        });
+                    }
+                    let mut seen = std::collections::BTreeSet::new();
+                    for controller in controllers {
+                        if controller.is_empty()
+                            || controller.contains(char::is_whitespace)
+                            || controller.contains('\0')
+                            || !seen.insert(controller)
+                        {
+                            return Err(ModelError::Invalid {
+                                location: format!(
+                                    "bootstrap.actions.{}.subgroup_controllers",
+                                    self.id
+                                ),
+                                message: format!(
+                                    "invalid or duplicate subgroup controller {controller:?}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                if let Some(values) = &self.subgroup_controller_values {
+                    if self.subgroup.is_none() || values.is_empty() {
+                        return Err(ModelError::Invalid {
+                            location: format!(
+                                "bootstrap.actions.{}.subgroup_controller_values",
+                                self.id
+                            ),
+                            message: "subgroup_controller_values requires a non-empty subgroup"
+                                .to_owned(),
+                        });
+                    }
+                    for (target, source) in values {
+                        for (field, value) in [("target", target), ("source", source)] {
+                            if value.is_empty()
+                                || value.starts_with('/')
+                                || value.contains('/')
+                                || value.contains("..")
+                                || value.contains('\0')
+                            {
+                                return Err(ModelError::Invalid {
+                                    location: format!(
+                                        "bootstrap.actions.{}.subgroup_controller_values.{}",
+                                        self.id, field
+                                    ),
+                                    message: format!(
+                                        "{field} must be a single relative cgroup file name, got {value:?}"
+                                    ),
+                                });
+                            }
                         }
                     }
                 }

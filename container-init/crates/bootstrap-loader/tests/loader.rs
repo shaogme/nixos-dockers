@@ -451,7 +451,7 @@ extends = ["base"]
 [[bootstrap.actions]]
 id = "cgroup-init"
 kind = "cgroup.v2_init"
-subgroup = "init"
+subgroup = "libpod_parent"
 required_controllers = ["cpu", "memory"]
 optional_controllers = ["io"]
 run_as = "root"
@@ -466,7 +466,7 @@ run_as = "root"
         .find(|a| a.id == "cgroup-init")
         .expect("cgroup-init action should be present");
     assert_eq!(cg_action.kind, ActionKind::CgroupV2Init);
-    assert_eq!(cg_action.subgroup.as_deref(), Some("init"));
+    assert_eq!(cg_action.subgroup.as_deref(), Some("libpod_parent"));
     assert_eq!(
         cg_action.controllers.as_deref(),
         Some(&["cpu".to_string(), "memory".to_string()][..])
