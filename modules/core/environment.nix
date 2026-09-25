@@ -5,6 +5,12 @@ let
 in
 {
   options.environment = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Enable the shared development environment package and variable set.";
+    };
+
     systemPackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
@@ -39,13 +45,10 @@ in
 
   };
 
-  config = {
+  config = lib.mkIf config.environment.enable {
     environment.systemPackages = [
       pkgs.su-exec
       pkgs.shadow
-      pkgs.fuse-overlayfs
-      pkgs.slirp4netns
-      pkgs.iptables
     ];
     environment.variables = {
       NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";

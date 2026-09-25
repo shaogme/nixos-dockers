@@ -26,34 +26,6 @@ let
     ${config.system.defaultUser}:31000:34000
   '';
 
-  containersPolicy = pkgs.writeTextDir "etc/containers/policy.json" ''
-    {
-      "default": [
-        {
-          "type": "insecureAcceptAnything"
-        }
-      ]
-    }
-  '';
-
-  containersStorage = pkgs.writeTextDir "etc/containers/storage.conf" ''
-    [storage]
-    driver = "overlay"
-    runroot = "/run/containers/storage"
-    graphroot = "/var/lib/containers/storage"
-
-    [storage.options]
-    pull_options = { enable_partial_images = "true", use_hard_links = "false", ostree_repos="" }
-
-    [storage.options.overlay]
-    mount_program = "/usr/bin/fuse-overlayfs"
-    mountopt = "nodev,metacopy=on"
-  '';
-
-  containersRegistries = pkgs.writeTextDir "etc/containers/registries.conf" ''
-    unqualified-search-registries = ["docker.io", "quay.io"]
-  '';
-
   sshdConfig = pkgs.writeTextDir "etc/ssh/sshd_config" ''
     PermitRootLogin yes
     PasswordAuthentication yes
@@ -111,9 +83,6 @@ let
   systemConfigFiles = [
     passwd
     group
-    containersPolicy
-    containersStorage
-    containersRegistries
     nsswitchConf
     nixConf
     etcEnvironment
@@ -157,6 +126,12 @@ in
   };
 
   options.system = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Enable the shared developer system files and directory layout.";
+    };
+
     defaultUser = lib.mkOption {
       type = lib.types.str;
       default = "dev";
@@ -188,7 +163,7 @@ in
     };
   };
 
-  config = {
+  config = lib.mkIf config.system.enable {
     docker.extraContents = config.system.configFiles;
     docker.extraCommands = ''
       # 1. Base System Directories
@@ -196,10 +171,9 @@ in
       chmod 1777 tmp
       chmod 777 workspace
       
-      mkdir -p run var/lock var/tmp run/containers var/lib/containers
+      mkdir -p run var/lock var/tmp
       chmod 1777 var/lock
       chmod 1777 var/tmp
-      chmod 1777 run/containers
       
       ${sshExtraCommands}
 

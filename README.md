@@ -39,6 +39,21 @@
 | `vscode-rust` | Rust 专用镜像 (SSH) | Rust 工具链, rust-analyzer, clippy, gdb, SSH | `latest`, `1.97.1-2026.8.24` |
 | [`vscode-mise`](images/mise/README.md) | Mise 开发镜像 (SSH) | Nix, mise, direnv, coreutils, SSH | `latest`, `2026.8.12-2026.8.24` |
 
+### 3. Podman 引擎镜像（单一 engine 产物）
+
+| 镜像名称 | 描述 | 主要包含 | 示例 Tag |
+| :--- | :--- | :--- | :--- |
+| `podman` | Compose 使用的 rootful Podman 服务 | Podman, crun, conmon, fuse-overlayfs, netavark | `latest`, `5.8.7-2026.9.25` |
+
+`nixos-dockers/podman` 不包含 SSH、`container-init`、`dev-env` 或开发工具，只运行
+Podman API。它通过 `/run/podman/podman.sock` 提供 Unix socket，存储目录固定在
+`/var/lib/containers`；应当与开发工具容器共享 socket、数据卷和 `/workspace` 路径。
+引擎只通过 Compose 的 `podman` 服务启动，不监听 TCP；`PODMAN_SOCKET_GID` 必须与
+开发容器的有效 GID 一致。
+引擎以 UID/GID `0:0` 运行 rootful Podman，但宿主容器必须使用私有 cgroup namespace、
+保持 cgroups enabled，并仅授予测试所需的 capability 与 `/dev/fuse`，禁止使用
+特权模式或宿主 cgroup namespace。
+
 ### Tag 命名规则
 
 每次 CI 构建都会发布两个 Tag：
@@ -69,8 +84,22 @@ docker run -it --rm \
 # 或运行 rust 镜像
 docker run -it --rm \
   -v $(pwd):/workspace \
-  ghcr.io/shaogme/nixos-dockers/rust:latest
+ghcr.io/shaogme/nixos-dockers/rust:latest
 ```
+
+### 3. 使用独立 Podman engine
+
+`coding-images/podman` 及其 Rust/QEMU 派生镜像必须使用双服务 Compose：
+
+```bash
+cd images/podman
+PODMAN_SOCKET_GID=$(id -g) docker compose up -d podman dev
+docker compose exec dev bash
+```
+
+`dev` 与 `podman` 都挂载 `/workspace`，并通过 `podman-socket` 共享
+`CONTAINER_HOST=unix:///run/podman/podman.sock` 和 `DOCKER_HOST`。`podman-data` 只挂载
+到 engine；旧的 `/var/lib/containers` 工具容器卷不会自动复用。
 
 ### 3. 使用 Docker Compose (VS Code Remote)
 
@@ -191,7 +220,8 @@ manifest。
 
 ## 本地构建镜像
 
-每个镜像目录（如 `images/rust`）均同时支持构建标准 CLI 镜像与 VS Code Remote 镜像：
+开发镜像目录（如 `images/rust`）同时支持标准 CLI、VS Code Remote 和 builder 产物；
+Podman engine 目录只生成一个 `podman` 产物：
 
 ```bash
 # 1. 构建 Rust 通用 CLI 镜像
@@ -205,6 +235,9 @@ nix-build images/rust/image.nix
 
 # Mise 构建阶段镜像（仅用于 Docker build stage）
 nix-build images/mise/image.nix -A mise-builder
+
+# Podman engine 服务镜像（无 SSH、无 dev-env）
+nix-build images/podman/image.nix -A podman
 ```
 
 构建完成后，使用 `docker load < result` 即可将镜像导入本地 Docker。
@@ -217,22 +250,25 @@ nix-build images/mise/image.nix -A mise-builder
 bash images/rust/tests/docker.sh
 bash images/npins/tests/docker.sh
 bash images/mise/tests/docker.sh
+bash images/podman/tests/docker.sh
 ```
 
-CI 会对 `mise`、`npins`、`rust` 三个 image 运行相同测试。`coding-images` 暂不纳入本次迁移。
+CI 对开发镜像运行 container-init/dev-env 测试，对 `podman` 单独运行 socket、远程 API
+和持久化数据测试。`coding-images` 暂不纳入本次迁移。
 
 ## 项目结构
 
 ```text
 .
-├── images/                # Docker 镜像定义目录 (每个定义同时产出 CLI 与 VS Code 镜像)
+├── images/                # Docker 镜像定义目录 (按 role 产出开发或 engine 镜像)
 │   ├── npins/             # 基础通用镜像 (npins, vscode-npins)
 │   ├── rust/              # Rust 专用镜像 (rust, vscode-rust)
+│   ├── podman/            # 独立 Podman engine 镜像 (仅 podman)
 │   └── mise/              # Mise 专用镜像 (mise, vscode-mise, mise-builder) -> 详见 [Mise 文档](images/mise/README.md)
 │       └── example/       # 生产级派生开发容器示例 (Dockerfile, compose, entrypoint)
 ├── modules/               # 统一 NixOS 模块系统
 │   ├── core/              # 核心构建器、系统配置与 container-init/dev-env runtime
-│   └── profiles/          # 语言与工具特性 Profile (base, rust, npins, mise)
+│   └── profiles/          # 语言、工具与 engine Profile (base, rust, npins, mise, podman)
 ├── update-npins.sh        # 依赖自动更新脚本
 └── .github/workflows/     # CI/CD 自动化构建发布工作流
 ```

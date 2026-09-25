@@ -2,13 +2,13 @@
 let
   validVars = lib.filterAttrs (_: value: value != null) config.environment.variables;
   envList = [
-    "PATH=/nix/var/nix/profiles/default/bin:/bin:/usr/bin:/usr/local/bin"
+    "PATH=${config.docker.environmentPath}"
   ] ++ (lib.mapAttrsToList (name: value: "${name}=${toString value}") validVars);
 
   layeredImage = (pkgs.dockerTools.buildLayeredImage {
     name = config.docker.name;
     tag = config.docker.tag;
-    includeNixDB = true;
+    includeNixDB = config.docker.includeNixDB;
     # Keep derived Docker images below overlayfs' lower-directory limit.
     maxLayers = 64;
     contents = lib.unique (
@@ -19,11 +19,7 @@ let
     extraCommands = config.docker.extraCommands;
     fakeRootCommands = config.docker.fakeRootCommands;
     config = {
-      Entrypoint = lib.optionals config.runtime.enable [
-        "/usr/bin/container-init"
-        "run"
-        "--"
-      ];
+      Entrypoint = config.docker.entrypoint;
       # An SSH image is a service image by default. The container-init
       # handoff still materializes the environment before starting sshd.
       Cmd = lib.optionals config.services.openssh.enable [
@@ -34,6 +30,8 @@ let
       WorkingDir = config.docker.workingDir;
       ExposedPorts = config.docker.exposedPorts;
       Env = envList;
+    } // lib.optionalAttrs (config.docker.user != null) {
+      User = config.docker.user;
     };
   }) // {
     imageVersion = config.docker.version;
@@ -45,9 +43,33 @@ in
 {
   options.docker = {
     role = lib.mkOption {
-      type = lib.types.enum [ "runtime" "builder" ];
-      default = "runtime";
-      description = "Image role used to select runtime or build-stage defaults.";
+      type = lib.types.enum [ "disabled" "runtime" "builder" "engine" ];
+      default = "disabled";
+      description = "Image role used to select runtime, builder, or Podman engine defaults.";
+    };
+
+    includeNixDB = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Include the Nix database in the image layer.";
+    };
+
+    environmentPath = lib.mkOption {
+      type = lib.types.str;
+      default = "/bin:/usr/bin:/usr/local/bin";
+      description = "PATH baked into the image metadata.";
+    };
+
+    entrypoint = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Entrypoint command baked into the image metadata.";
+    };
+
+    user = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional UID/GID used as the default Docker image user.";
     };
 
     name = lib.mkOption {
@@ -120,5 +142,16 @@ in
       default = layeredImage;
       description = "The resulting Docker layered image derivation.";
     };
+  };
+
+  # Engine images are infrastructure artifacts. Keep the role self-contained
+  # even when a caller forgets to repeat the profile defaults from the builder.
+  config = lib.mkIf (config.docker.role == "engine") {
+    docker.includeNixDB = false;
+    runtime.enable = false;
+    profiles.base.enable = false;
+    system.enable = false;
+    environment.enable = false;
+    services.openssh.enable = false;
   };
 }

@@ -3,7 +3,7 @@
   options.profiles.base = {
     enable = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      default = false;
       description = "Enable base development tools and runtime libraries for VS Code Remote.";
     };
   };

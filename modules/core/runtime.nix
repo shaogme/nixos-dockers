@@ -206,7 +206,7 @@ in
   options.runtime = {
     enable = lib.mkOption {
       type = lib.types.bool;
-      default = config.docker.role != "builder";
+      default = false;
       description = "Install the container-init and dev-env runtimes and their base profile.";
     };
   };

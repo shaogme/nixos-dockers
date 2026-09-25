@@ -25,35 +25,54 @@ jobs:
     outputs:
       runtime_matrix: ${{ steps.set-matrix.outputs.runtime_matrix }}
       builder_matrix: ${{ steps.set-matrix.outputs.builder_matrix }}
+      engine_matrix: ${{ steps.set-matrix.outputs.engine_matrix }}
     steps:
       - uses: actions/checkout@main
+      - name: Install Nix
+        uses: cachix/install-nix-action@master
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
       - id: set-matrix
         run: |
-          # Every image definition publishes CLI, vscode, and builder roles.
-          IMAGE_NAMES=$(find images -maxdepth 2 -name "image.nix" | sort | jq -R . | jq -s -c '
-            map(capture("images/(?<name>[^/]+)/image.nix"))
-          ')
-          RUNTIME_MATRIX=$(echo "$IMAGE_NAMES" | jq -c '
-            map(
-              . as $image |
-              [
-                { file: "images/\($image.name)/image.nix", attr: $image.name, name: $image.name },
-                { file: "images/\($image.name)/image.nix", attr: "vscode-\($image.name)", name: "vscode-\($image.name)" }
-              ]
-            ) | flatten
-          ')
-          BUILDER_MATRIX=$(echo "$IMAGE_NAMES" | jq -c '
-            map(
-              . as $image |
-              [{
-                file: "images/\($image.name)/image.nix",
-                attr: "\($image.name)-builder",
-                name: "\($image.name)-builder"
-              }]
-            ) | flatten
-          ')
+          RUNTIME_MATRIX='[]'
+          BUILDER_MATRIX='[]'
+          ENGINE_MATRIX='[]'
+          while IFS= read -r file; do
+            name="${file#images/}"
+            name="${name%/image.nix}"
+            role=$(nix-instantiate --eval --raw "$file" -A role 2>/dev/null || printf runtime)
+            outputs=$(nix-instantiate --eval --json "$file" -A outputs 2>/dev/null || printf '["%s"]' "$name")
+            if [[ "$role" == engine ]]; then
+              ENGINE_MATRIX=$(jq -c --arg file "$file" --arg role "$role" --argjson outputs "$outputs" \
+                '. + ($outputs | map({file: $file, role: $role, attr: ., name: .}))' <<< "$ENGINE_MATRIX")
+            else
+              RUNTIME_MATRIX=$(jq -c --arg file "$file" --arg role "$role" --argjson outputs "$outputs" \
+                '. + ($outputs | map({file: $file, role: $role, attr: ., name: .}) + map({file: $file, role: $role, attr: ("vscode-" + .), name: ("vscode-" + .)}))' <<< "$RUNTIME_MATRIX")
+              BUILDER_MATRIX=$(jq -c --arg file "$file" --arg role "$role" --argjson outputs "$outputs" \
+                '. + ($outputs | map({file: $file, role: $role, attr: (. + "-builder"), name: (. + "-builder")}))' <<< "$BUILDER_MATRIX")
+            fi
+          done < <(find images -maxdepth 2 -name "image.nix" | sort)
           echo "runtime_matrix=$RUNTIME_MATRIX" >> $GITHUB_OUTPUT
           echo "builder_matrix=$BUILDER_MATRIX" >> $GITHUB_OUTPUT
+          echo "engine_matrix=$ENGINE_MATRIX" >> $GITHUB_OUTPUT
+
+  build-and-publish-engines:
+    needs: discover
+    if: ${{ needs.discover.outputs.engine_matrix != '[]' && needs.discover.outputs.engine_matrix != '' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.discover.outputs.engine_matrix) }}
+    uses: ./.github/workflows/build-image.yml
+    with:
+      file: ${{ matrix.target.file }}
+      attr: ${{ matrix.target.attr }}
+      name: ${{ matrix.target.name }}
+      role: ${{ matrix.target.role }}
+    secrets: inherit
 
   build-and-publish-builders:
     needs: discover
@@ -70,6 +89,7 @@ jobs:
       file: ${{ matrix.target.file }}
       attr: ${{ matrix.target.attr }}
       name: ${{ matrix.target.name }}
+      role: ${{ matrix.target.role }}
     secrets: inherit
 
   build-and-publish-runtimes:
@@ -87,4 +107,5 @@ jobs:
       file: ${{ matrix.target.file }}
       attr: ${{ matrix.target.attr }}
       name: ${{ matrix.target.name }}
+      role: ${{ matrix.target.role }}
     secrets: inherit

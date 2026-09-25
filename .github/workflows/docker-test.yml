@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [mise, npins, rust]
+        image: [mise, npins, rust, podman]
     steps:
       - name: Checkout repository
         uses: actions/checkout@main

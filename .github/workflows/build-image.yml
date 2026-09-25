@@ -12,6 +12,11 @@ on:
       name:
         required: true
         type: string
+      role:
+        description: Image role (runtime, builder, or engine)
+        required: false
+        default: runtime
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -36,7 +41,7 @@ jobs:
             extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
 
       - name: Setup NixCache for mise
-        if: contains(inputs.name, 'mise')
+        if: inputs.role != 'engine' && contains(inputs.name, 'mise')
         uses: shaogme/nixcache-oci/setup@main
         with:
           repo: shaogme/mise-nixcache
@@ -71,7 +76,7 @@ jobs:
             extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
 
       - name: Setup NixCache for mise
-        if: contains(inputs.name, 'mise')
+        if: inputs.role != 'engine' && contains(inputs.name, 'mise')
         uses: shaogme/nixcache-oci/setup@main
         with:
           repo: shaogme/mise-nixcache
