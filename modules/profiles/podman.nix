@@ -126,6 +126,9 @@ in
     docker.user = "0:0";
     docker.version = lib.mkDefault pkgs.podman.version;
     docker.extraContents = [
+      # The engine is built without profiles.base/system, so include the trust
+      # store explicitly. Registry clients must validate TLS inside the image.
+      pkgs.dockerTools.caCertificates
       containersConfig
       containersPolicy
       containersRegistries
@@ -155,6 +158,8 @@ in
       CONTAINERS_CONF = "/etc/containers/containers.conf";
       CONTAINERS_STORAGE_CONF = "/etc/containers/storage.conf";
       CONTAINERS_REGISTRIES_CONF = "/etc/containers/registries.conf";
+      SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
+      NIX_SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
       PODMAN_SOCKET_GID = "1000";
       PODMAN_SOCKET_MODE = "0660";
     };
