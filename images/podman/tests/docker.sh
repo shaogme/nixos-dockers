@@ -77,6 +77,10 @@ docker volume create "$socket_volume" >/dev/null
 docker volume create "$data_volume" >/dev/null
 mkdir -p "$tmp_dir/workspace"
 printf 'engine test workspace\n' > "$tmp_dir/workspace/README"
+# Reproduce a rootless outer runtime whose bind-mounted workspace is only
+# traversable by its owner. The engine must use / as its working directory;
+# /workspace remains available for workload bind mounts through the API.
+chmod 0700 "$tmp_dir/workspace"
 
 echo "==> starting rootless Podman engine"
 engine_run() {
@@ -105,6 +109,9 @@ engine_run --detach --name "$container" \
     --volume "$data_volume:/var/lib/containers" \
     --volume "$tmp_dir/workspace:/workspace" \
     podman:latest
+
+engine_working_dir="$(docker inspect --format '{{.Config.WorkingDir}}' "$container")"
+[[ "$engine_working_dir" == / ]]
 
 wait_for_socket() {
     wait_for_socket_in "$container"

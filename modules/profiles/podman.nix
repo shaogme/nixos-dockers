@@ -213,6 +213,10 @@ in
     docker.includeNixDB = false;
     docker.environmentPath = "/usr/bin:/bin";
     docker.user = "1000:1000";
+    # The engine must not inherit /workspace as its current directory. The
+    # Compose service bind-mounts that path for workloads, and a rootless
+    # outer runtime may not grant the engine UID traversal permission there.
+    docker.workingDir = "/";
     docker.version = lib.mkDefault pkgs.podman.version;
     docker.extraContents = [
       # The engine is built without profiles.base/system, so include the trust
