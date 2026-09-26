@@ -74,12 +74,85 @@ let
       socket_path="$socket_dir/podman.sock"
       socket_gid="''${PODMAN_SOCKET_GID:-1000}"
       socket_mode="''${PODMAN_SOCKET_MODE:-0660}"
+      map_dir=/run/user/1000/containers
+      uid_map_file="$map_dir/subuid"
+      gid_map_file="$map_dir/subgid"
+
+      # A rootless outer runtime exposes its subordinate IDs in the current
+      # user namespace, not in the host namespace.  Translate the first
+      # column of uid_map/gid_map into the ranges that an inner newuidmap can
+      # actually write, while leaving the image defaults intact for a rootful
+      # outer runtime.
+      write_nested_map() {
+        source_map="$1"
+        destination="$2"
+        current_id="$3"
+
+        if ${pkgs.busybox}/bin/awk '
+          $1 == 0 && $2 == 0 && $3 >= 4294967295 { identity = 1 }
+          END { exit identity ? 0 : 1 }
+        ' "$source_map"; then
+          ${pkgs.busybox}/bin/cp "/etc/$(${pkgs.busybox}/bin/basename "$destination")" "$destination"
+          return 0
+        fi
+
+        ${pkgs.busybox}/bin/awk -v owner=podman -v current="$current_id" '
+          function emit(start, count, end, left, right) {
+            end = start + count
+            # UID/GID zero is the outer namespace root and is intentionally
+            # not delegated as a subordinate ID.
+            if (start < 1) {
+              start = 1
+            }
+            if (start < end && current >= start && current < end) {
+              left = current - start
+              right = end - (current + 1)
+              if (left > 0) {
+                printf "%s:%d:%d\n", owner, start, left
+              }
+              if (right > 0) {
+                printf "%s:%d:%d\n", owner, current + 1, right
+              }
+            } else if (start < end) {
+              printf "%s:%d:%d\n", owner, start, end - start
+            }
+          }
+          /^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]*$/ {
+            emit($1, $3)
+          }
+        ' "$source_map" > "$destination"
+
+        if [ ! -s "$destination" ]; then
+          echo "podman engine could not derive subordinate IDs from $source_map" >&2
+          return 1
+        fi
+      }
 
       mkdir -p "$socket_dir" /run/user/1000/containers /var/lib/containers/storage
+      write_nested_map /proc/self/uid_map "$uid_map_file" "$(id -u)"
+      write_nested_map /proc/self/gid_map "$gid_map_file" "$(id -g)"
+      if ! ${pkgs.busybox}/bin/mount --bind "$uid_map_file" /etc/subuid; then
+        echo "podman engine could not mount dynamic /etc/subuid" >&2
+        exit 1
+      fi
+      if ! ${pkgs.busybox}/bin/mount --bind "$gid_map_file" /etc/subgid; then
+        echo "podman engine could not mount dynamic /etc/subgid" >&2
+        exit 1
+      fi
+      echo "podman engine uid_map:" >&2
+      cat /proc/self/uid_map >&2
+      echo "podman engine gid_map:" >&2
+      cat /proc/self/gid_map >&2
+      echo "podman engine subuid:" >&2
+      cat /etc/subuid >&2
+      echo "podman engine subgid:" >&2
+      cat /etc/subgid >&2
       # A rootless process can only change the group to one it owns.  The
       # default GID is the engine user's GID; callers that need another GID
       # can opt into the explicitly configured socket mode.
-      chgrp "$socket_gid" "$socket_dir" 2>/dev/null || true
+      if ! chgrp "$socket_gid" "$socket_dir"; then
+        echo "podman engine could not set socket directory group to $socket_gid" >&2
+      fi
       # The socket volume may be initialized as root-owned by Docker.  Its
       # image directory is intentionally writable, so UID 1000 can create
       # the socket without needing to chmod/chown the volume mount itself.
@@ -107,7 +180,9 @@ let
         exit 1
       fi
       chmod "$socket_mode" "$socket_path"
-      chgrp "$socket_gid" "$socket_path" 2>/dev/null || true
+      if ! chgrp "$socket_gid" "$socket_path"; then
+        echo "podman engine could not set socket group to $socket_gid" >&2
+      fi
 
       wait "$service_pid"
     '';
@@ -165,6 +240,8 @@ in
       chmod 0644 etc/subuid etc/subgid
       ln -sf ${pkgs.busybox}/bin/busybox bin/sh
       ln -sf ${pkgs.busybox}/bin/busybox usr/bin/sh
+      ln -sf ${pkgs.busybox}/bin/busybox bin/mount
+      ln -sf ${pkgs.busybox}/bin/busybox usr/bin/mount
       ln -sf ${pkgs.podman}/bin/podman usr/bin/podman
       ln -sf /usr/bin/podman bin/podman
       ln -sf ${pkgs.crun}/bin/crun usr/bin/crun

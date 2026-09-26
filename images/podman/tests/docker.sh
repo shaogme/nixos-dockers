@@ -11,11 +11,32 @@ dev_container="nixos-dockers-podman-alpine-dev-$$"
 socket_volume="nixos-dockers-podman-socket-$$"
 data_volume="nixos-dockers-podman-data-$$"
 
+dump_engine_diagnostics() {
+    echo "==> engine container logs ($container)" >&2
+    docker logs "$container" >&2 || true
+    echo "==> engine container inspect ($container)" >&2
+    docker inspect "$container" >&2 || true
+    echo "==> engine namespace and mapping state ($container)" >&2
+    docker exec "$container" /bin/sh -c '
+        id
+        printf "uid_map: "; cat /proc/self/uid_map
+        printf "gid_map: "; cat /proc/self/gid_map
+        printf "setgroups: "; cat /proc/self/setgroups 2>&1 || true
+        printf "no_new_privs: "; grep NoNewPrivs /proc/self/status || true
+        printf "newuidmap: "; stat -c "%A %a %u:%g %n" /usr/bin/newuidmap 2>&1 || true
+        printf "newgidmap: "; stat -c "%A %a %u:%g %n" /usr/bin/newgidmap 2>&1 || true
+        podman info 2>&1 || true
+    ' >&2 || true
+}
+
 cleanup() {
     local status=$?
-    docker rm -f "$container" >/dev/null 2>&1 || true
-    docker rm -f "$dev_container" >/dev/null 2>&1 || true
-    docker volume rm "$socket_volume" "$data_volume" >/dev/null 2>&1 || true
+    if [[ "$status" -ne 0 ]]; then
+        dump_engine_diagnostics
+    fi
+    docker rm -f "$container" || true
+    docker rm -f "$dev_container" || true
+    docker volume rm "$socket_volume" "$data_volume" || true
     rm -rf -- "$tmp_dir"
     exit "$status"
 }
@@ -83,7 +104,7 @@ engine_run --detach --name "$container" \
     --volume "$socket_volume:/run/podman" \
     --volume "$data_volume:/var/lib/containers" \
     --volume "$tmp_dir/workspace:/workspace" \
-    podman:latest >/dev/null
+    podman:latest
 
 wait_for_socket() {
     wait_for_socket_in "$container"
@@ -93,7 +114,7 @@ wait_for_socket_in() {
     local probe_container="$1"
     local attempt
     for attempt in {1..60}; do
-        if docker exec "$probe_container" /bin/sh -c 'test -S /run/podman/podman.sock' >/dev/null 2>&1; then
+        if docker exec "$probe_container" /bin/sh -c 'test -S /run/podman/podman.sock'; then
             return 0
         fi
         sleep 1
