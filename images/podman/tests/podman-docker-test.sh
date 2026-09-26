@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Run images/podman/tests/docker.sh inside a Docker daemon hosted by a QEMU
+# Run images/podman/tests/common.sh inside a Docker daemon hosted by a QEMU
 # NixOS guest. This preserves the nested cgroup topology from CI and checks
 # that the engine receives a writable cgroup2 hierarchy for crun.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd -- "$script_dir/.." && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 image_nix="$script_dir/docker-image.nix"
 ssh_port="${PODMAN_QEMU_SSH_PORT:-22230}"
 memory="${PODMAN_QEMU_MEMORY:-4096}"
@@ -28,9 +28,17 @@ require_command() {
     }
 }
 
-for command in nix-build qemu-img ssh sshpass tar; do
+for command in nix-build nix-instantiate qemu-img ssh sshpass tar; do
     require_command "$command"
 done
+
+# Resolve the pinned nixpkgs source when this script is run outside the CI
+# workflow, which normally provides NIX_PATH through the Nix installer.
+if [[ -z "${NIX_PATH:-}" ]]; then
+    nixpkgs_path="$(nix-instantiate --eval --raw -E \
+        "let sources = import $script_dir/../npins; in sources.nixpkgs.outPath")"
+    export NIX_PATH="nixpkgs=$nixpkgs_path"
+fi
 
 mkdir -p "$work_dir"
 
@@ -114,11 +122,11 @@ echo "==> copying nixos-dockers into the guest"
 ssh_guest mkdir -p /workspace/nixos-dockers
 tar -C "$repo_root" -cf - . | ssh_guest tar -xf - -C /workspace/nixos-dockers
 
-echo "==> running images/podman/tests/docker.sh in the guest"
+echo "==> running images/podman/tests/common.sh in the guest"
 ssh_guest env NIX_PATH="nixpkgs=/etc/nixpkgs" bash -s <<'GUEST_TEST'
 set -Eeuo pipefail
 cd /workspace/nixos-dockers
-exec bash images/podman/tests/docker.sh
+exec bash images/podman/tests/common.sh
 GUEST_TEST
 
 echo "==> Podman Docker test completed successfully"

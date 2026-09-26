@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # then run the Podman engine image test as the guest's unprivileged user.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd -- "$script_dir/.." && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 image_nix="$script_dir/podman-rootless-image.nix"
 ssh_port="${PODMAN_ROOTLESS_QEMU_SSH_PORT:-22231}"
 memory="${PODMAN_ROOTLESS_QEMU_MEMORY:-4096}"
@@ -34,11 +34,11 @@ done
 mkdir -p "$work_dir"
 rm -f "$known_hosts"
 
-# GitHub runners normally provide NIX_PATH through install-nix-action. Make
-# the standalone script work as well by resolving the image's pinned source.
+# Resolve the pinned nixpkgs source when this script is run without a caller
+# that has already configured NIX_PATH.
 if [[ -z "${NIX_PATH:-}" ]]; then
     nixpkgs_path="$(nix-instantiate --eval --raw -E \
-        "let sources = import $repo_root/images/podman/npins; in sources.nixpkgs.outPath")"
+        "let sources = import $script_dir/../npins; in sources.nixpkgs.outPath")"
     export NIX_PATH="nixpkgs=$nixpkgs_path"
 fi
 
@@ -134,7 +134,7 @@ ssh_guest mkdir -p /workspace/nixos-dockers
 tar -C "$repo_root" -cf - . | ssh_guest tar -xf - -C /workspace/nixos-dockers
 ssh_guest chown -R podman:podman /workspace/nixos-dockers
 
-echo "==> running images/podman/tests/docker.sh as rootless podman"
+echo "==> running images/podman/tests/common.sh as rootless podman"
 ssh_guest_user env \
     NIX_PATH="nixpkgs=/etc/nixpkgs" \
     HOME=/home/podman \
@@ -145,7 +145,7 @@ cd /workspace/nixos-dockers
 test "$(id -u)" = 1000
 test "$(id -g)" = 1000
 test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
-exec bash images/podman/tests/docker.sh
+exec bash images/podman/tests/common.sh
 GUEST_TEST
 
 echo "==> rootless Podman image test completed successfully"

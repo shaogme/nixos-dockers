@@ -50,5 +50,11 @@ jobs:
           repo: shaogme/mise-nixcache
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install qemu tools
+        if: matrix.image == 'podman'
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y qemu-utils
+
       - name: Build and test Docker images
         run: bash "images/${{ matrix.image }}/tests/docker.sh"
