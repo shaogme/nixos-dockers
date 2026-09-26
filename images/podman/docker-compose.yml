@@ -1,0 +1,64 @@
+services:
+  podman:
+    image: podman:latest
+    command: ["podman", "system", "service", "--time=0", "unix:///run/podman/podman.sock"]
+    environment:
+      PODMAN_SOCKET_GID: "${PODMAN_SOCKET_GID:-1000}"
+      PODMAN_SOCKET_MODE: "${PODMAN_SOCKET_MODE:-0660}"
+    volumes:
+      - podman-socket:/run/podman
+      - podman-data:/var/lib/containers
+      - .:/workspace
+    # This service is safe to run from a rootless Docker/Podman daemon. The
+    # image process is also unprivileged; its private cgroup namespace keeps
+    # cgroup management inside the outer runtime's delegation boundary.
+    user: "1000:1000"
+    cgroup: private
+    cap_drop: [ALL]
+    # crun needs the namespaced capability to mount /proc for rootless
+    # workloads. It uses no privileged mode and remains inside the outer
+    # runtime's namespace boundary.
+    cap_add:
+      - SYS_ADMIN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - seccomp:unconfined
+      - systempaths:unconfined
+    group_add:
+      - "${PODMAN_SOCKET_GID:-1000}"
+    devices:
+      - /dev/fuse:/dev/fuse
+      - /dev/net/tun:/dev/net/tun
+    healthcheck:
+      test: ["CMD-SHELL", "podman --remote --url unix:///run/podman/podman.sock info >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
+  dev:
+    image: alpine:latest
+    command: ["/bin/sh", "-c", "apk add --no-cache podman >/dev/null 2>&1 || true; exec sleep infinity"]
+    depends_on:
+      podman:
+        condition: service_healthy
+    environment:
+      CONTAINER_HOST: unix:///run/podman/podman.sock
+      DOCKER_HOST: unix:///run/podman/podman.sock
+    volumes:
+      - .:/workspace
+      - podman-socket:/run/podman
+    group_add:
+      - "${PODMAN_SOCKET_GID:-1000}"
+    working_dir: /workspace
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stdin_open: true
+    tty: true
+
+volumes:
+  podman-socket:
+  podman-data:

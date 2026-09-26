@@ -4,14 +4,17 @@ set -Eeuo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd -- "$script_dir/../../.." && pwd)"
 image_file="$root_dir/images/podman/image.nix"
+compose_file="$root_dir/images/podman/docker-compose.yml"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/nixos-dockers-podman-test.XXXXXX")"
 container="nixos-dockers-podman-$$"
+dev_container="nixos-dockers-podman-alpine-dev-$$"
 socket_volume="nixos-dockers-podman-socket-$$"
 data_volume="nixos-dockers-podman-data-$$"
 
 cleanup() {
     local status=$?
     docker rm -f "$container" >/dev/null 2>&1 || true
+    docker rm -f "$dev_container" >/dev/null 2>&1 || true
     docker volume rm "$socket_volume" "$data_volume" >/dev/null 2>&1 || true
     rm -rf -- "$tmp_dir"
     exit "$status"
@@ -21,6 +24,8 @@ trap cleanup EXIT
 command -v docker >/dev/null
 command -v nix-build >/dev/null
 command -v nix-instantiate >/dev/null
+[[ -f "$compose_file" ]]
+grep -Eq '^[[:space:]]+image:[[:space:]]+alpine:latest[[:space:]]*$' "$compose_file"
 
 assert_contains() {
     local value="$1"
@@ -52,30 +57,23 @@ docker volume create "$data_volume" >/dev/null
 mkdir -p "$tmp_dir/workspace"
 printf 'engine test workspace\n' > "$tmp_dir/workspace/README"
 
-echo "==> starting rootful Podman engine"
+echo "==> starting rootless Podman engine"
 engine_run() {
-    # crun/netavark need these narrowly scoped policy relaxations for nested
-    # rootful workloads; the capability set below remains explicitly bounded.
+    # The engine must remain usable from a rootless outer daemon.  Overlay
+    # storage uses fuse-overlayfs; the engine uses a private cgroup namespace
+    # and an explicit device set without privileged mode.
     docker run \
-        --user 0:0 \
+        --user 1000:1000 \
         --cap-drop=ALL \
-        --cap-add=CHOWN \
-        --cap-add=DAC_OVERRIDE \
-        --cap-add=FOWNER \
-        --cap-add=MKNOD \
-        --cap-add=NET_ADMIN \
-        --cap-add=NET_RAW \
-        --cap-add=SETFCAP \
-        --cap-add=SETGID \
-        --cap-add=SETPCAP \
-        --cap-add=SETUID \
         --cap-add=SYS_ADMIN \
-        --cap-add=SYS_CHROOT \
+        --cap-add=SETUID \
+        --cap-add=SETGID \
+        --cap-add=DAC_OVERRIDE \
         --cgroupns=private \
         --security-opt seccomp=unconfined \
-        --security-opt apparmor=unconfined \
         --security-opt systempaths=unconfined \
         --device /dev/fuse \
+        --device /dev/net/tun \
         "$@"
 }
 
@@ -88,21 +86,25 @@ engine_run --detach --name "$container" \
     podman:latest >/dev/null
 
 wait_for_socket() {
+    wait_for_socket_in "$container"
+}
+
+wait_for_socket_in() {
+    local probe_container="$1"
     local attempt
     for attempt in {1..60}; do
-        if docker exec "$container" /bin/sh -c 'test -S /run/podman/podman.sock'; then
+        if docker exec "$probe_container" /bin/sh -c 'test -S /run/podman/podman.sock' >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
     done
-    docker logs "$container" >&2 || true
     return 1
 }
 wait_for_socket
 
-echo "==> verifying rootful cgroup and namespace policy"
+echo "==> verifying rootless cgroup and namespace policy"
 engine_user="$(docker inspect --format '{{.Config.User}}' "$container")"
-[[ "$engine_user" == 0:0 ]]
+[[ "$engine_user" == 1000:1000 ]]
 engine_cgroupns="$(docker inspect --format '{{.HostConfig.CgroupnsMode}}' "$container" 2>/dev/null || true)"
 if [[ -n "$engine_cgroupns" ]]; then
     [[ "$engine_cgroupns" == private ]]
@@ -111,10 +113,7 @@ engine_cgroup_policy="$(docker exec "$container" /bin/sh -c "grep -E '^(cgroups|
 assert_contains "$engine_cgroup_policy" 'cgroups = "enabled"'
 assert_contains "$engine_cgroup_policy" 'cgroupns = "private"'
 engine_cgroup_mount="$(docker exec "$container" /bin/sh -c "grep ' /sys/fs/cgroup ' /proc/self/mountinfo")"
-assert_contains "$engine_cgroup_mount" ' rw,'
-engine_cgroup_controllers="$(docker exec "$container" /bin/sh -c "cat /sys/fs/cgroup/cgroup.subtree_control")"
-assert_contains "$engine_cgroup_controllers" 'cpu'
-assert_contains "$engine_cgroup_controllers" 'pids'
+assert_contains "$engine_cgroup_mount" 'cgroup2'
 
 echo "==> validating socket permissions and engine configuration"
 socket_stat="$(docker exec "$container" /bin/sh -c "stat -c '%a:%g' /run/podman/podman.sock")"
@@ -130,10 +129,53 @@ echo "==> validating API create/delete and workspace path"
 docker exec -i "$container" podman load < "$archive" >/dev/null
 docker exec "$container" podman --remote --url unix:///run/podman/podman.sock create \
     --name engine-test-workload --entrypoint /bin/sh podman:latest -c 'test -d /workspace' >/dev/null
+
+echo "==> validating bridge and host networking through the engine socket"
+bridge_output="$(docker exec "$container" podman --remote --url unix:///run/podman/podman.sock run \
+    --rm --network=bridge --entrypoint /bin/sh podman:latest \
+    -c 'printf socket-bridge-network')"
+[[ "$bridge_output" == socket-bridge-network ]]
+host_output="$(docker exec "$container" podman --remote --url unix:///run/podman/podman.sock run \
+    --rm --network=host --entrypoint /bin/sh podman:latest \
+    -c 'printf socket-host-network')"
+[[ "$host_output" == socket-host-network ]]
+
+echo "==> reproducing Alpine dev socket networking without extra capabilities"
+docker run --detach --name "$dev_container" \
+    --cap-drop=ALL \
+    --security-opt no-new-privileges:true \
+    --group-add 1000 \
+    --env CONTAINER_HOST=unix:///run/podman/podman.sock \
+    --env DOCKER_HOST=unix:///run/podman/podman.sock \
+    --volume "$socket_volume:/run/podman" \
+    --volume "$tmp_dir/workspace:/workspace" \
+    --workdir /workspace \
+    docker.io/library/alpine:latest \
+    /bin/sh -c 'apk add --no-cache podman >/dev/null || true; exec sleep 300' >/dev/null
+for attempt in {1..60}; do
+    if docker exec "$dev_container" /bin/sh -c 'command -v podman >/dev/null 2>&1'; then
+        break
+    fi
+    if [[ "$attempt" -eq 60 ]]; then
+        docker logs "$dev_container" >&2 || true
+        exit 1
+    fi
+    sleep 1
+done
+
+dev_bridge_output="$(docker exec "$dev_container" podman run \
+    --rm --network=bridge docker.io/library/alpine:latest \
+    /bin/sh -c 'printf alpine-dev-bridge-network')"
+[[ "$dev_bridge_output" == alpine-dev-bridge-network ]]
+dev_host_output="$(docker exec "$dev_container" podman run \
+    --rm --network=host docker.io/library/alpine:latest \
+    /bin/sh -c 'printf alpine-dev-host-network')"
+[[ "$dev_host_output" == alpine-dev-host-network ]]
+
 workload_output="$(docker exec "$container" podman --remote --url unix:///run/podman/podman.sock run \
     --rm --network=none --cgroups=enabled --entrypoint /bin/sh podman:latest \
-    -c 'test "$(id -u)" = 0; printf rootful-workload')"
-[[ "$workload_output" == rootful-workload ]]
+    -c 'test "$(id -u)" = 1000; printf rootless-workload')"
+[[ "$workload_output" == rootless-workload ]]
 docker exec "$container" podman --remote --url unix:///run/podman/podman.sock rm engine-test-workload >/dev/null
 
 echo "==> validating persistent data after engine restart"

@@ -16,8 +16,11 @@ let
 
   containersStorage = pkgs.writeTextDir "etc/containers/storage.conf" ''
     [storage]
+    # fuse-overlayfs provides the overlay mount for the unprivileged engine;
+    # the outer runtime only needs the tested namespaced capabilities for
+    # crun and rootless UID/GID mapping, never privileged mode.
     driver = "overlay"
-    runroot = "/run/containers/storage"
+    runroot = "/run/user/1000/containers"
     graphroot = "/var/lib/containers/storage"
 
     [storage.options]
@@ -32,14 +35,18 @@ let
     [containers]
     cgroups = "enabled"
     cgroupns = "private"
-    userns = "host"
+    # Keep the engine user's UID/GID stable inside rootless workloads while
+    # retaining a private workload user namespace.
+    userns = "keep-id"
 
     [engine]
     cgroup_manager = "cgroupfs"
     runtime = "crun"
     events_logger = "file"
     network_backend = "netavark"
-    network_cmd_path = "/usr/bin/netavark"
+    # network_cmd_path is the rootless slirp4netns helper path; netavark is
+    # selected independently through network_backend above.
+    network_cmd_path = "/usr/bin/slirp4netns"
 
     [network]
     default_rootless_network_cmd = "slirp4netns"
@@ -47,10 +54,12 @@ let
 
   passwd = pkgs.writeTextDir "etc/passwd" ''
     root:x:0:0:root:/root:/bin/sh
+    podman:x:1000:1000:Podman Engine:/home/podman:/bin/sh
   '';
 
   group = pkgs.writeTextDir "etc/group" ''
     root:x:0:
+    podman:x:1000:
   '';
 
   entrypoint = pkgs.writeTextFile {
@@ -61,39 +70,19 @@ let
       #!${pkgs.busybox}/bin/sh
       set -eu
 
-      # Docker mounts cgroup2 read-only in ordinary containers. Remount the
-      # namespace-local hierarchy writable so cgroupfs and crun can create
-      # child cgroups without sharing the host cgroup namespace.
-      if [ -e /sys/fs/cgroup/cgroup.subtree_control ]; then
-        if ! ${pkgs.busybox}/bin/mount -o bind,remount,rw /sys/fs/cgroup; then
-          echo "podman engine requires a writable cgroup2 mount" >&2
-          exit 1
-        fi
-
-        # A private namespace starts with PID 1 in its root cgroup. Move the
-        # entrypoint aside before enabling controllers; cgroup v2 rejects
-        # controller delegation from a populated non-leaf cgroup.
-        cgroup_bootstrap=/sys/fs/cgroup/podman-init
-        mkdir -p "$cgroup_bootstrap"
-        echo "$$" > "$cgroup_bootstrap/cgroup.procs"
-        cgroup_controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
-        cgroup_enable=""
-        for controller in $cgroup_controllers; do
-          cgroup_enable="$cgroup_enable +$controller"
-        done
-        if [ -n "$cgroup_enable" ]; then
-          echo "$cgroup_enable" > /sys/fs/cgroup/cgroup.subtree_control
-        fi
-      fi
-
       socket_dir=/run/podman
       socket_path="$socket_dir/podman.sock"
       socket_gid="''${PODMAN_SOCKET_GID:-1000}"
       socket_mode="''${PODMAN_SOCKET_MODE:-0660}"
 
-      mkdir -p "$socket_dir" /run/containers/storage /var/lib/containers/storage
+      mkdir -p "$socket_dir" /run/user/1000/containers /var/lib/containers/storage
+      # A rootless process can only change the group to one it owns.  The
+      # default GID is the engine user's GID; callers that need another GID
+      # can opt into the explicitly configured socket mode.
       chgrp "$socket_gid" "$socket_dir" 2>/dev/null || true
-      chmod 0770 "$socket_dir"
+      # The socket volume may be initialized as root-owned by Docker.  Its
+      # image directory is intentionally writable, so UID 1000 can create
+      # the socket without needing to chmod/chown the volume mount itself.
 
       if [ "$#" -eq 0 ]; then
         set -- /usr/bin/podman system service --time=0 "unix://$socket_path"
@@ -141,14 +130,14 @@ in
     enable = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Enable the minimal rootful Podman engine service image.";
+      description = "Enable the minimal rootless Podman engine service image.";
     };
   };
 
   config = lib.mkIf config.profiles.podman.enable {
     docker.includeNixDB = false;
     docker.environmentPath = "/usr/bin:/bin";
-    docker.user = "0:0";
+    docker.user = "1000:1000";
     docker.version = lib.mkDefault pkgs.podman.version;
     docker.extraContents = [
       # The engine is built without profiles.base/system, so include the trust
@@ -163,8 +152,17 @@ in
       group
     ];
     docker.extraCommands = ''
-      mkdir -p bin usr/bin usr/local/bin etc/containers tmp var/tmp workspace root run/podman run/containers/storage var/lib/containers/storage
+      mkdir -p bin usr/bin usr/local/bin etc/containers tmp var/tmp workspace root home/podman run/podman run/user/1000/containers var/lib/containers/storage
       chmod 1777 tmp var/tmp workspace
+      # Keep the image layer root-owned so a single rootless UID mapping can
+      # import it; world-writable application directories provide UID 1000
+      # with the access the engine needs after Docker applies its User field.
+      chmod 0777 home/podman run/podman run/user/1000/containers var/lib/containers/storage
+      # Rootless workloads need a subordinate range for image layer ownership
+      # while the engine process itself remains UID/GID 1000.
+      printf 'podman:100000:65536\n' > etc/subuid
+      printf 'podman:100000:65536\n' > etc/subgid
+      chmod 0644 etc/subuid etc/subgid
       ln -sf ${pkgs.busybox}/bin/busybox bin/sh
       ln -sf ${pkgs.busybox}/bin/busybox usr/bin/sh
       ln -sf ${pkgs.podman}/bin/podman usr/bin/podman
@@ -177,6 +175,12 @@ in
       ln -sf ${pkgs.slirp4netns}/bin/slirp4netns usr/bin/slirp4netns
       ln -sf ${pkgs.iptables}/bin/iptables usr/bin/iptables
       ln -sf ${pkgs.iptables}/bin/iptables-nft usr/bin/iptables-nft
+      cp -L ${pkgs.shadow}/bin/newuidmap usr/bin/newuidmap
+      cp -L ${pkgs.shadow}/bin/newgidmap usr/bin/newgidmap
+    '';
+    docker.fakeRootCommands = ''
+      chmod 0777 home/podman run/podman run/user/1000 var/lib/containers
+      chmod 4755 usr/bin/newuidmap usr/bin/newgidmap
     '';
     environment.systemPackages = packages;
     environment.variables = {
@@ -185,6 +189,10 @@ in
       CONTAINERS_REGISTRIES_CONF = "/etc/containers/registries.conf";
       SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
       NIX_SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
+      HOME = "/home/podman";
+      USER = "podman";
+      LOGNAME = "podman";
+      XDG_RUNTIME_DIR = "/run/user/1000";
       PODMAN_SOCKET_GID = "1000";
       PODMAN_SOCKET_MODE = "0660";
     };
