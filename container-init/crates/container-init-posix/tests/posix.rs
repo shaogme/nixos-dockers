@@ -56,12 +56,12 @@ fn isolated_account_database_is_read_and_reconciled_atomically() {
     let second = system.map_user(&identity).unwrap();
     assert_eq!(second.message(), "POSIX passwd entry already mapped");
     system
-        .set_user_shell("fixture", Path::new("/usr/bin/dev-env-login-shell"))
+        .set_user_shell("fixture", Path::new("/usr/bin/login-shell"))
         .unwrap();
 
     assert!(fs::read_to_string(&passwd)
         .unwrap()
-        .contains("fixture:x:2100:2101::/home/fixture:/usr/bin/dev-env-login-shell"));
+        .contains("fixture:x:2100:2101::/home/fixture:/usr/bin/login-shell"));
     assert!(fs::read_to_string(&group)
         .unwrap()
         .contains("fixture:x:2101:"));

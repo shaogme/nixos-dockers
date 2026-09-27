@@ -223,6 +223,8 @@ in
     environment.variables = {
       DEVENV_CONTAINER_INIT = containerInitPath;
       DEVENV_BOOTSTRAP_REAL_SHELL = bootstrapRealShellPath;
+      CONTAINER_INIT_PROFILE_DIR = "/etc/dev-env/profiles.d";
+      CONTAINER_INIT_DEFAULT_PROFILE = "/etc/dev-env/default-profile";
       DEVENV_BACKEND_SOCKET = "/run/dev-env/backend.sock";
       DEVENV_IDENTITY_BROKER_SOCKET = "/run/container-init/backend.sock";
       DEVENV_BACKEND_SOCKET_GID = toString config.system.defaultGid;

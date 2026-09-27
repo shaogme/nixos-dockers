@@ -7,8 +7,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_PROFILES_DIR: &str = "/etc/dev-env/profiles.d";
-pub const DEFAULT_PROFILE_FILE: &str = "/etc/dev-env/default-profile";
+pub const DEFAULT_PROFILES_DIR: &str = "/etc/container-init/profiles.d";
+pub const DEFAULT_PROFILE_FILE: &str = "/etc/container-init/default-profile";
 
 pub struct LoadedConfig {
     profile: String,

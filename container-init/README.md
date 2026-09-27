@@ -80,7 +80,7 @@ run_as = "root"
 depends_on = ["state-dir"]
 ```
 
-把文件放到例如 `/etc/dev-env/profiles.d/example.toml`，并让默认 profile 文件包含单独一行的 `example`：
+把文件放到例如 `/etc/container-init/profiles.d/example.toml`，并让默认 profile 文件包含单独一行的 `example`：
 
 ```text
 example

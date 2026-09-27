@@ -47,7 +47,7 @@ container-init --profile coding-images plan --json
       "origin": {
         "profile": "base",
         "source": "image_profile",
-        "location": "/etc/dev-env/profiles.d/base.toml:bootstrap.actions[0]"
+        "location": "/etc/container-init/profiles.d/base.toml:bootstrap.actions[0]"
       },
       "idempotency": "idempotent",
       "effect": "identity_resolve"
@@ -186,6 +186,10 @@ CLI 环境变量的发现顺序如下；同一类配置中，命令行选项优�
 | `WORKSPACE` | workspace 的通用回退变量 | 当前目录 |
 | `CONTAINER_INIT_BACKEND_SOCKET` | backend Unix socket | root: `/run/container-init/backend.sock` |
 | `CONTAINER_INIT_BACKEND_TIMEOUT_MS` | backend 请求/启动连接超时 | 5000 |
+
+handoff runtime 如果需要为自身的 runtime ACL 使用解析后的非 root 映射身份，
+`container-init` 会在初始 handoff 中提供 `CONTAINER_INIT_HANDOFF_UID` 和
+`CONTAINER_INIT_HANDOFF_GID`；这两个变量不属于 Bootstrap profile 输入。
 
 profile 的 typed input 不是由 container-init 读取全部环境变量，而是仅读取 `bootstrap.inputs` 中声明的名字和 aliases。其他 ambient 环境值只会在条件或路径显式使用 `env.NAME` 时被引用。
 

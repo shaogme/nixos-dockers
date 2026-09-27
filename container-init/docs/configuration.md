@@ -7,7 +7,7 @@
 CLI 默认读取：
 
 ```text
-/etc/dev-env/
+/etc/container-init/
 ├── default-profile          # 一个 profile id，不能包含空白
 └── profiles.d/
     ├── base.toml
@@ -20,8 +20,8 @@ CLI 默认读取：
 典型 Docker 镜像配置：
 
 ```dockerfile
-COPY profiles.d/ /etc/dev-env/profiles.d/
-COPY default-profile /etc/dev-env/default-profile
+COPY profiles.d/ /etc/container-init/profiles.d/
+COPY default-profile /etc/container-init/default-profile
 COPY container-init /usr/bin/container-init
 
 ENTRYPOINT ["/usr/bin/container-init", "run"]
@@ -38,7 +38,7 @@ ENTRYPOINT ["/usr/bin/container-init", "run"]
 1. `--profiles-dir PATH` 或 `--profile-dir PATH`；
 2. `CONTAINER_INIT_PROFILE_DIR`；
 3. `CONTAINER_INIT_PROFILES_DIR`；
-4. `/etc/dev-env/profiles.d`。
+4. `/etc/container-init/profiles.d`。
 
 按优先级选择 admin profile 目录：
 
@@ -62,7 +62,7 @@ image 目录中的 profile 标记为 `image_profile`，admin 目录中的 profil
 1. `--default-profile PATH` 或 `--default-profile-file PATH`；
 2. `CONTAINER_INIT_DEFAULT_PROFILE`；
 3. `CONTAINER_INIT_DEFAULT_PROFILE_FILE`；
-4. `/etc/dev-env/default-profile`。
+4. `/etc/container-init/default-profile`。
 
 默认文件必须只包含一个非空、无空白的 profile id，例如：
 
@@ -271,7 +271,7 @@ workspace action 仍需同时满足：kind 在安全集合中、`run_as = "targe
 container-init 本身不包含 NixOS module，也不推断镜像目录。NixOS 或镜像构建层应负责：
 
 1. 把编译出的 `/usr/bin/container-init` 放进镜像；
-2. 写入 `/etc/dev-env/profiles.d` 和默认 profile；
+2. 写入 `/etc/container-init/profiles.d` 和默认 profile；
 3. 确保 profile 中的 `runtime`、`login_shell`、`ssh_daemon`（如果使用）是真实绝对路径；
 4. 为 `run_as = "root"` 的 profile action 选择 root entrypoint；
 5. 需要 SSH 时确保 `ssh-keygen` 存在，并在 action 中声明 `ssh_keygen` 或使用默认 `/usr/bin/ssh-keygen`；
@@ -287,7 +287,7 @@ Docker 的 `ENTRYPOINT ["/usr/bin/container-init", "run"]` 只规定入口；真
 检查 profile id 是否与 TOML 内的 `id` 一致，并确认搜索目录里扩展名是 `.toml`：
 
 ```bash
-container-init --profiles-dir /etc/dev-env/profiles.d \
+container-init --profiles-dir /etc/container-init/profiles.d \
   --profile coding-images plan --json
 ```
 

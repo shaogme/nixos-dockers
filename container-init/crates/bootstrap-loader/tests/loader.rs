@@ -22,7 +22,7 @@ default_gid = 1000
 auto_mapping = true
 
 [bootstrap.handoff]
-runtime = "/usr/bin/dev-env"
+runtime = "/usr/bin/runtime"
 exec_prefix = ["exec", "--"]
 shell_prefix = ["shell"]
 

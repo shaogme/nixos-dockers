@@ -466,15 +466,19 @@ fn spawn_handoff(
         .args(&handoff.args)
         .current_dir(cwd)
         .process_group(0);
+    if identity.uid != 0 {
+        // Handoff runtimes may need a mapped non-root identity to set their
+        // own runtime ACLs. Keep this contract runtime-neutral. Root service
+        // handoffs retain the runtime's configured peer ACL.
+        command
+            .env("CONTAINER_INIT_HANDOFF_UID", identity.uid.to_string())
+            .env("CONTAINER_INIT_HANDOFF_GID", identity.gid.to_string());
+    }
     if root_service {
         command
             .env("HOME", "/root")
             .env("USER", "root")
-            .env("LOGNAME", "root")
-            // The startup identity may come from HOST_UID/HOST_GID mapping;
-            // pass its resolved UID to the backend peer policy rather than
-            // relying on the image's default UID.
-            .env("DEVENV_BACKEND_ALLOWED_UID", identity.uid.to_string());
+            .env("LOGNAME", "root");
     } else {
         command
             .env("HOME", &identity.home)

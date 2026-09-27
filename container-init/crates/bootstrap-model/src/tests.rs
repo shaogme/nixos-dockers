@@ -20,7 +20,7 @@ fn config(actions: Vec<Action>) -> BootstrapConfig {
             home_input: Some("CONTAINER_HOME".to_owned()),
         },
         handoff: HandoffConfig {
-            runtime: "/usr/bin/dev-env".to_owned(),
+            runtime: "/usr/bin/runtime".to_owned(),
             exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
             initial_exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
             shell_prefix: vec!["shell".to_owned()],

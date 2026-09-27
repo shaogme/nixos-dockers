@@ -273,7 +273,7 @@ fn authorized_peer(peer: dev_env_model::IdentityPeer) -> bool {
     if peer.uid == 0 {
         return true;
     }
-    let allowed = env::var("DEVENV_BACKEND_ALLOWED_UID")
+    let allowed = env::var("CONTAINER_INIT_HANDOFF_UID")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or_else(|| unsafe { libc::geteuid() });
@@ -860,9 +860,9 @@ fn socket_path(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
 }
 
 fn backend_socket_gid() -> Result<u32, CliError> {
-    if let Some(value) = env::var_os("DEVENV_BACKEND_SOCKET_GID") {
+    if let Some(value) = env::var_os("CONTAINER_INIT_HANDOFF_GID") {
         return value.to_string_lossy().parse::<u32>().map_err(|_| {
-            CliError::Backend("DEVENV_BACKEND_SOCKET_GID must be an integer".to_owned())
+            CliError::Backend("CONTAINER_INIT_HANDOFF_GID must be an integer".to_owned())
         });
     }
     Ok(unsafe { libc::getegid() })
