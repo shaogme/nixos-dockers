@@ -95,7 +95,7 @@ container-init --profile coding-images run -- tool --flag 'value with spaces'
 1. 获取固定 backend 实例 `flock`；已有实例只返回状态，不再加载 profile；
 2. 加载 image/admin profile 目录并选择 profile，构建不可变 snapshot；
 3. 完成启动 reconcile，创建 identity broker socket，并以 root service 身份启动唯一的
-   dev-env backend handoff 子进程；
+   runtime backend handoff 子进程；
 4. backend 监督初始子进程，初始子进程退出码成为容器退出码；
 5. 收到终止信号时转发给 backend，回收子进程并清理 broker/socket 状态。
 
@@ -121,7 +121,7 @@ container-init exec
 container-init exec -- tool --flag 'value with spaces'
 ```
 
-`exec` 是连接运行中 backend 的并发权限转交入口（供 `dev-env shim` 或并发 `docker exec` 使用）。它会：
+`exec` 是连接运行中 backend 的并发权限转交入口（供 runtime shim 或并发 `docker exec` 使用）。它会：
 
 1. 通过 Unix socket 向 backend 请求快照中的 handoff 和身份 reconciliation；
 2. 发送绝对 cwd、显式 runtime input 和 schema 允许的环境值；

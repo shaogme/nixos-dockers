@@ -27,7 +27,7 @@ COPY container-init /usr/bin/container-init
 ENTRYPOINT ["/usr/bin/container-init", "run"]
 ```
 
-`container-init` 不要求 runtime 叫 `dev-env`；由每个 profile 的 `bootstrap.handoff.runtime` 决定最终执行哪个绝对路径。
+`container-init` 不规定 runtime 的名称；由每个 profile 的 `bootstrap.handoff.runtime` 决定最终执行哪个绝对路径。
 
 ## 2. 路径发现和优先级
 
@@ -127,11 +127,11 @@ runtime = true
 allow_outside_workspace = false
 
 [bootstrap.handoff]
-runtime = "/usr/bin/dev-env"
+runtime = "/usr/bin/example-runtime"
 exec_prefix = ["exec", "--"]
 shell_prefix = ["shell"]
 root_service = true
-login_shell = "/usr/bin/dev-env-login-shell"
+login_shell = "/usr/bin/example-runtime-login-shell"
 
 [[bootstrap.actions]]
 id = "resolve"
@@ -213,7 +213,7 @@ id = "admin-coding"
 extends = ["coding-images"]
 
 [bootstrap.handoff]
-runtime = "/usr/local/bin/dev-env"
+runtime = "/usr/local/bin/example-runtime"
 
 [override."bootstrap.handoff.runtime"]
 op = "set"
@@ -278,7 +278,7 @@ container-init 本身不包含 NixOS module，也不推断镜像目录。NixOS �
 6. 给持久化数据目录配置正确 mount 与权限，避免把真实 mountpoint 当成待替换的 symlink；
 7. 在镜像构建和运行时分别执行 `plan`、`doctor` 与测试。
 
-Docker 的 `ENTRYPOINT ["/usr/bin/container-init", "run"]` 只规定入口；真正的最终 runtime 和参数由 profile handoff 决定。`docker exec` 不应再次调用 container-init 作为隐含前置；需要新会话时应直接调用上层 runtime，例如 `dev-env shell`。
+Docker 的 `ENTRYPOINT ["/usr/bin/container-init", "run"]` 只规定入口；真正的最终 runtime 和参数由 profile handoff 决定。`docker exec` 不应再次调用 container-init 作为隐含前置；需要新会话时应直接调用上层 runtime 的 shell 命令。
 
 ## 7. 常见配置错误
 

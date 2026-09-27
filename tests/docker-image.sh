@@ -65,6 +65,26 @@ wait_for_running() {
     return 1
 }
 
+wait_for_backend() {
+    local container="$1"
+    local attempt state
+    for attempt in {1..30}; do
+        state="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)"
+        if [[ "$state" == false ]]; then
+            echo "container $container exited before the runtime backend became ready" >&2
+            docker logs "$container" >&2 || true
+            return 1
+        fi
+        if [[ "$state" == true ]] && docker exec "$container" /usr/bin/dev-env backend status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "timed out waiting for the runtime backend in $container" >&2
+    docker logs "$container" >&2 || true
+    return 1
+}
+
 test_loaded_image() {
     local attr="$1"
     local archive="$tmp_dir/${attr//\//_}.tar.gz"
@@ -169,6 +189,7 @@ test_loaded_image() {
         containers+=("$container")
         docker run --detach --name "$container" --env RUN_AS_ROOT=1 "$attr:latest" >/dev/null
         wait_for_running "$container"
+        wait_for_backend "$container"
         environment="$(docker exec "$container" /usr/bin/dev-env print --format json)"
         assert_contains "$environment" '"PATH"'
         echo "==> validating root SSH login shell"

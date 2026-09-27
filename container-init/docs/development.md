@@ -31,7 +31,7 @@ container-init-posix ← container-init-core ← container-init-backend ← cont
 - `container-init-backend` 持有单实例 snapshot，提供版本化 Unix socket RPC 和 PID 1 supervisor；
 - `container-init-cli` 负责参数解析、配置路径发现和 backend 启动/客户端命令；二进制名称是 `container-init`。
 
-保持这个方向很重要：bootstrap 不应反向依赖 dev-env provider、shellenv、mise、Devbox 或镜像特化逻辑。
+保持这个方向很重要：bootstrap 不应反向依赖任何 provider、shellenv 或镜像特化逻辑。
 
 ## 2. 本地构建和测试
 

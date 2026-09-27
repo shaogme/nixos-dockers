@@ -21,7 +21,7 @@ default_gid = 1000
 auto_mapping = true
 
 [bootstrap.handoff]
-runtime = "/usr/bin/dev-env"
+runtime = "/usr/bin/example-runtime"
 exec_prefix = ["exec", "--"]
 # Optional prefix for an explicit command during the initial backend handoff.
 initial_exec_prefix = ["backend", "run", "--initial-exec", "--"]
@@ -99,15 +99,15 @@ home_input = "CONTAINER_HOME"
 
 ```toml
 [bootstrap.handoff]
-runtime = "/usr/bin/dev-env"
+runtime = "/usr/bin/example-runtime"
 exec_prefix = ["exec", "--"]
 shell_prefix = ["shell"]
 ssh_daemon = "/usr/sbin/sshd"
-login_shell = "/usr/bin/dev-env-login-shell"
+login_shell = "/usr/bin/example-runtime-login-shell"
 ```
 
 `runtime` 必须是绝对路径，且不能包含空格或插值。所有 prefix 元素都必须是非空、不含 NUL/换行的 argv 值。
-`root_service = true` 只适用于受信任的长期 supervisor handoff（例如 dev-env backend）；它
+`root_service = true` 只适用于受信任的长期 supervisor handoff（例如 runtime backend）；它
 保留 container-init 的 root 权限给 supervisor，后续请求的 provider/命令身份仍必须由
 identity broker 明确解析，不能由 client 直接伪造 UID/GID。
 
@@ -318,7 +318,7 @@ depends_on = ["map-user"]
 id = "login-shell"
 kind = "process.set_user_shell"
 user = "identity.target"
-shell = "/usr/bin/dev-env-login-shell"
+shell = "/usr/bin/example-runtime-login-shell"
 run_as = "root"
 depends_on = ["map-user"]
 ```

@@ -12,13 +12,13 @@ POSIX 基础设施操作，然后把当前进程交给 profile 指定的 runtime
 - 必要时更新 passwd/group 和登录 shell；
 - 按声明准备可选的 OpenSSH host key、authorized keys 和运行目录；
 - 按声明自动化初始化 cgroup v2 层级、迁移隔离根进程并委托子树控制器，支持默认就地与只读挂载覆挂模式；
-- 以结构化 argv 方式 handoff 到 `dev-env` 或其他 runtime。
+- 以结构化 argv 方式 handoff 到 profile 指定的 runtime。
 
-它不执行 shell 脚本，不运行 `mise`、Devbox、sccache 或 provider，也不负责开发环境变量的物化。环境 DSL 与 Bootstrap DSL 可以存在于同一个 profile，但由不同程序分别读取。
+它不执行 shell 脚本，不运行 provider，也不负责开发环境变量的物化。环境 DSL 与 Bootstrap DSL 可以存在于同一个 profile，但由不同程序分别读取。
 
 Compose 注入的开发环境变量会随进程环境保留到 handoff runtime；例如
 `CARGO_INCREMENTAL`、`SCCACHE_DIR` 和 `SCCACHE_DISABLE` 的解析属于 handoff
-后的 `dev-env` environment DSL。`container-init` 不解析这些变量，也不会因为
+后的 runtime environment DSL。`container-init` 不解析这些变量，也不会因为
 `SCCACHE_DISABLE=1` 修改 `RUSTC_WRAPPER`。
 
 > 本 README 以当前 `container-init` 源码为准。身份 namespace 映射、挂载证据和 root service handoff 的实现约定见仓库顶层设计文档及[实现状态与边界](#实现状态与边界)。
@@ -112,32 +112,25 @@ ENTRYPOINT ["/usr/bin/container-init", "run"]
 
 如果需要把 `run` 的命令参数传给 handoff runtime，使用 `--` 结束 `container-init` 自身的选项。没有显式命令时使用 `shell_prefix`；初始 backend 的显式命令使用 `initial_exec_prefix`；运行中的 `exec` 使用 `exec_prefix`。程序始终以 argv 调用，不把参数拼成 shell 字符串。
 
-### `docker exec` 与 Bash shim
+### `docker exec` 与 runtime shim
 
 Docker daemon 不会为已运行容器重新执行 Entrypoint，因此它不会自动应用
-`container-init` 的身份解析和降权。镜像中的 `/bin/bash` 与 `/usr/bin/bash` 是
-`dev-env` 的兼容 shim；root 启动 shim 时，shim 会通过内部的
-`DEVENV_CONTAINER_INIT`、`DEVENV_BOOTSTRAP_REAL_SHELL` 路径重新执行：
+`container-init` 的身份解析和降权。镜像可以把 shell 兼容入口配置为 runtime
+shim；该 shim 应通过显式配置的 `container-init exec` 路径重新执行，再由运行中的
+backend 完成身份 reconciliation。shim 的环境变量、真实 shell 路径和 backend
+协议属于上层 runtime，不是 `container-init` 的固定实现。
 
-```text
-dev-env Bash shim
-  → container-init run -- /usr/local/libexec/dev-env/real/bash <原始 argv>
-  → backend snapshot / startup reconcile
-  → dev-env exec -- /usr/local/libexec/dev-env/real/bash <原始 argv>
-```
-
-这些变量只标记镜像提供的内部能力，shim 不会猜测 PATH 中的程序，也不会复制
-UID/GID 解析逻辑。`HOST_UID`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT` 会
-随继承环境传给 Bootstrap。需要保留 root 时显式使用：
+`HOST_UID`、`HOST_GID`、`CONTAINER_HOME` 和 `RUN_AS_ROOT` 会随继承环境传给
+Bootstrap。需要保留 root 时显式使用：
 
 ```bash
 docker exec -e RUN_AS_ROOT=1 -it <container> bash
 ```
 
-`/usr/bin/dev-env-login-shell` 是 root SSH 的稳定 login shell，不会因为 `/bin/bash`
-shim 而把 root 登录映射到开发用户；`/bin/sh` 和 real Bash 是低层诊断/显式逃生
-入口，不会自动运行身份 Bootstrap。`docker exec` 的自动身份行为来自 shim 委托，
-不是 Docker daemon 修改了容器默认用户。
+profile 可以把 root SSH 的稳定 login shell 指向 runtime 提供的入口；它不会因为
+shell shim 而把 root 登录映射到开发用户。低层 shell 入口不会自动运行身份
+Bootstrap。`docker exec` 的自动身份行为来自 shim 委托，不是 Docker daemon 修改了
+容器默认用户。
 
 ### 3. 用运行时输入映射宿主身份
 
