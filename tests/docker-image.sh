@@ -99,7 +99,9 @@ test_loaded_image() {
     assert_contains "$plan" '"handoff"'
 
     echo "==> validating dev-env materialization"
-    environment="$(docker run --rm --entrypoint /usr/bin/dev-env "$attr:latest" print --format json)"
+    # `dev-env` is a backend client in runtime images. Start the configured
+    # container-init/backend handoff before querying its materialized env.
+    environment="$(docker run --rm --entrypoint /usr/bin/container-init "$attr:latest" run -- /usr/bin/dev-env print --format json)"
     assert_contains "$environment" '"PATH"'
     assert_contains "$environment" '"NIX_PATH"'
 
@@ -108,7 +110,7 @@ test_loaded_image() {
     assert_contains "$handoff" 'nixos-docker handoff'
 
     echo "==> validating login-shell shim"
-    handoff="$(docker run --rm --entrypoint /usr/bin/dev-env-login-shell "$attr:latest" -c 'printf "nixos-docker login-shell"')"
+    handoff="$(docker run --rm --entrypoint /usr/bin/container-init "$attr:latest" run -- /usr/bin/dev-env-login-shell -c 'printf "nixos-docker login-shell"')"
     assert_contains "$handoff" 'nixos-docker login-shell'
 
     echo "==> validating non-mounted workspace default"

@@ -86,7 +86,7 @@ doctor 不会创建 workspace、HOME、SSH 目录、lock 或 receipt，也不会
 # 无显式 command，runtime 使用 shell_prefix
 container-init --profile coding-images run
 
-# 有显式 command，runtime 使用 exec_prefix
+# 有显式 command，初始 backend handoff 使用 initial_exec_prefix
 container-init --profile coding-images run -- tool --flag 'value with spaces'
 ```
 
@@ -117,7 +117,7 @@ service supervisor；`container-init exec` 不继承该标志，普通 provider 
 # 无显式 command，runtime 使用 shell_prefix
 container-init exec
 
-# 有显式 command，runtime 使用 exec_prefix
+# 有显式 command，运行中的 backend client 使用 exec_prefix
 container-init exec -- tool --flag 'value with spaces'
 ```
 

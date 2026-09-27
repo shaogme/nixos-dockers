@@ -23,6 +23,8 @@ auto_mapping = true
 [bootstrap.handoff]
 runtime = "/usr/bin/dev-env"
 exec_prefix = ["exec", "--"]
+# Optional prefix for an explicit command during the initial backend handoff.
+initial_exec_prefix = ["backend", "run", "--initial-exec", "--"]
 shell_prefix = ["shell"]
 root_service = true
 ```
@@ -113,8 +115,11 @@ identity broker 明确解析，不能由 client 直接伪造 UID/GID。
 
 ```text
 无显式 command: [runtime] + shell_prefix
-有显式 command: [runtime] + exec_prefix + command
+运行中的 exec: [runtime] + exec_prefix + command
+初始 run 的显式 command: [runtime] + initial_exec_prefix + command
 ```
+
+`initial_exec_prefix` 未设置时回退到 `exec_prefix`，适用于没有常驻 supervisor 的旧 profile。
 
 例如：
 

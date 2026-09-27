@@ -110,7 +110,7 @@ container-init --profile example run -- 'printf "ready\n"'
 ENTRYPOINT ["/usr/bin/container-init", "run"]
 ```
 
-如果需要把 `run` 的命令参数传给 handoff runtime，使用 `--` 结束 `container-init` 自身的选项。没有显式命令时使用 `shell_prefix`；有显式命令时使用 `exec_prefix`。程序始终以 argv 调用，不把参数拼成 shell 字符串。
+如果需要把 `run` 的命令参数传给 handoff runtime，使用 `--` 结束 `container-init` 自身的选项。没有显式命令时使用 `shell_prefix`；初始 backend 的显式命令使用 `initial_exec_prefix`；运行中的 `exec` 使用 `exec_prefix`。程序始终以 argv 调用，不把参数拼成 shell 字符串。
 
 ### `docker exec` 与 Bash shim
 
