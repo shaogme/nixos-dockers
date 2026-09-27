@@ -50,8 +50,8 @@ Podman API。它通过 `/run/podman/podman.sock` 提供 Unix socket，存储目�
 `/var/lib/containers`；应当与开发工具容器共享 socket、数据卷和 `/workspace` 路径。
 引擎只通过 Compose 的 `podman` 服务启动，不监听 TCP；`PODMAN_SOCKET_GID` 必须与
 开发容器的有效 GID 一致。
-引擎以 UID/GID `1000:1000` 运行 rootless Podman，存储使用 `overlay` 和
-`fuse-overlayfs`。宿主容器使用私有 cgroup namespace，保持 cgroups enabled；engine
+引擎不指定容器用户，由 rootless 外层运行时把容器 UID/GID 0 映射到宿主普通用户，存储使用
+`overlay` 和 `fuse-overlayfs`。宿主容器使用私有 cgroup namespace，保持 cgroups enabled；engine
 只增加经过测试的 namespaced `SYS_ADMIN`、`SETUID`、`SETGID`、`DAC_OVERRIDE`，并挂载
 `/dev/fuse` 与 `/dev/net/tun`，不使用特权模式或宿主 user namespace。入口脚本不会重挂载
 或关闭 cgroup 层级，调用者必须让外层运行时提供 cgroup v2。

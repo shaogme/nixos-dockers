@@ -10,9 +10,8 @@ services:
       - podman-data:/var/lib/containers
       - .:/workspace
     # This service is safe to run from a rootless Docker/Podman daemon. The
-    # image process is also unprivileged; its private cgroup namespace keeps
-    # cgroup management inside the outer runtime's delegation boundary.
-    user: "1000:1000"
+    # outer runtime maps image root to its regular host user; its private
+    # cgroup namespace keeps cgroup management inside the delegation boundary.
     cgroup: private
     cap_drop: [ALL]
     # crun needs the namespaced capability to mount /proc for rootless

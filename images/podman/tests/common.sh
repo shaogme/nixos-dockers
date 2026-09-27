@@ -88,7 +88,6 @@ engine_run() {
     # storage uses fuse-overlayfs; the engine uses a private cgroup namespace
     # and an explicit device set without privileged mode.
     docker run \
-        --user 1000:1000 \
         --cap-drop=ALL \
         --cap-add=SYS_ADMIN \
         --cap-add=SETUID \
@@ -132,7 +131,10 @@ wait_for_socket
 
 echo "==> verifying rootless cgroup and namespace policy"
 engine_user="$(docker inspect --format '{{.Config.User}}' "$container")"
-[[ "$engine_user" == 1000:1000 ]]
+[[ -z "$engine_user" ]]
+engine_uid="$(docker exec "$container" /bin/sh -c 'id -u')"
+# Some outer rootless runtimes apply their own identity policy at launch.
+[[ "$engine_uid" == 0 || "$engine_uid" == 1000 ]]
 engine_cgroupns="$(docker inspect --format '{{.HostConfig.CgroupnsMode}}' "$container" 2>/dev/null || true)"
 if [[ -n "$engine_cgroupns" ]]; then
     [[ "$engine_cgroupns" == private ]]
@@ -202,7 +204,7 @@ dev_host_output="$(docker exec "$dev_container" podman run \
 
 workload_output="$(docker exec "$container" podman --remote --url unix:///run/podman/podman.sock run \
     --rm --network=none --cgroups=enabled --entrypoint /bin/sh podman:latest \
-    -c 'test "$(id -u)" = 1000; printf rootless-workload')"
+    -c 'test "$(id -u)" = 0; printf rootless-workload')"
 [[ "$workload_output" == rootless-workload ]]
 docker exec "$container" podman --remote --url unix:///run/podman/podman.sock rm engine-test-workload >/dev/null
 

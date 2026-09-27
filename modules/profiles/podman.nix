@@ -35,10 +35,6 @@ let
     [containers]
     cgroups = "enabled"
     cgroupns = "private"
-    # Keep the engine user's UID/GID stable inside rootless workloads while
-    # retaining a private workload user namespace.
-    userns = "keep-id"
-
     [engine]
     cgroup_manager = "cgroupfs"
     runtime = "crun"
@@ -87,6 +83,7 @@ let
         source_map="$1"
         destination="$2"
         current_id="$3"
+        owner="$4"
 
         if ${pkgs.busybox}/bin/awk '
           $1 == 0 && $2 == 0 && $3 >= 4294967295 { identity = 1 }
@@ -96,7 +93,7 @@ let
           return 0
         fi
 
-        ${pkgs.busybox}/bin/awk -v owner=podman -v current="$current_id" '
+        ${pkgs.busybox}/bin/awk -v owner="$owner" -v current="$current_id" '
           function emit(start, count, end, left, right) {
             end = start + count
             # UID/GID zero is the outer namespace root and is intentionally
@@ -129,8 +126,10 @@ let
       }
 
       mkdir -p "$socket_dir" /run/user/1000/containers /var/lib/containers/storage
-      write_nested_map /proc/self/uid_map "$uid_map_file" "$(id -u)"
-      write_nested_map /proc/self/gid_map "$gid_map_file" "$(id -g)"
+      current_user="$(${pkgs.busybox}/bin/id -un)"
+      current_group="$(${pkgs.busybox}/bin/id -gn)"
+      write_nested_map /proc/self/uid_map "$uid_map_file" "$(id -u)" "$current_user"
+      write_nested_map /proc/self/gid_map "$gid_map_file" "$(id -g)" "$current_group"
       if ! ${pkgs.busybox}/bin/mount --bind "$uid_map_file" /etc/subuid; then
         echo "podman engine could not mount dynamic /etc/subuid" >&2
         exit 1
@@ -147,14 +146,13 @@ let
       cat /etc/subuid >&2
       echo "podman engine subgid:" >&2
       cat /etc/subgid >&2
-      # A rootless process can only change the group to one it owns.  The
-      # default GID is the engine user's GID; callers that need another GID
-      # can opt into the explicitly configured socket mode.
+      # A rootless process can only change the group to one it owns. Keep the
+      # socket group configurable so clients can opt into their shared group.
       if ! chgrp "$socket_gid" "$socket_dir"; then
         echo "podman engine could not set socket directory group to $socket_gid" >&2
       fi
-      # The socket volume may be initialized as root-owned by Docker.  Its
-      # image directory is intentionally writable, so UID 1000 can create
+      # The socket volume may be initialized as root-owned by Docker. Its
+      # image directory is intentionally writable, so the engine can create
       # the socket without needing to chmod/chown the volume mount itself.
 
       if [ "$#" -eq 0 ]; then
@@ -212,7 +210,6 @@ in
   config = lib.mkIf config.profiles.podman.enable {
     docker.includeNixDB = false;
     docker.environmentPath = "/usr/bin:/bin";
-    docker.user = "1000:1000";
     # The engine must not inherit /workspace as its current directory. The
     # Compose service bind-mounts that path for workloads, and a rootless
     # outer runtime may not grant the engine UID traversal permission there.
@@ -233,14 +230,14 @@ in
     docker.extraCommands = ''
       mkdir -p bin usr/bin usr/local/bin etc/containers tmp var/tmp workspace root home/podman run/podman run/user/1000/containers var/lib/containers/storage
       chmod 1777 tmp var/tmp workspace
-      # Keep the image layer root-owned so a single rootless UID mapping can
-      # import it; world-writable application directories provide UID 1000
-      # with the access the engine needs after Docker applies its User field.
+      # Keep the image layer root-owned so the outer runtime can map its root
+      # user directly to the host user; application directories stay writable
+      # for runtimes that apply their own rootless identity policy.
       chmod 0777 home/podman run/podman run/user/1000/containers var/lib/containers/storage
-      # Rootless workloads need a subordinate range for image layer ownership
-      # while the engine process itself remains UID/GID 1000.
-      printf 'podman:100000:65536\n' > etc/subuid
-      printf 'podman:100000:65536\n' > etc/subgid
+      # Rootless workloads need a subordinate range for image layer ownership.
+      # The outer runtime maps the image's root user to its regular user.
+      printf 'root:100000:65536\n' > etc/subuid
+      printf 'root:100000:65536\n' > etc/subgid
       chmod 0644 etc/subuid etc/subgid
       ln -sf ${pkgs.busybox}/bin/busybox bin/sh
       ln -sf ${pkgs.busybox}/bin/busybox usr/bin/sh
@@ -270,6 +267,9 @@ in
       CONTAINERS_REGISTRIES_CONF = "/etc/containers/registries.conf";
       SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
       NIX_SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
+      # Keep these paths usable when an outer runtime applies its own identity
+      # policy to an image without a User field; rootless Podman derives the
+      # real identity from the process UID and namespace map.
       HOME = "/home/podman";
       USER = "podman";
       LOGNAME = "podman";

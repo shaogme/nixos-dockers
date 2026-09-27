@@ -107,12 +107,6 @@ in
       description = "Default non-root user name for container operations.";
     };
 
-    autoUserMapping = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = "Enable adaptive UID/GID mapping based on runtime bootstrap inputs or the mounted workspace.";
-    };
-
     exposedPorts = lib.mkOption {
       type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
       default = lib.optionalAttrs config.services.openssh.enable { "22/tcp" = { }; };
@@ -148,6 +142,9 @@ in
   # even when a caller forgets to repeat the profile defaults from the builder.
   config = lib.mkIf (config.docker.role == "engine") {
     docker.includeNixDB = false;
+    # Rootless outer runtimes map container UID 0 to the host user.  An
+    # explicit image user would remap the engine to a subordinate UID instead.
+    docker.user = lib.mkForce null;
     runtime.enable = false;
     profiles.base.enable = false;
     system.enable = false;
