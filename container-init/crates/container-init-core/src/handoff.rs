@@ -17,11 +17,38 @@ impl HandoffCommand {
         handoff: &HandoffConfig,
         command: &[String],
     ) -> Result<Self, CoreError> {
-        let mut args = if command.is_empty() {
-            handoff.shell_prefix.clone()
-        } else {
-            handoff.exec_prefix.clone()
-        };
+        Self::from_prefix(
+            handoff,
+            if command.is_empty() {
+                &handoff.shell_prefix
+            } else {
+                &handoff.exec_prefix
+            },
+            command,
+        )
+    }
+
+    pub(crate) fn from_initial_config(
+        handoff: &HandoffConfig,
+        command: &[String],
+    ) -> Result<Self, CoreError> {
+        Self::from_prefix(
+            handoff,
+            if command.is_empty() {
+                &handoff.shell_prefix
+            } else {
+                &handoff.initial_exec_prefix
+            },
+            command,
+        )
+    }
+
+    fn from_prefix(
+        handoff: &HandoffConfig,
+        prefix: &[String],
+        command: &[String],
+    ) -> Result<Self, CoreError> {
+        let mut args = prefix.to_vec();
         for argument in command {
             if argument.is_empty() || argument.contains('\0') {
                 return Err(CoreError::Invalid {

@@ -354,6 +354,13 @@ impl PlanExecutor {
         HandoffCommand::from_config(&self.config.handoff, command)
     }
 
+    pub fn build_initial_handoff_command(
+        &self,
+        command: &[String],
+    ) -> Result<HandoffCommand, CoreError> {
+        HandoffCommand::from_initial_config(&self.config.handoff, command)
+    }
+
     /// Execute the plan and replace this process with the configured runtime.
     pub fn execute_and_handoff(&self, plan: &Plan, command: &[String]) -> Result<(), CoreError> {
         let report = self.execute(plan, command)?;

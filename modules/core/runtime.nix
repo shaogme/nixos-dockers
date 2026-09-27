@@ -131,9 +131,10 @@ let
 
     [bootstrap.handoff]
     runtime = "/usr/bin/dev-env"
-    # container-init exec uses the dev-env client after reconciling the
-    # target identity; only the initial shell handoff starts the backend.
+    # Running commands through container-init starts the dev-env backend once;
+    # subsequent container-init exec requests keep using the client prefix.
     exec_prefix = ["exec", "--"]
+    initial_exec_prefix = ["backend", "run", "--initial-exec", "--"]
     shell_prefix = ${backendInitialPrefix}
     root_service = true
     ${sshBootstrap}

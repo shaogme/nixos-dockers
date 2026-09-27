@@ -108,7 +108,7 @@ impl BackendLease {
         let root_service = is_root_service(&config, command, self.paths.owner_uid, true);
         let handoff =
             PlanExecutor::with_shared_config(Arc::clone(&config), startup_context.clone())
-                .build_handoff_command(command)?;
+                .build_initial_handoff_command(command)?;
         if unsafe { libc::geteuid() } != 0
             && (identity.uid != unsafe { libc::geteuid() }
                 || identity.gid != unsafe { libc::getegid() })

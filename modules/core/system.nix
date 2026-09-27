@@ -59,6 +59,7 @@ let
   nixConf = pkgs.writeTextDir "etc/nix/nix.conf" ''
     build-users-group =
     experimental-features = nix-command flakes
+    sandbox = true
     filter-syscalls = false
     trusted-users = root ${config.system.defaultUser}
   '';

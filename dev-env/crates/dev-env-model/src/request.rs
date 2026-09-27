@@ -72,6 +72,20 @@ impl RequestContext {
         self
     }
 
+    pub fn with_runtime_inputs<I, K, V>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.typed_runtime_inputs.extend(
+            inputs
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        self
+    }
+
     pub fn with_ambient_environment(mut self, environment: BTreeMap<String, String>) -> Self {
         self.filtered_ambient_environment = environment;
         self

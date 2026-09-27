@@ -33,6 +33,7 @@ fn fixture_config(root: &Path, actions: Vec<Action>) -> BootstrapConfig {
         handoff: HandoffConfig {
             runtime: "/bin/sh".to_owned(),
             exec_prefix: vec!["-c".to_owned()],
+            initial_exec_prefix: vec!["-c".to_owned()],
             shell_prefix: vec!["-c".to_owned(), "true".to_owned()],
             root_service: false,
             ssh_daemon: None,

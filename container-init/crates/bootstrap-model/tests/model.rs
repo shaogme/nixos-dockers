@@ -27,6 +27,7 @@ fn minimal_config(actions: Vec<Action>) -> BootstrapConfig {
         handoff: HandoffConfig {
             runtime: "/usr/bin/runtime".to_owned(),
             exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
+            initial_exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
             shell_prefix: vec!["shell".to_owned()],
             root_service: false,
             ssh_daemon: None,

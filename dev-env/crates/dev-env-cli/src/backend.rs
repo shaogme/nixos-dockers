@@ -645,6 +645,12 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         snapshot.resolved_config.shell.default.clone(),
     )
     .with_identity(IdentityRequest::User { name: initial_user })
+    .with_runtime_inputs(
+        snapshot
+            .runtime_inputs
+            .keys()
+            .filter_map(|name| env::var(name).ok().map(|value| (name.clone(), value))),
+    )
     .with_ambient_environment(config::ambient_environment());
     let response = handle_prepare(
         &runtime,

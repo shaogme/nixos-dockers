@@ -336,6 +336,11 @@ pub struct HandoffConfig {
     pub runtime: String,
     #[serde(default)]
     pub exec_prefix: Vec<String>,
+    /// Prefix used when `container-init run` starts the backend with an
+    /// explicit initial command. Profiles without a supervisor handoff can
+    /// omit it and retain the `exec_prefix` behavior.
+    #[serde(default)]
+    pub initial_exec_prefix: Vec<String>,
     #[serde(default)]
     pub shell_prefix: Vec<String>,
     /// Keep the handoff runtime as a privileged service supervisor.
@@ -351,6 +356,7 @@ impl HandoffConfig {
         for (index, arg) in self
             .exec_prefix
             .iter()
+            .chain(self.initial_exec_prefix.iter())
             .chain(self.shell_prefix.iter())
             .enumerate()
         {
