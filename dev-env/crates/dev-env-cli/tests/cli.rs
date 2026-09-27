@@ -73,6 +73,10 @@ BASE = "base"
             .env("DEVENV_PROFILES_DIR", &self.profiles)
             .env("DEVENV_DEFAULT_PROFILE_FILE", &self.default_profile)
             .env("DEVENV_TRUST_FILE", &self.trust_file)
+            .env(
+                "DEVENV_BACKEND_SOCKET",
+                self.root.join("missing-backend.sock"),
+            )
             .current_dir(&self.root);
         command
     }
@@ -85,7 +89,12 @@ impl Drop for Fixture {
 }
 
 fn run(fixture: &Fixture, arguments: &[&str]) -> Output {
-    fixture.command().args(arguments).output().unwrap()
+    fixture
+        .command()
+        .arg("--offline")
+        .args(arguments)
+        .output()
+        .unwrap()
 }
 
 fn stdout(output: &Output) -> String {
@@ -215,6 +224,19 @@ fn print_exec_shell_login_and_shim_share_the_same_environment() {
     assert_eq!(stdout(&shim), "base");
 }
 
+#[test]
+fn client_does_not_fallback_to_profile_when_backend_is_unavailable() {
+    let fixture = Fixture::new();
+    let output = fixture.command().arg("print").output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("DEVENV-E-BACKEND-UNAVAILABLE"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_runs_a_declared_provider_and_includes_its_shellenv_delta() {
@@ -272,6 +294,7 @@ runtime = true
     );
     fs::write(profile_path, profile).unwrap();
     let mut command = fixture.command();
+    command.arg("--offline");
     command.env("DEVBOX_AUTO_INIT", "1");
     command.args(["explain", "--json", "features.devbox.auto_init"]);
     let output = command.output().unwrap();

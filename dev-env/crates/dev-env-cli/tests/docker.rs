@@ -71,20 +71,26 @@ impl Fixture {
             .env("DEVENV_PROFILES_DIR", &self.profiles)
             .env("DEVENV_DEFAULT_PROFILE_FILE", &self.default_profile)
             .env("DEVENV_TRUST_FILE", &self.trust_file)
+            .env(
+                "DEVENV_BACKEND_SOCKET",
+                self.root.join("missing-backend.sock"),
+            )
             .current_dir(&self.cwd);
         command
     }
 
     fn run(&self, arguments: &[&str]) -> Output {
-        self.command().args(arguments).output().unwrap()
+        self.command()
+            .arg("--offline")
+            .args(arguments)
+            .output()
+            .unwrap()
     }
 
     fn run_login_shell(&self, script: &str) -> Output {
-        use std::os::unix::process::CommandExt;
-
         let mut command = self.command();
-        command.arg0("/usr/bin/dev-env-login-shell");
-        command.args(["-c", script]);
+        command.arg("--offline");
+        command.args(["login-shell", "--", "-c", script]);
         command.output().unwrap()
     }
 }
@@ -349,6 +355,7 @@ fn docker_cli_rejects_provider_output_without_executing_shell_code() {
 
     let output = fixture
         .command()
+        .arg("--offline")
         .args(["--set", "environment.variables.PROVIDER_MODE=reject"])
         .arg("--set")
         .arg(marker_assignment)
@@ -411,4 +418,13 @@ fn docker_cli_explain_doctor_and_trust_are_real_process_commands() {
     assert!(!fs::read_to_string(&fixture.trust_file)
         .unwrap()
         .contains("schema = 1"));
+}
+
+#[test]
+fn docker_client_reports_backend_unavailable_without_offline_fallback() {
+    let fixture = Fixture::new();
+    let output = fixture.command().arg("print").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("DEVENV-E-BACKEND-UNAVAILABLE"));
+    assert!(output.stdout.is_empty());
 }

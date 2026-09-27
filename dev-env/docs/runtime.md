@@ -2,16 +2,25 @@
 
 本页说明进程边界和命令行为。配置加载顺序见 [配置与部署](configuration.md)，DSL 字段见 [DSL 参考](dsl.md)。
 
-## 1. 一次 materialize
+## 1. Backend 和一次 Prepare
 
-每个需要开发环境的入口都执行相同的基本流程：
+生产容器只启动一个 `dev-env backend run`。该进程由 `container-init` 以 root supervisor
+身份 handoff，backend 在 startup/reload 读取 profile，创建
+不可变 snapshot，并持有 materializer、provider supervisor 和内存 cache。`exec`、`shell`、
+`login-shell`、shim 和 `print` 都是短命 client，只发送请求上下文，不读取 profile，也不
+直接启动 provider：
 
 ```text
-选择 profile
+client 采集 cwd、shell、identity、runtime inputs 和允许的 ambient env
   ↓
-加载 profile chain 和 overlays
+连接 /run/dev-env/backend.sock；身份通过 /run/container-init/backend.sock 的
+PrepareIdentity RPC 解析
   ↓
-解析 runtime inputs / CLI patches
+backend 校验 peer 和 snapshot policy
+  ↓
+规范化 context，生成 MaterializationKey
+  ↓
+single-flight/cache 命中，或执行一次 Materializer
   ↓
 创建 RuntimeContext(workspace, cwd, shell, user, ambient env)
   ↓
@@ -26,7 +35,11 @@
 exec 目标命令或输出诊断
 ```
 
-`explain` 和 `doctor` 只需要加载配置，因此不会执行 provider；`print`、`exec`、`shell`、`login-shell` 和 `shim` 会执行启用的 provider 生命周期。
+相同 key 的并发请求共享一次 materialization；成功结果包含 provider receipt 和 diagnostics，
+并按 generation、workspace、cwd、identity、runtime input、ambient value 和 detect-file
+fingerprint 缓存。`reload` 替换 snapshot 并清空旧 cache。没有 backend 时 client 返回
+`DEVENV-E-BACKEND-UNAVAILABLE`，不会隐式启动实例。任何命令如需离线读取文件，必须显式传入
+`--offline`；生产入口默认不会回退到本地 profile。
 
 ## 2. 命令总览
 
@@ -39,8 +52,22 @@ dev-env print [--format dotenv|json|shell] [--shell <id>]
 dev-env explain [<config.path>]
 dev-env doctor [--json]
 dev-env trust <path|sha256>
+dev-env backend run [OPTIONS] --initial-shell
+dev-env backend run [OPTIONS] --initial-exec -- <command> [args...]
+dev-env backend status [--json]
+dev-env backend reload [--wait]
+dev-env backend stop
 dev-env version
 ```
+
+`backend run` 在启动时一次加载并校验 profile，持有 `/run/dev-env/backend.lock`，并
+通过 `/run/dev-env/backend.sock` 提供 protocol v3 请求，错误 envelope 使用
+`error_version = 2`。runtime profile 为
+`/run/dev-env` 创建 `0770` 的 root/group 目录；socket 固定为 root、配置 group、`0660`，
+lock 文件使用相同 owner/group 和 `0660`。backend 退出时删除 socket，目录和锁文件由
+container-init 的 runtime action 保留到容器生命周期结束。第二个 `backend run` 只返回
+已有实例状态；它不会重新加载 profile 或抢占 socket。`backend reload` 成功后才替换
+snapshot 并递增 generation，失败时保留旧 snapshot。
 
 通用选项可以放在 command 前，也可在支持它的子命令中使用：
 
@@ -54,8 +81,11 @@ dev-env version
 --config PATH
 --set PATH=VALUE
 --unset PATH
---user-id UID
+--offline
 ```
+
+profile、overlay、`--set`、`--unset` 和 workspace 选项只允许用于 `backend run`/`reload`
+或显式 `--offline`；普通 client 从 backend snapshot 获取配置。
 
 ### `exec`
 
@@ -101,13 +131,13 @@ dev-env shim \
   -- -lc 'echo "$PATH"'
 ```
 
-非 root shim 只负责：物化环境 → 使用不可递归的绝对 real path → 原样转发 argv。
+非 root shim 只负责：请求 backend Prepare → 使用不可递归的绝对 real path → 原样转发 argv。
 镜像中的 `/bin/bash` 和 `/usr/bin/bash` 是指向 `dev-env` 的 symlink；CLI 根据
 argv0 把它识别为 Bash shim，并使用 `DEVENV_REAL_SHELL` 或默认
-`/usr/local/libexec/dev-env/real/bash`。当 shim 以 root 启动且镜像提供
-以继承环境的结构化 argv 委托给 `container-init exec -- real-bash ...`。`exec` 连接
-容器启动时持有 profile snapshot 的 backend，只执行受限 identity reconciliation；它不
-重新读取 profile，也不会触发启动 action 或覆盖启动 receipt。
+`/usr/local/libexec/dev-env/real/bash`。root shim 先以继承环境调用
+`container-init exec -- real-bash ...`；container-init 的 runtime handoff prefix 将其
+转换为 `dev-env exec -- real-bash ...`，完成目标 UID/GID 后再由 dev-env backend
+Prepare 注入环境。它不重新读取 profile，也不会触发启动 action 或覆盖启动 receipt。
 
 `--real` 与配置的 shim 路径必须分离。直接将 real shell 配置成 `/bin/bash` 会导致 `/bin/bash` 再回到 dev-env，应该把真实 executable 放在 profile 明确的非 shim 路径。
 
@@ -208,8 +238,9 @@ ENTRYPOINT ["/usr/bin/container-init", "run", "--"]
 然后通过 Unix socket 为后续 handoff 提供同一份 snapshot：
 
 ```text
-无显式 command: /usr/bin/dev-env shell
-有显式 command: /usr/bin/dev-env exec -- <command> <args...>
+无显式 command: /usr/bin/dev-env backend run --initial-shell
+SSH service: /usr/bin/dev-env backend run --initial-exec -- /bin/sshd -D -e
+container-init exec: /usr/bin/dev-env exec -- <command> <args...>
 ```
 
 开发环境 provider 在 handoff 后才执行。
@@ -232,7 +263,7 @@ docker exec <container> dev-env print --format json
 
 如果镜像安装 Bash shim，root 的 `docker exec -it <container> bash -lc ...` 和
 `docker exec -it <container> /bin/bash -lc ...` 会先重新进入身份 Bootstrap，再
-materialize；非 root 调用则直接 materialize。需要保留 root 身份时显式传入
+通过 dev-env backend materialize；非 root 调用则直接 materialize。需要保留 root 身份时显式传入
 `RUN_AS_ROOT=1`。直接指定 `/nix/store/.../bash`、
 `/bin/sh` 或任意非 shell binary 不会自动注入开发环境；此时请显式写
 `dev-env exec --`。
@@ -243,8 +274,7 @@ SSH 用户的 passwd shell 是 `/usr/bin/dev-env-login-shell`：
 
 ```text
 sshd → dev-env login-shell -c "..."
-     → 重新解析当前用户/workspace/profile
-     → materialize
+     → backend Prepare（当前用户、cwd、login shell argv）
      → 真实 shell -c "..."
 ```
 

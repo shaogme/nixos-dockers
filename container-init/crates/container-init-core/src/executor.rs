@@ -589,12 +589,15 @@ impl PlanExecutor {
 
     fn is_root_service_handoff(&self, command: &[String]) -> bool {
         self.options.posix.current_ids().0 == 0
-            && self
-                .config
-                .handoff
-                .ssh_daemon
-                .as_deref()
-                .is_some_and(|daemon| command.first().is_some_and(|candidate| candidate == daemon))
+            && (self.config.handoff.root_service
+                || self
+                    .config
+                    .handoff
+                    .ssh_daemon
+                    .as_deref()
+                    .is_some_and(|daemon| {
+                        command.first().is_some_and(|candidate| candidate == daemon)
+                    }))
     }
 
     fn execute_action(

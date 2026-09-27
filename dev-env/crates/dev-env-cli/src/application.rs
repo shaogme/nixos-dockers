@@ -1,10 +1,10 @@
 use crate::args::{Cli, CliCommand, CliOptions};
-use crate::config::LoadedConfig;
 use crate::error::{BootstrapError, BootstrapPathError, CliError};
-use crate::{config, doctor, explain, output, process, trust};
-use dev_env_core::{ContextError, CoreError, Materialization, Materializer};
-use dev_env_model::ShellConfig;
-use dev_env_shell::{build_invocation, CommandLine, ConfiguredShellAdapter, ShellInvocation, Shim};
+use crate::{config, offline, output, process, trust};
+use dev_env_model::{
+    BackendRequest, BackendResponse, PreparedResponse, RequestContext, RequestMode,
+};
+use dev_env_shell::{CommandLine, Shim};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,53 +24,55 @@ where
             output::print_version()?;
             Ok(0)
         }
+        CliCommand::Backend { command } => crate::backend::dispatch(command, cli.options),
         CliCommand::Exec { command } => run_exec(&cli.options, command),
         CliCommand::Shell { shell, login, args } => {
             run_shell(&cli.options, shell.as_deref(), login, args)
         }
         CliCommand::LoginShell { args } => run_shell(&cli.options, None, true, args),
         CliCommand::Shim { shell, real, args } => run_shim(&cli.options, &shell, &real, args),
-        CliCommand::Print { format, shell } => {
-            let loaded = config::load(&cli.options)?;
-            let materialization = materialize(&loaded, shell.as_deref())?;
-            output::print_environment(&materialization, format, cli.options.show_secrets)?;
-            Ok(0)
-        }
+        CliCommand::Print { format, shell } => run_print(&cli.options, format, shell.as_deref()),
         CliCommand::Explain { path, json } => {
-            let loaded = config::load(&cli.options)?;
-            let report = explain::build_report(&loaded, path.as_deref())?;
-            explain::print_report(&report, json)?;
-            Ok(0)
+            run_backend_value(&cli.options, BackendRequest::Explain { path }, json)
         }
-        CliCommand::Doctor { json } => {
-            let loaded = config::load(&cli.options)?;
-            let report = doctor::inspect(&loaded);
-            output::print_doctor(&report, json)?;
-            if report.ok {
-                Ok(0)
-            } else {
-                Err(CliError::DoctorFailed {
-                    failed_checks: report.failed_checks().count(),
-                })
-            }
-        }
+        CliCommand::Doctor { json } => run_doctor(&cli.options, json),
         CliCommand::Trust { target } => {
-            let hash = trust::trust(&target)?;
-            output::write_stdout(&format!("trusted: {hash}\n"))?;
-            Ok(0)
+            if cli.options.offline {
+                return offline::trust(&target);
+            }
+            ensure_backend_options(&cli.options)?;
+            let hash = trust::digest(&target)?;
+            let target = parse_trust_target(&target)?;
+            let response = crate::backend::request_backend(BackendRequest::Trust { target })?;
+            match response.response {
+                BackendResponse::Trusted { .. } => {
+                    output::write_stdout(&format!("trusted: {hash}\n"))?;
+                    Ok(0)
+                }
+                BackendResponse::Error(error) => Err(CliError::Backend(format!(
+                    "{}: {}",
+                    error.class, error.message
+                ))),
+                other => Err(CliError::Backend(format!(
+                    "backend returned unexpected response: {other:?}"
+                ))),
+            }
         }
     }
 }
 
 fn run_exec(options: &CliOptions, command: Vec<OsString>) -> Result<i32, CliError> {
-    let loaded = config::load(options)?;
-    let materialization = materialize(&loaded, None)?;
+    if options.offline {
+        return offline::exec(options, command);
+    }
+    ensure_backend_options(options)?;
     let mut arguments = command.into_iter();
     let program = arguments
         .next()
         .expect("argument parser requires a command");
     let line = CommandLine::try_new(program, arguments.collect::<Vec<_>>())?;
-    process::execute(line, materialization.environment(), loaded.cwd())
+    let prepared = prepare_client(options, RequestMode::Exec, None, Vec::new())?;
+    process::execute(line, &prepared.materialized_environment, &prepared.cwd)
 }
 
 fn run_shell(
@@ -79,18 +81,18 @@ fn run_shell(
     login: bool,
     args: Vec<OsString>,
 ) -> Result<i32, CliError> {
-    let loaded = config::load(options)?;
-    let materialization = materialize(&loaded, shell)?;
-    let shell_id = shell.unwrap_or(&loaded.config().shell.default);
-    let shell_config = shell_config(&loaded, shell_id)?;
-    let adapter = ConfiguredShellAdapter::new(shell_id);
-    let invocation = if login {
-        ShellInvocation::login(args)
+    if options.offline {
+        return offline::shell(options, shell, login, args);
+    }
+    ensure_backend_options(options)?;
+    let mode = if login {
+        RequestMode::LoginShell
     } else {
-        ShellInvocation::interactive(args)
+        RequestMode::Shell
     };
-    let line = build_invocation(&adapter, shell_config, &invocation)?;
-    process::execute(line, materialization.environment(), loaded.cwd())
+    let prepared = prepare_client(options, mode, shell, args.clone())?;
+    let line = prepared_command_line(&prepared)?;
+    process::execute(line, &prepared.materialized_environment, &prepared.cwd)
 }
 
 fn run_shim(
@@ -99,6 +101,10 @@ fn run_shim(
     real: &Path,
     args: Vec<OsString>,
 ) -> Result<i32, CliError> {
+    if options.offline {
+        return offline::shim(options, shell, real, args);
+    }
+    ensure_backend_options(options)?;
     if config::effective_user_id() == 0 {
         if let Some(paths) = BootstrapPaths::from_environment()? {
             let line = paths.build_command(&args)?;
@@ -106,15 +112,249 @@ fn run_shim(
         }
     }
 
-    let loaded = config::load(options)?;
-    let materialization = materialize(&loaded, Some(shell))?;
+    let prepared = prepare_client(options, RequestMode::Shim, Some(shell), args.clone())?;
     // The configured shell command is the real executable that the shim must
     // launch, so it is expected to equal `real` for the image-level bash
     // compatibility shim.  Passing it as the recursion guard would reject
     // every valid invocation.  The shim path itself is owned by the image
     // layout and is not the configured real shell command.
     let line = Shim::new(real).build(&args)?;
-    process::execute(line, materialization.environment(), loaded.cwd())
+    process::execute(line, &prepared.materialized_environment, &prepared.cwd)
+}
+
+fn ensure_backend_options(options: &CliOptions) -> Result<(), CliError> {
+    if options.profile.is_some()
+        || options.profiles_dir.is_some()
+        || options.admin_profiles_dir.is_some()
+        || options.default_profile_file.is_some()
+        || options.workspace.is_some()
+        || options.config.is_some()
+        || !options.patches.is_empty()
+    {
+        return Err(CliError::Backend(
+            "profile and configuration options are only valid for backend run/reload or --offline"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_client(
+    options: &CliOptions,
+    mode: RequestMode,
+    shell: Option<&str>,
+    shell_args: Vec<OsString>,
+) -> Result<PreparedResponse, CliError> {
+    let cwd = options
+        .cwd
+        .clone()
+        .or_else(|| std::env::var_os("DEVENV_CWD").map(PathBuf::from))
+        .unwrap_or(std::env::current_dir().map_err(|source| {
+            CliError::io(
+                crate::error::IoOperation::ReadCurrentDirectory,
+                None,
+                source,
+            )
+        })?);
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        std::env::current_dir()
+            .map_err(|source| {
+                CliError::io(
+                    crate::error::IoOperation::ReadCurrentDirectory,
+                    None,
+                    source,
+                )
+            })?
+            .join(cwd)
+    };
+    let shell = shell
+        .map(str::to_owned)
+        .or_else(|| std::env::var("DEVENV_SHELL").ok())
+        .unwrap_or_else(|| "default".to_owned());
+    let shell_args = shell_args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string().map_err(|_| {
+                CliError::Backend(
+                    "shell arguments must be valid UTF-8 for backend protocol".to_owned(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let context = RequestContext::new("client", mode, normalize_path(&cwd), shell)
+        .with_shell_args(shell_args)
+        .with_ambient_environment(config::ambient_environment());
+    crate::backend::prepare(context)
+}
+
+fn prepared_command_line(prepared: &PreparedResponse) -> Result<CommandLine, CliError> {
+    CommandLine::try_new(
+        prepared.shell_invocation.executable.clone(),
+        prepared
+            .shell_invocation
+            .args
+            .iter()
+            .cloned()
+            .map(OsString::from)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(CliError::CommandLine)
+}
+
+fn run_print(
+    options: &CliOptions,
+    format: crate::args::OutputFormat,
+    shell: Option<&str>,
+) -> Result<i32, CliError> {
+    if options.offline {
+        return offline::print(options, format, shell);
+    }
+    ensure_backend_options(options)?;
+    let prepared = prepare_client(options, RequestMode::Print, shell, Vec::new())?;
+    output::print_materialized_environment(
+        &prepared.materialized_environment,
+        format,
+        options.show_secrets,
+    )?;
+    Ok(0)
+}
+
+fn run_backend_value(
+    options: &CliOptions,
+    request: BackendRequest,
+    json: bool,
+) -> Result<i32, CliError> {
+    if options.offline {
+        if let BackendRequest::Explain { ref path } = request {
+            return offline::explain(options, path.as_deref(), json);
+        }
+    }
+    ensure_backend_options(options)?;
+    let response = crate::backend::request_backend(request)?;
+    let value = match response.response {
+        BackendResponse::Explain(value) | BackendResponse::Plan(value) => value,
+        BackendResponse::Error(error) => {
+            return Err(CliError::Backend(format!(
+                "{}: {}",
+                error.class, error.message
+            )))
+        }
+        other => {
+            return Err(CliError::Backend(format!(
+                "backend returned unexpected response: {other:?}"
+            )))
+        }
+    };
+    let rendered = if json {
+        serde_json::to_string_pretty(&value)
+    } else {
+        serde_json::to_string(&value)
+    }
+    .map_err(crate::error::OutputError::Json)?;
+    output::write_stdout(&format!("{rendered}\n"))?;
+    Ok(0)
+}
+
+fn run_doctor(options: &CliOptions, json: bool) -> Result<i32, CliError> {
+    if options.offline {
+        return offline::doctor(options, json);
+    }
+    ensure_backend_options(options)?;
+    let response = crate::backend::request_backend(BackendRequest::Doctor)?;
+    let value = match response.response {
+        BackendResponse::Doctor(value) => value,
+        BackendResponse::Error(error) => {
+            return Err(CliError::Backend(format!(
+                "{}: {}",
+                error.class, error.message
+            )))
+        }
+        other => {
+            return Err(CliError::Backend(format!(
+                "backend returned unexpected response: {other:?}"
+            )))
+        }
+    };
+    if json {
+        output::write_stdout(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).map_err(crate::error::OutputError::Json)?
+        ))?;
+    } else {
+        output::write_stdout(&format!(
+            "status: {}\n",
+            if value
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "ok"
+            } else {
+                "failed"
+            }
+        ))?;
+    }
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(0)
+    } else {
+        Err(CliError::DoctorFailed { failed_checks: 1 })
+    }
+}
+
+fn parse_trust_target(target: &Path) -> Result<dev_env_model::TrustTarget, CliError> {
+    let value = target.to_string_lossy();
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let mut digest = [0_u8; 32];
+        for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+            digest[index] = (hex_value(chunk[0]) << 4) | hex_value(chunk[1]);
+        }
+        Ok(dev_env_model::TrustTarget::Sha256 { digest })
+    } else {
+        let path = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| {
+                    CliError::io(
+                        crate::error::IoOperation::ReadCurrentDirectory,
+                        None,
+                        source,
+                    )
+                })?
+                .join(target)
+        };
+        Ok(dev_env_model::TrustTarget::Path {
+            path: normalize_path(&path),
+        })
+    }
+}
+
+fn hex_value(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => 0,
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut output = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                output.push(component.as_os_str())
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                output.pop();
+            }
+            std::path::Component::Normal(value) => output.push(value),
+        }
+    }
+    output
 }
 
 const CONTAINER_INIT_ENV: &str = "DEVENV_CONTAINER_INIT";
@@ -226,19 +466,4 @@ fn contains_nul(path: &Path) -> bool {
     {
         path.as_os_str().to_string_lossy().contains('\0')
     }
-}
-
-fn materialize(loaded: &LoadedConfig, shell: Option<&str>) -> Result<Materialization, CliError> {
-    let context = config::runtime_context(loaded, shell)?;
-    Materializer::try_new(loaded.config().clone())?
-        .materialize(&context)
-        .map_err(CliError::Core)
-}
-
-fn shell_config<'a>(loaded: &'a LoadedConfig, shell: &str) -> Result<&'a ShellConfig, CliError> {
-    loaded.config().shells.get(shell).ok_or_else(|| {
-        CliError::Core(CoreError::Context(ContextError::UnknownShell {
-            shell: shell.to_owned(),
-        }))
-    })
 }

@@ -20,6 +20,7 @@ dev-env-loader = { path = "../dev-env-loader" }
 dev-env-model = { path = "../dev-env-model" }
 dev-env-provider = { path = "../dev-env-provider" }
 dev-env-shell = { path = "../dev-env-shell" }
+fs2 = "0.4"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

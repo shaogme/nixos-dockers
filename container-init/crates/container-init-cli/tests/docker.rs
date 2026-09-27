@@ -490,7 +490,12 @@ depends_on = ["resolve"]
             .unwrap()
             .contains("\"cgroup-bind-init\""));
     } else {
-        assert!(String::from_utf8_lossy(&run.stderr).contains("bind-mount mode"));
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains("bind-mount mode")
+                || stderr.contains("backend cannot perform cgroup mount fallback"),
+            "{stderr}"
+        );
         assert!(!handoff.exists());
         assert!(!target_cgroup.join("worker").is_dir());
         assert!(!receipt.exists());

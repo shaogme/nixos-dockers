@@ -282,6 +282,8 @@ pub enum CliError {
     Output(OutputError),
     Trust(TrustError),
     Bootstrap(BootstrapError),
+    Backend(String),
+    BackendUnavailable(String),
     Launch {
         program: PathBuf,
         args: Vec<std::ffi::OsString>,
@@ -320,6 +322,7 @@ impl CliError {
             Self::Io { .. } | Self::Output(_) => 74,
             Self::Trust(_) => 66,
             Self::Bootstrap(_) => 65,
+            Self::Backend(_) | Self::BackendUnavailable(_) => 74,
             Self::Launch { .. } => 127,
             Self::DoctorFailed { .. } => 65,
         }
@@ -362,6 +365,10 @@ impl fmt::Display for CliError {
             Self::Output(error) => write!(formatter, "DEVENV-E-OUTPUT: {error}"),
             Self::Trust(error) => write!(formatter, "DEVENV-E-TRUST: {error}"),
             Self::Bootstrap(error) => write!(formatter, "DEVENV-E-BOOTSTRAP: {error}"),
+            Self::Backend(error) => write!(formatter, "DEVENV-E-BACKEND: {error}"),
+            Self::BackendUnavailable(error) => {
+                write!(formatter, "DEVENV-E-BACKEND-UNAVAILABLE: {error}")
+            }
             Self::Launch {
                 program, source, ..
             } => write!(
@@ -392,6 +399,8 @@ impl Error for CliError {
             Self::Output(error) => Some(error),
             Self::Trust(error) => Some(error),
             Self::Bootstrap(error) => Some(error),
+            Self::Backend(_) => None,
+            Self::BackendUnavailable(_) => None,
             Self::Launch { source, .. } => Some(source),
             Self::DoctorFailed { .. } => None,
         }

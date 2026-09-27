@@ -1,5 +1,5 @@
 use dev_env_model::ProviderConfig;
-use dev_env_provider::{ProviderRunResult, ProviderRunner, ProviderRuntimeError};
+use dev_env_provider::{ProviderJob, ProviderRunResult, ProviderRunner, ProviderRuntimeError};
 
 /// Provider lifecycle boundary used by [`crate::Materializer`].
 ///
@@ -23,5 +23,28 @@ impl ProviderRuntime for ProviderRunner {
         context: &dev_env_provider::ProviderContext,
     ) -> Result<ProviderRunResult, ProviderRuntimeError> {
         ProviderRunner::run(self, provider_id, config, context)
+    }
+}
+
+/// Adapter retained for callers that still provide the pre-backend runtime
+/// callback. New backend code should implement dev_env_provider's
+/// ProviderSupervisor directly.
+pub struct LegacyProviderSupervisor<R> {
+    runtime: R,
+}
+
+impl<R> LegacyProviderSupervisor<R> {
+    pub fn new(runtime: R) -> Self {
+        Self { runtime }
+    }
+}
+
+impl<R> dev_env_provider::ProviderSupervisor for LegacyProviderSupervisor<R>
+where
+    R: ProviderRuntime + 'static,
+{
+    fn prepare(&self, job: &ProviderJob) -> Result<ProviderRunResult, ProviderRuntimeError> {
+        self.runtime
+            .run(&job.provider_id, &job.config, &job.context)
     }
 }

@@ -338,6 +338,9 @@ pub struct HandoffConfig {
     pub exec_prefix: Vec<String>,
     #[serde(default)]
     pub shell_prefix: Vec<String>,
+    /// Keep the handoff runtime as a privileged service supervisor.
+    #[serde(default)]
+    pub root_service: bool,
     pub ssh_daemon: Option<String>,
     pub login_shell: Option<String>,
 }

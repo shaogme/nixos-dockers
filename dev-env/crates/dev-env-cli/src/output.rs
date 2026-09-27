@@ -1,6 +1,7 @@
 use crate::args::OutputFormat;
 use crate::error::{CliError, OutputError};
 use dev_env_core::Materialization;
+use dev_env_model::MaterializedEnv;
 use dev_env_shell::{format_environment, EnvironmentFormat, RenderOptions};
 use std::io::{self, Write};
 
@@ -9,7 +10,14 @@ pub fn print_environment(
     format: OutputFormat,
     show_secrets: bool,
 ) -> Result<(), CliError> {
-    let environment = materialization.environment();
+    print_materialized_environment(materialization.environment(), format, show_secrets)
+}
+
+pub fn print_materialized_environment(
+    environment: &MaterializedEnv,
+    format: OutputFormat,
+    show_secrets: bool,
+) -> Result<(), CliError> {
     let rendered = format_environment(
         environment_format(format),
         environment,

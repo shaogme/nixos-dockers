@@ -9,7 +9,7 @@
 | `dev-env-model` | 配置模型、DSL 类型、输入值和验证错误 |
 | `dev-env-loader` | TOML 解析、profile 继承、overlay 合并、运行时输入覆盖 |
 | `dev-env-core` | 运行时上下文、初始环境和 provider 执行编排 |
-| `dev-env-provider` | provider 检测、依赖排序、命令执行、输出解析、锁和 receipt |
+| `dev-env-provider` | provider 检测、依赖排序、命令执行、输出解析和 receipt |
 | `dev-env-shell` | shell argv 构造、环境导出、shim 行为 |
 | `dev-env-cli` | 命令行入口、配置发现、进程边界、诊断和 trust 命令 |
 
@@ -67,7 +67,7 @@ cd nixos-dockers/dev-env
 ./crates/dev-env-cli/tests/docker.sh
 ```
 
-这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、锁、检测文件或真实 shell 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
+这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、检测文件、真实 shell 或 backend socket 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
 
 ## 4. 修改 DSL 的检查清单
 

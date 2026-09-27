@@ -43,6 +43,7 @@ struct MergedHandoff {
     runtime: Option<String>,
     exec_prefix: Option<Vec<String>>,
     shell_prefix: Option<Vec<String>>,
+    root_service: Option<bool>,
     ssh_daemon: Option<String>,
     login_shell: Option<String>,
 }
@@ -231,6 +232,14 @@ impl MergedBootstrap {
                 &mut self.field_origins,
             )?;
             merge_scalar(
+                &mut self.handoff.root_service,
+                "bootstrap.handoff.root_service",
+                handoff.root_service,
+                &origin,
+                &overrides,
+                &mut self.field_origins,
+            )?;
+            merge_scalar(
                 &mut self.handoff.ssh_daemon,
                 "bootstrap.handoff.ssh_daemon",
                 handoff.ssh_daemon.clone(),
@@ -364,6 +373,7 @@ impl MergedBootstrap {
                     .ok_or_else(|| missing("bootstrap.handoff.runtime"))?,
                 exec_prefix: self.handoff.exec_prefix.unwrap_or_default(),
                 shell_prefix: self.handoff.shell_prefix.unwrap_or_default(),
+                root_service: self.handoff.root_service.unwrap_or(false),
                 ssh_daemon: self.handoff.ssh_daemon,
                 login_shell: self.handoff.login_shell,
             },

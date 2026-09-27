@@ -36,6 +36,18 @@ pub enum ClientRequest {
         #[serde(default)]
         environment: BTreeMap<String, String>,
     },
+    /// Resolve a request identity for a trusted long-lived runtime. The
+    /// caller never supplies a UID/GID pair as the identity itself; the
+    /// backend only forwards the authenticated client observation to the
+    /// container-init broker.
+    PrepareIdentity {
+        cwd: PathBuf,
+        #[serde(default)]
+        inputs: BTreeMap<String, String>,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
+        requested: IdentityRequest,
+    },
     Status,
     Plan,
     Doctor,
@@ -54,10 +66,31 @@ pub struct ServerMessage {
 pub enum ServerResponse {
     Hello(HelloInfo),
     Prepared(PreparedHandoff),
+    Identity(PreparedIdentity),
     Status(BackendStatus),
     Plan(serde_json::Value),
     Doctor(serde_json::Value),
     Error(BackendError),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum IdentityRequest {
+    Peer { uid: u32, gid: u32 },
+    Root,
+    User { name: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    pub user: String,
+    pub home: PathBuf,
+    #[serde(default)]
+    pub supplemental_groups: Vec<u32>,
+    pub run_as_root: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -229,14 +262,41 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
     {
         return Err(ProtocolError::InvalidRequestId);
     }
-    if let ClientRequest::Exec {
-        argv,
-        inputs,
-        environment,
-        ..
-    } = &message.request
+    let (argv, inputs, environment) = match &message.request {
+        ClientRequest::Exec {
+            argv,
+            inputs,
+            environment,
+            ..
+        } => (Some(argv), inputs, environment),
+        ClientRequest::PrepareIdentity {
+            inputs,
+            environment,
+            requested,
+            ..
+        } => {
+            match requested {
+                IdentityRequest::User { name }
+                    if name.is_empty()
+                        || name.len() > 32
+                        || !name.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                        }) =>
+                {
+                    return Err(ProtocolError::invalid_frame(
+                        "identity user name is invalid",
+                    ));
+                }
+                IdentityRequest::Peer { .. }
+                | IdentityRequest::Root
+                | IdentityRequest::User { .. } => {}
+            }
+            (None, inputs, environment)
+        }
+        _ => return Ok(()),
+    };
     {
-        if argv.iter().any(|argument| argument.contains('\0')) {
+        if argv.is_some_and(|argv| argv.iter().any(|argument| argument.contains('\0'))) {
             return Err(ProtocolError::invalid_frame("argv contains a NUL byte"));
         }
         if inputs.len() > 64 || environment.len() > 128 {
@@ -269,8 +329,8 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_message, validate_message, write_message, ClientMessage, ClientRequest, ProtocolError,
-        PROTOCOL_VERSION,
+        read_message, validate_message, write_message, ClientMessage, ClientRequest,
+        IdentityRequest, ProtocolError, PROTOCOL_VERSION,
     };
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -328,5 +388,29 @@ mod tests {
             environment: BTreeMap::new(),
         });
         assert!(validate_message(&invalid_argv).is_err());
+
+        let identity = message(ClientRequest::PrepareIdentity {
+            cwd: PathBuf::from("/workspace"),
+            inputs: BTreeMap::new(),
+            environment: BTreeMap::new(),
+            requested: IdentityRequest::Peer {
+                uid: 1000,
+                gid: 1000,
+            },
+        });
+        let mut frame = Vec::new();
+        write_message(&mut frame, &identity).unwrap();
+        let decoded: ClientMessage = read_message(&mut Cursor::new(frame)).unwrap();
+        assert_eq!(decoded, identity);
+
+        let invalid_user = message(ClientRequest::PrepareIdentity {
+            cwd: PathBuf::from("/workspace"),
+            inputs: BTreeMap::new(),
+            environment: BTreeMap::new(),
+            requested: IdentityRequest::User {
+                name: "not/a-user".to_owned(),
+            },
+        });
+        assert!(validate_message(&invalid_user).is_err());
     }
 }

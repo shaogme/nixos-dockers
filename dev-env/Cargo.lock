@@ -45,6 +45,7 @@ dependencies = [
  "dev-env-model",
  "dev-env-provider",
  "dev-env-shell",
+ "fs2",
  "libc",
  "serde",
  "serde_json",
@@ -76,6 +77,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "toml",
 ]
 
@@ -84,7 +86,7 @@ name = "dev-env-provider"
 version = "0.1.0"
 dependencies = [
  "dev-env-model",
- "fs2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

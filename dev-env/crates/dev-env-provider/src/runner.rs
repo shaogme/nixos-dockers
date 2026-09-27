@@ -6,7 +6,6 @@ use crate::context::ProviderContext;
 use crate::detect::{detect, DetectionResult, ExecutableLocator, SystemExecutableLocator};
 use crate::environment::{parse_output, EnvironmentDelta};
 use crate::error::ProviderRuntimeError;
-use crate::lock::{lock_key, LockManager, ProviderLockGuard};
 use crate::receipt::{provider_config_fingerprint, workspace_fingerprint};
 use crate::template::expand_argv;
 use dev_env_model::{
@@ -109,9 +108,7 @@ impl Provider for GenericProvider {
 pub struct ProviderRunner {
     executor: Box<dyn CommandExecutor>,
     locator: Box<dyn ExecutableLocator>,
-    lock_manager: Option<LockManager>,
     command_timeout: Duration,
-    lock_timeout: Duration,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 }
@@ -121,9 +118,7 @@ impl Default for ProviderRunner {
         Self {
             executor: Box::new(ProcessExecutor),
             locator: Box::new(SystemExecutableLocator),
-            lock_manager: Some(LockManager::from_environment()),
             command_timeout: Duration::from_secs(300),
-            lock_timeout: Duration::from_secs(60),
             max_stdout_bytes: 1024 * 1024,
             max_stderr_bytes: 64 * 1024,
         }
@@ -153,23 +148,8 @@ impl ProviderRunner {
         }
     }
 
-    pub fn without_locks(mut self) -> Self {
-        self.lock_manager = None;
-        self
-    }
-
-    pub fn with_lock_manager(mut self, lock_manager: LockManager) -> Self {
-        self.lock_manager = Some(lock_manager);
-        self
-    }
-
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = timeout.max(Duration::from_millis(1));
-        self
-    }
-
-    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
-        self.lock_timeout = timeout;
         self
     }
 
@@ -184,6 +164,16 @@ impl ProviderRunner {
         provider_id: &str,
         config: &ProviderConfig,
         context: &ProviderContext,
+    ) -> Result<ProviderRunResult, ProviderRuntimeError> {
+        self.run_with_identity(provider_id, config, context, None)
+    }
+
+    pub fn run_with_identity(
+        &self,
+        provider_id: &str,
+        config: &ProviderConfig,
+        context: &ProviderContext,
+        identity: Option<&dev_env_model::EffectiveIdentity>,
     ) -> Result<ProviderRunResult, ProviderRuntimeError> {
         config
             .validate(provider_id)
@@ -249,12 +239,6 @@ impl ProviderRunner {
             }
         }
 
-        let _lock = if runnable_steps.is_empty() || self.lock_manager.is_none() {
-            None
-        } else {
-            Some(self.acquire_lock(provider_id, &context.workspace, context.user_id)?)
-        };
-
         let mut diagnostics = Vec::new();
         let mut prepared_steps = 0;
         for (index, step) in runnable_steps {
@@ -267,6 +251,7 @@ impl ProviderRunner {
                 args,
                 &provider_context,
                 step.timeout_ms,
+                identity,
             );
             match result {
                 Ok(output) if output.succeeded() => prepared_steps += 1,
@@ -302,6 +287,7 @@ impl ProviderRunner {
                 args,
                 &provider_context,
                 shellenv.timeout_ms,
+                identity,
             );
             match result {
                 Ok(output) if output.succeeded() => {
@@ -392,24 +378,6 @@ impl ProviderRunner {
         })
     }
 
-    fn acquire_lock(
-        &self,
-        provider: &str,
-        workspace: &std::path::Path,
-        user_id: u32,
-    ) -> Result<ProviderLockGuard, ProviderRuntimeError> {
-        let manager = self
-            .lock_manager
-            .as_ref()
-            .expect("lock manager is configured");
-        manager
-            .acquire(lock_key(workspace, user_id, provider), self.lock_timeout)
-            .map_err(|source| ProviderRuntimeError::Lock {
-                provider: provider.to_owned(),
-                source,
-            })
-    }
-
     fn expand_args(
         &self,
         provider: &str,
@@ -432,10 +400,23 @@ impl ProviderRunner {
         args: Vec<String>,
         context: &ProviderContext,
         timeout_ms: Option<u64>,
+        identity: Option<&dev_env_model::EffectiveIdentity>,
     ) -> Result<CommandOutput, ProviderRuntimeError> {
         let mut request = CommandRequest::new(executable.display().to_string(), &context.cwd);
         request.args = args;
         request.environment = context.environment.clone();
+        if let Some(identity) = identity {
+            request.environment.insert(
+                "HOME".to_owned(),
+                identity.home.to_string_lossy().into_owned(),
+            );
+            request
+                .environment
+                .insert("USER".to_owned(), identity.user.clone());
+            request
+                .environment
+                .insert("LOGNAME".to_owned(), identity.user.clone());
+        }
         request.timeout = Some(
             timeout_ms
                 .map(Duration::from_millis)
@@ -444,7 +425,7 @@ impl ProviderRunner {
         request.max_stdout_bytes = self.max_stdout_bytes;
         request.max_stderr_bytes = self.max_stderr_bytes;
         self.executor
-            .execute(&request)
+            .execute_with_identity(&request, identity)
             .map_err(|source| ProviderRuntimeError::Command {
                 provider: provider.to_owned(),
                 operation: operation.to_owned(),

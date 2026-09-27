@@ -130,6 +130,7 @@ allow_outside_workspace = false
 runtime = "/usr/bin/dev-env"
 exec_prefix = ["exec", "--"]
 shell_prefix = ["shell"]
+root_service = true
 login_shell = "/usr/bin/dev-env-login-shell"
 
 [[bootstrap.actions]]

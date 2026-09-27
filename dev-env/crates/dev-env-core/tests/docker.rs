@@ -5,16 +5,13 @@ use dev_env_model::{
     Sensitivity, ShellConfig, ShellEnvConfig, ShellEnvFormat, ShellKind, ShellSelection, ValueTree,
     WorkspaceConfig, WorkspaceSearch,
 };
-use dev_env_provider::{
-    LockManager, ProviderRunner, ProviderRuntimeError, ProviderRuntimeErrorKind,
-};
+use dev_env_provider::{ProviderRunner, ProviderRuntimeError, ProviderRuntimeErrorKind};
 use dev_env_shell::CommandLine;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 struct TempWorkspace {
     path: PathBuf,
@@ -185,10 +182,8 @@ fn context(workspace: &Path) -> RuntimeContext {
     .with_workspace_writable(true)
 }
 
-fn runner(temp: &TempWorkspace) -> ProviderRunner {
+fn runner(_temp: &TempWorkspace) -> ProviderRunner {
     ProviderRunner::default()
-        .with_lock_manager(LockManager::new(temp.path.join("locks")))
-        .with_lock_timeout(Duration::from_secs(2))
 }
 
 fn run_shell(environment: &dev_env_model::MaterializedEnv, workspace: &Path) -> String {

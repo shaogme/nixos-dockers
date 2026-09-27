@@ -6,15 +6,19 @@
 
 mod application;
 mod args;
+mod backend;
 mod config;
 mod doctor;
 mod error;
 mod explain;
+mod identity_broker;
+mod offline;
 mod output;
 mod process;
 mod trust;
 
 pub use application::run;
+pub use args::{BackendCommand, BackendInitial};
 pub use args::{Cli, CliCommand, CliOptions, OutputFormat, ParseError};
 pub use config::{
     load, runtime_context, LoadedConfig, DEFAULT_ADMIN_CONFIG, DEFAULT_PROFILES_DIR,

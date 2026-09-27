@@ -80,9 +80,10 @@ sensitivity = "public"
 | `warn` | 记录结构化 `PrepareFailed` diagnostic，继续后续流程 |
 | `ignore` | 记录 diagnostic，继续后续流程 |
 
-只要有 runnable prepare step，就先获取 workspace/user/provider 锁。默认锁目录是 `$XDG_RUNTIME_DIR/dev-env/locks`，没有 `XDG_RUNTIME_DIR` 时使用 `/run/dev-env/locks`；同一 workspace、user id、provider id 的并发 prepare 会串行化。
-
-当前 runner 会在一次调用中每次执行符合条件的 prepare；receipt 会随结果返回，但当前 CLI 不读取 receipt 来跳过下一次 prepare。因而 profile 中的安装/初始化命令应当自身幂等。
+prepare 不使用跨进程锁文件。生产 backend 由 `MaterializationService` 按
+`MaterializationKey` 做 single-flight，并在成功后缓存 receipt；相同 workspace、身份、
+provider 和 detect fingerprint 的并发请求只执行一次。直接使用 provider runner 的库
+调用不提供跨进程协调保证，生产入口必须通过 backend。
 
 ### `shellenv`
 
@@ -182,17 +183,19 @@ generic runner 通过 `CommandRequest` 启动 provider，cwd 是当前会话 cwd
 - stdout 默认最多 1 MiB，stderr 默认最多 64 KiB；
 - 默认单命令超时为 300 秒，profile 的 `timeout_ms` 可以缩短或调整。
 
-## 7. Receipt、fingerprint 和锁
+## 7. Receipt 和 fingerprint
 
-`MaterializedEnv` 会带有：
+backend 返回的 `MaterializedEnv` 会带有：
 
 - `config_fingerprint`：序列化后的 `ResolvedConfig` SHA-256；
-- provider receipt：provider id、配置 fingerprint、workspace fingerprint、版本和完成时间（当前 generic runner 的 version/time 可能为空）；
+- provider receipt：provider id、配置 fingerprint、workspace fingerprint、版本和完成时间；
 - provider 输出的 sensitivity 和 provider id。
 
-workspace fingerprint 使用 canonical workspace 路径及 provider 探测到的文件内容计算，不会把 workspace 中无关文件和完整 secret 写入 receipt。锁 key 则使用 canonical workspace、user id 和 provider id 的 SHA-256。
+workspace fingerprint 使用 canonical workspace 路径及 provider 探测到的文件内容计算，不会把 workspace 中无关文件和完整 secret 写入 receipt。
 
-receipt 当前用于报告结果和测试审计，不是已接入的缓存系统；不要把它当成 prepare 一定只执行一次的保证。
+backend receipt 是当前 generation 的缓存审计信息；生产 client 不能伪造 receipt，也不能
+绕过 backend 直接执行 provider。直接使用 provider crate 的 runner 只适合库测试和离线
+诊断，不提供跨进程协调。
 
 ## 8. Provider 失败诊断
 
@@ -208,7 +211,6 @@ receipt 当前用于报告结果和测试审计，不是已接入的缓存系统
 | `DEVENV-E-PROVIDER-EXIT` | provider 返回非零退出码或超时 |
 | `DEVENV-E-PROVIDER-UTF8` | shellenv stdout 不是 UTF-8 |
 | `DEVENV-E-PROVIDER-OUTPUT` | shellenv 输出格式或安全语法被拒绝 |
-| `DEVENV-E-PROVIDER-LOCK` | 锁目录、锁文件或等待超时失败 |
 | `DEVENV-E-PROVIDER-FINGERPRINT` | 计算配置/workspace fingerprint 失败 |
 
 `warn`/`ignore` 不会吞掉结构化事实；它们返回 diagnostic，CLI 或调用库可以继续输出环境并报告具体 provider、step、退出码、timeout 和截断 stderr。

@@ -24,6 +24,7 @@ auto_mapping = true
 runtime = "/usr/bin/dev-env"
 exec_prefix = ["exec", "--"]
 shell_prefix = ["shell"]
+root_service = true
 ```
 
 外层 `schema` 是 profile 的 schema 版本；加载时如果没有 `bootstrap.schema`，它也会作为 Bootstrap schema 版本使用。为了可读性，建议像上例一样在顶层写 `schema = 1`。`bootstrap.schema = 1` 也被支持，但不能与不同值的顶层 schema 同时出现。
@@ -104,6 +105,9 @@ login_shell = "/usr/bin/dev-env-login-shell"
 ```
 
 `runtime` 必须是绝对路径，且不能包含空格或插值。所有 prefix 元素都必须是非空、不含 NUL/换行的 argv 值。
+`root_service = true` 只适用于受信任的长期 supervisor handoff（例如 dev-env backend）；它
+保留 container-init 的 root 权限给 supervisor，后续请求的 provider/命令身份仍必须由
+identity broker 明确解析，不能由 client 直接伪造 UID/GID。
 
 构造 handoff argv 的规则是：
 

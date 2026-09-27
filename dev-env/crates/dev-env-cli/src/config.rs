@@ -19,7 +19,6 @@ pub struct LoadedConfig {
     workspace: PathBuf,
     cwd: PathBuf,
     workspace_config_present: bool,
-    user_id: u32,
 }
 
 impl LoadedConfig {
@@ -45,10 +44,6 @@ impl LoadedConfig {
 
     pub fn workspace_config_present(&self) -> bool {
         self.workspace_config_present
-    }
-
-    pub fn user_id(&self) -> u32 {
-        self.user_id
     }
 }
 
@@ -130,7 +125,6 @@ pub fn load(options: &CliOptions) -> Result<LoadedConfig, CliError> {
         workspace,
         cwd,
         workspace_config_present: workspace_config_present || has_explicit_config,
-        user_id: options.user_id.unwrap_or_else(effective_user_id),
     })
 }
 
@@ -153,7 +147,7 @@ pub fn runtime_context(
         ),
     };
     Ok(context
-        .with_user_id(loaded.user_id())
+        .with_user_id(effective_user_id())
         .with_workspace_config_present(loaded.workspace_config_present()))
 }
 

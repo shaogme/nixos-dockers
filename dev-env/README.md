@@ -20,9 +20,11 @@
 profile TOML / overlay / runtime input / CLI
                     │
                     ▼
-             ResolvedConfig
+        backend ConfigSnapshot (generation)
                     │
-       detect → prepare → shellenv
+             Prepare context/key
+                    │
+       cache or detect → prepare → shellenv
                     │
                     ▼
              MaterializedEnv
@@ -42,7 +44,7 @@ profile TOML / overlay / runtime input / CLI
 - 生成环境变量和结构化 `PATH`；
 - 通过 argv 调用通用 provider，不拼接 shell 命令；
 - 解析受限的 shell、dotenv 或 JSON 环境输出；
-- 以同一个 materializer 启动不同入口。
+- 由单实例 backend 持有 materializer、provider jobs 和 generation cache；短命 client 只发送 Prepare。
 
 它不负责：
 
@@ -105,7 +107,7 @@ docker exec <container> dev-env doctor --json
 
 镜像还可以把 `/bin/bash` 和 `/usr/bin/bash` 做成兼容 shim。root 启动的
 `docker exec ... bash -lc ...` 会先重新进入 `container-init` 的身份 Bootstrap，
-再物化环境并启动真实 Bash；已经以目标用户运行的 shell 只会物化环境：
+通过 backend Prepare 获取环境并启动真实 Bash；已经以目标用户运行的 shell 也只请求同一 backend：
 
 ```bash
 docker exec -it <container> bash -lc 'printf "%s\\n" "$PATH"'
@@ -137,8 +139,12 @@ cargo build --locked --release -p dev-env-cli
 ./target/release/dev-env \
   --profiles-dir /path/to/profiles.d \
   --default-profile-file /path/to/default-profile \
-  print --format json
+  backend run --initial-shell
 ```
+
+另一个终端再使用 `dev-env print`、`dev-env exec` 或 `dev-env shell` 连接该 backend。
+只做本地文件诊断或离线测试时可以显式使用 `--offline`；该路径不会被生产 handoff
+调用。
 
 最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。快速验证 Rust workspace 本身：
 
@@ -150,20 +156,21 @@ cargo clippy --workspace --all-targets --locked
 
 ## 入口一致性
 
-容器的默认 `Entrypoint` 是 `/usr/bin/container-init run --`。`container-init` backend 在
-启动时加载一次 profile snapshot，完成 UID/GID namespace 解析、账户和目录 reconcile；
-后续 `dev-env` shim 通过 `container-init exec` 请求同一 snapshot，环境 provider 不在
-`container-init` 中执行。
+容器的默认 `Entrypoint` 是 `/usr/bin/container-init run --`。`container-init` 负责
+bootstrap namespace、UID/GID 解析、账户和目录 reconcile，并把 root supervisor handoff
+给唯一的 `dev-env backend`。backend 加载一次 profile snapshot，通过 container-init
+identity broker 为每个 request/provider 解析身份，再执行 provider。后续 `dev-env` client
+通过 `/run/dev-env/backend.sock` 请求环境。
 
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |
-| Docker 默认命令 | `container-init` → `dev-env exec/shell` | 当前用户、cwd、profile、provider |
-| `docker exec` 非 shell 命令 | `dev-env exec -- <command>` | 重新解析当前会话 |
-| `docker exec` 交互 shell | `dev-env shell` | 重新解析当前会话 |
-| root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | backend Bootstrap 身份、再物化并转发原始 argv |
-| 非 root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | 直接物化并转发原始 argv |
+| Docker 默认命令 | `container-init` → `dev-env backend` → `dev-env exec/shell` | backend snapshot、当前用户、cwd、provider |
+| `docker exec` 非 shell 命令 | `dev-env exec -- <command>` | backend snapshot + 当前 context |
+| `docker exec` 交互 shell | `dev-env shell` | backend snapshot + 当前 context |
+| root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | backend Bootstrap 身份、Prepare 并转发原始 argv |
+| 非 root 的 Bash 调用 | `/bin/bash` 或 `/usr/bin/bash` shim | 请求 backend 并转发原始 argv |
 | 显式 root | `RUN_AS_ROOT=1 ... bash` | 保留 root，仍物化环境 |
-| SSH 登录 | `/usr/bin/dev-env-login-shell` | 重新解析 SSH 用户的环境 |
+| SSH 登录 | `/usr/bin/dev-env-login-shell` | backend snapshot + SSH 用户 context |
 | 仅查看 | `print` / `explain` / `doctor` | 不启动目标 shell；`explain`/`doctor` 不执行 provider |
 
 child process 由 `CommandLine` 使用 `env_clear()` 后注入 `MaterializedEnv`。因此不同入口不会依赖某一次 entrypoint 对当前 shell 的临时修改，也不会把动态 provider 环境写入 `/etc/environment`。
@@ -209,6 +216,8 @@ dev-env/
 - admin、user、workspace、runtime 和 CLI 的加载层；
 - bool、enum、integer、path、string 类型输入及 alias；
 - provider 的文件探测、依赖排序、prepare、shellenv、超时、锁和 receipt；
+- backend v2 的单实例 lock/socket、immutable startup snapshot、状态/诊断请求、reload
+  generation，以及 provider process group/subreaper 回收边界；
 - shell、dotenv、JSON 输出解析与敏感值脱敏；
 - `exec`、`shell`、`login-shell`、`shim`、`print`、`explain`、`doctor`、`trust`；
 - model、loader、core、provider、shell、CLI 的单元测试，以及 Linux Docker 真实进程测试。

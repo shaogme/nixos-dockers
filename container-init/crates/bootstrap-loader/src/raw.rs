@@ -60,6 +60,8 @@ pub(crate) struct RawHandoff {
     pub(crate) runtime: Option<String>,
     pub(crate) exec_prefix: Option<Vec<String>>,
     pub(crate) shell_prefix: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) root_service: Option<bool>,
     pub(crate) ssh_daemon: Option<String>,
     pub(crate) login_shell: Option<String>,
 }
@@ -277,6 +279,7 @@ fn validate_bootstrap_override_path(path: &str, profile: &str) -> Result<(), Loa
         "bootstrap.handoff.runtime",
         "bootstrap.handoff.exec_prefix",
         "bootstrap.handoff.shell_prefix",
+        "bootstrap.handoff.root_service",
         "bootstrap.handoff.ssh_daemon",
         "bootstrap.handoff.login_shell",
     ];

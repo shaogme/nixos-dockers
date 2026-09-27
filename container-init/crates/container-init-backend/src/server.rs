@@ -1,7 +1,8 @@
 use crate::protocol::{
     read_message, validate_message, write_message, BackendError, BackendState, BackendStatus,
-    ClientMessage, ClientRequest, HelloInfo, PeerCredentials, PreparedHandoff, ProtocolError,
-    ReceiptSummary, ServerMessage, ServerResponse, PROTOCOL_VERSION,
+    ClientMessage, ClientRequest, HelloInfo, IdentityRequest, PeerCredentials, PreparedHandoff,
+    PreparedIdentity, ProtocolError, ReceiptSummary, ServerMessage, ServerResponse,
+    PROTOCOL_VERSION,
 };
 use crate::socket::{bind_socket, cleanup_stale_socket, ensure_socket_directory, peer_credentials};
 use bootstrap_model::{ActionKind, BootstrapConfig, Condition, ConditionValue, Plan};
@@ -104,7 +105,7 @@ impl BackendLease {
         // must not overwrite that report with a partial identity plan.
         execution_options.receipt_path = None;
         self._lock.allow_peer_group(identity.gid)?;
-        let root_service = is_root_service(&config, command, self.paths.owner_uid);
+        let root_service = is_root_service(&config, command, self.paths.owner_uid, true);
         let handoff =
             PlanExecutor::with_shared_config(Arc::clone(&config), startup_context.clone())
                 .build_handoff_command(command)?;
@@ -438,13 +439,20 @@ fn snapshot_id(profile: &str, config: &BootstrapConfig, plan: &Plan) -> Result<S
     Ok(format!("{hash:016x}"))
 }
 
-fn is_root_service(config: &BootstrapConfig, command: &[String], owner_uid: u32) -> bool {
+fn is_root_service(
+    config: &BootstrapConfig,
+    command: &[String],
+    owner_uid: u32,
+    initial_handoff: bool,
+) -> bool {
     owner_uid == 0
-        && config
-            .handoff
-            .ssh_daemon
-            .as_deref()
-            .is_some_and(|daemon| command.first().is_some_and(|candidate| candidate == daemon))
+        && initial_handoff
+        && (config.handoff.root_service
+            || config
+                .handoff
+                .ssh_daemon
+                .as_deref()
+                .is_some_and(|daemon| command.first().is_some_and(|candidate| candidate == daemon)))
 }
 
 fn spawn_handoff(
@@ -462,7 +470,11 @@ fn spawn_handoff(
         command
             .env("HOME", "/root")
             .env("USER", "root")
-            .env("LOGNAME", "root");
+            .env("LOGNAME", "root")
+            // The startup identity may come from HOST_UID/HOST_GID mapping;
+            // pass its resolved UID to the backend peer policy rather than
+            // relying on the image's default UID.
+            .env("DEVENV_BACKEND_ALLOWED_UID", identity.uid.to_string());
     } else {
         command
             .env("HOME", &identity.home)
@@ -773,6 +785,25 @@ fn serve_connection(mut stream: UnixStream, runtime: Arc<BackendRuntime>) -> io:
                     }
                 }
             }
+            ClientRequest::PrepareIdentity {
+                cwd,
+                inputs,
+                environment,
+                requested,
+            } => {
+                if !greeted {
+                    ServerResponse::Error(backend_error(
+                        "protocol",
+                        false,
+                        "prepare_identity requires a hello request on this connection",
+                    ))
+                } else {
+                    match prepare_identity(&runtime, peer, requested, cwd, inputs, environment) {
+                        Ok(identity) => ServerResponse::Identity(identity),
+                        Err(error) => ServerResponse::Error(error),
+                    }
+                }
+            }
             ClientRequest::Status => ServerResponse::Status(runtime.status()),
             ClientRequest::Plan => ServerResponse::Plan(plan_response(&runtime)),
             ClientRequest::Doctor => ServerResponse::Doctor(doctor_response(&runtime)),
@@ -883,7 +914,9 @@ fn prepare_exec(
     let identity = executor
         .resolve_identity_prevalidated()
         .map_err(|error| backend_core_error(&error))?;
-    let root_service = is_root_service(&runtime.config, &argv, unsafe { libc::geteuid() });
+    // A request is always a client handoff. The root_service flag belongs to
+    // the initial container-init -> backend/sshd handoff only.
+    let root_service = is_root_service(&runtime.config, &argv, unsafe { libc::geteuid() }, false);
     if root_service && peer.uid != 0 {
         return Err(backend_error(
             "permission",
@@ -961,6 +994,174 @@ fn prepare_exec(
         root_service,
         receipt_summary,
     })
+}
+
+fn prepare_identity(
+    runtime: &BackendRuntime,
+    peer: PeerCredentials,
+    requested: IdentityRequest,
+    cwd: PathBuf,
+    inputs: BTreeMap<String, String>,
+    environment: BTreeMap<String, String>,
+) -> Result<PreparedIdentity, BackendError> {
+    if runtime.status().state != BackendState::Ready {
+        return Err(backend_error(
+            "backend_not_ready",
+            true,
+            "container-init is not ready to prepare an identity",
+        ));
+    }
+    let requested_peer = match &requested {
+        IdentityRequest::Peer { uid, gid } => PeerCredentials {
+            pid: peer.pid,
+            uid: *uid,
+            gid: *gid,
+        },
+        IdentityRequest::Root => PeerCredentials {
+            pid: peer.pid,
+            uid: 0,
+            gid: 0,
+        },
+        IdentityRequest::User { .. } => peer,
+    };
+    if peer.uid != 0 && (requested_peer.uid != peer.uid || requested_peer.gid != peer.gid) {
+        return Err(backend_error(
+            "permission",
+            false,
+            "non-root broker peers may only request their observed identity",
+        ));
+    }
+    if matches!(
+        requested,
+        IdentityRequest::Root | IdentityRequest::User { .. }
+    ) && peer.uid != 0
+    {
+        return Err(backend_error(
+            "permission",
+            false,
+            "only the root backend may request a named or root identity",
+        ));
+    }
+    if peer.uid == 0 {
+        match &requested {
+            IdentityRequest::Peer { uid, gid } if !allowed_peer_identity(runtime, *uid, *gid) => {
+                return Err(backend_error(
+                    "permission",
+                    false,
+                    "root broker peer identity is not allowed by the profile",
+                ));
+            }
+            IdentityRequest::User { name }
+                if name != "root"
+                    && runtime.request_config.identity.default_user.as_deref() != Some(name) =>
+            {
+                return Err(backend_error(
+                    "permission",
+                    false,
+                    "named identity is not allowed by the profile",
+                ));
+            }
+            IdentityRequest::Peer { .. } | IdentityRequest::Root | IdentityRequest::User { .. } => {
+            }
+        }
+    }
+    let cwd = if peer.uid == 0 {
+        fs::canonicalize(&cwd).and_then(|path| {
+            if fs::metadata(&path)?.is_dir() {
+                Ok(path)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cwd is not a directory",
+                ))
+            }
+        })
+    } else {
+        accessible_cwd(&cwd, requested_peer)
+    }
+    .map_err(|_| {
+        backend_error(
+            "permission",
+            false,
+            "identity request working directory is unavailable",
+        )
+    })?;
+    let mut config = (*runtime.request_config).clone();
+    let mut inputs = inputs;
+    let identity_inputs = [
+        config.identity.run_as_root_input.clone(),
+        config.identity.uid_input.clone(),
+        config.identity.gid_input.clone(),
+        config.identity.home_input.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<BTreeSet<_>>();
+    inputs.retain(|name, _| !identity_inputs.contains(name));
+    let mut environment = environment;
+    environment.retain(|name, _| !identity_inputs.contains(name));
+    match requested {
+        IdentityRequest::Peer { uid, gid } => {
+            config.identity.default_user = None;
+            config.identity.default_uid = Some(uid);
+            config.identity.default_gid = Some(gid);
+            config.identity.auto_mapping = false;
+        }
+        IdentityRequest::Root => {
+            if let Some(name) = config.identity.run_as_root_input.clone() {
+                inputs.entry(name).or_insert_with(|| "1".to_owned());
+            } else {
+                config.identity.default_user = Some("root".to_owned());
+                config.identity.default_uid = Some(0);
+                config.identity.default_gid = Some(0);
+                config.identity.auto_mapping = false;
+            }
+        }
+        IdentityRequest::User { name } => {
+            config.identity.default_user = Some(name);
+            config.identity.default_uid = None;
+            config.identity.default_gid = None;
+            config.identity.auto_mapping = false;
+        }
+    }
+    validate_inputs(&config, &inputs)?;
+    let mut context = RuntimeContext::new(cwd).with_environment(environment);
+    for (name, value) in inputs {
+        context = context.with_cli_input(name, value);
+    }
+    let executor = PlanExecutor::with_shared_config(Arc::new(config), context)
+        .with_options(runtime.execution_options.clone());
+    let report = executor
+        .execute_prevalidated(&runtime.request_plan, &[])
+        .map_err(|error| backend_core_error(&error))?;
+    let groups = supplementary_groups(&report.identity)
+        .map_err(|_| backend_error("identity", false, "supplementary groups unavailable"))?;
+    let supplemental_groups = groups
+        .into_iter()
+        .map(u32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| backend_error("identity", false, "supplementary group is out of range"))?;
+    Ok(PreparedIdentity {
+        uid: report.identity.uid,
+        gid: report.identity.gid,
+        user: report.identity.user,
+        home: report.identity.home,
+        supplemental_groups,
+        run_as_root: report.identity.run_as_root,
+    })
+}
+
+fn allowed_peer_identity(runtime: &BackendRuntime, uid: u32, gid: u32) -> bool {
+    let startup = &runtime.startup_identity;
+    if uid == startup.uid && gid == startup.gid {
+        return true;
+    }
+    runtime
+        .request_config
+        .identity
+        .default_uid
+        .zip(runtime.request_config.identity.default_gid)
+        .is_some_and(|(default_uid, default_gid)| uid == default_uid && gid == default_gid)
 }
 
 fn set_cloexec(stream: &UnixStream) -> io::Result<()> {

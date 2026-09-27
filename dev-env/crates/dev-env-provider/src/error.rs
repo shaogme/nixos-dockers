@@ -1,7 +1,6 @@
 use crate::command::{CommandError, CommandOutput};
 use crate::detect::DetectionError;
 use crate::environment::EnvironmentParseError;
-use crate::lock::LockError;
 use crate::receipt::FingerprintError;
 use crate::template::TemplateError;
 use dev_env_model::ModelError;
@@ -48,10 +47,6 @@ pub enum ProviderRuntimeError {
         operation: String,
         source: EnvironmentParseError,
     },
-    Lock {
-        provider: String,
-        source: LockError,
-    },
     Fingerprint {
         provider: String,
         source: FingerprintError,
@@ -71,7 +66,6 @@ pub enum ProviderRuntimeErrorKind {
     CommandFailed,
     OutputUtf8,
     OutputRejected,
-    Lock,
     Fingerprint,
 }
 
@@ -86,7 +80,6 @@ impl ProviderRuntimeError {
             Self::CommandFailed { .. } => ProviderRuntimeErrorKind::CommandFailed,
             Self::OutputUtf8 { .. } => ProviderRuntimeErrorKind::OutputUtf8,
             Self::OutputRejected { .. } => ProviderRuntimeErrorKind::OutputRejected,
-            Self::Lock { .. } => ProviderRuntimeErrorKind::Lock,
             Self::Fingerprint { .. } => ProviderRuntimeErrorKind::Fingerprint,
         }
     }
@@ -103,7 +96,6 @@ impl ProviderRuntimeErrorKind {
             Self::CommandFailed => "DEVENV-E-PROVIDER-EXIT",
             Self::OutputUtf8 => "DEVENV-E-PROVIDER-UTF8",
             Self::OutputRejected => "DEVENV-E-PROVIDER-OUTPUT",
-            Self::Lock => "DEVENV-E-PROVIDER-LOCK",
             Self::Fingerprint => "DEVENV-E-PROVIDER-FINGERPRINT",
         }
     }
@@ -152,9 +144,6 @@ impl fmt::Display for ProviderRuntimeError {
                 operation,
                 source,
             } => write!(formatter, "provider {provider:?} {operation} output was rejected: {source}"),
-            Self::Lock { provider, source } => {
-                write!(formatter, "provider {provider:?} lock failed: {source}")
-            }
             Self::Fingerprint { provider, source } => {
                 write!(formatter, "provider {provider:?} fingerprint failed: {source}")
             }
@@ -171,7 +160,6 @@ impl Error for ProviderRuntimeError {
             Self::Command { source, .. } => Some(source),
             Self::OutputUtf8 { source, .. } => Some(source),
             Self::OutputRejected { source, .. } => Some(source),
-            Self::Lock { source, .. } => Some(source),
             Self::Fingerprint { source, .. } => Some(source),
             Self::MissingExecutable { .. } | Self::CommandFailed { .. } => None,
         }

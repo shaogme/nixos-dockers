@@ -174,7 +174,6 @@ pub fn protocol_error(error: &ProviderRuntimeError) -> ProtocolError {
         | ProviderRuntimeErrorKind::Detection
         | ProviderRuntimeErrorKind::Template
         | ProviderRuntimeErrorKind::Command
-        | ProviderRuntimeErrorKind::Lock
         | ProviderRuntimeErrorKind::Fingerprint => ProtocolError::InvalidRequest {
             field: "provider runtime".to_owned(),
         },

@@ -7,19 +7,7 @@ use std::path::{Path, PathBuf};
 /// already computed SHA-256 hash.  The trust command intentionally stores
 /// only hashes, never the file contents or a rendered configuration error.
 pub fn trust(target: &Path) -> Result<String, TrustError> {
-    let digest = if target.is_file() {
-        let contents = fs::read(target).map_err(|source| TrustError::HashFile {
-            path: target.to_path_buf(),
-            source,
-        })?;
-        dev_env_provider::fingerprint_bytes(&contents)
-    } else {
-        let value = target.to_string_lossy();
-        parse_hash(&value).ok_or_else(|| TrustError::InvalidHash {
-            value: target.to_path_buf(),
-        })?
-    };
-    let hash = hex_digest(digest);
+    let hash = digest(target)?;
     let store = trust_store_path();
     let existing = match fs::read_to_string(&store) {
         Ok(contents) => contents,
@@ -52,6 +40,22 @@ pub fn trust(target: &Path) -> Result<String, TrustError> {
         })?;
     }
     Ok(hash)
+}
+
+pub fn digest(target: &Path) -> Result<String, TrustError> {
+    let digest = if target.is_file() {
+        let contents = fs::read(target).map_err(|source| TrustError::HashFile {
+            path: target.to_path_buf(),
+            source,
+        })?;
+        dev_env_provider::fingerprint_bytes(&contents)
+    } else {
+        let value = target.to_string_lossy();
+        parse_hash(&value).ok_or_else(|| TrustError::InvalidHash {
+            value: target.to_path_buf(),
+        })?
+    };
+    Ok(hex_digest(digest))
 }
 
 fn trust_store_path() -> PathBuf {

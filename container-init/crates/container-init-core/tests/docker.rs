@@ -34,6 +34,7 @@ fn fixture_config(root: &Path, actions: Vec<Action>) -> BootstrapConfig {
             runtime: "/bin/sh".to_owned(),
             exec_prefix: vec!["-c".to_owned()],
             shell_prefix: vec!["-c".to_owned(), "true".to_owned()],
+            root_service: false,
             ssh_daemon: None,
             login_shell: None,
         },

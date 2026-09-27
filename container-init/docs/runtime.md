@@ -94,9 +94,15 @@ container-init --profile coding-images run -- tool --flag 'value with spaces'
 
 1. 获取固定 backend 实例 `flock`；已有实例只返回状态，不再加载 profile；
 2. 加载 image/admin profile 目录并选择 profile，构建不可变 snapshot；
-3. 完成启动 reconcile，创建 Unix socket 并启动初始 handoff 子进程；
+3. 完成启动 reconcile，创建 identity broker socket，并以 root service 身份启动唯一的
+   dev-env backend handoff 子进程；
 4. backend 监督初始子进程，初始子进程退出码成为容器退出码；
-5. 收到终止信号时转发给 handoff，回收子进程并清理 socket。
+5. 收到终止信号时转发给 backend，回收子进程并清理 broker/socket 状态。
+
+backend handoff 可以声明 `root_service = true`。这表示 root 只属于初始 backend/SSH
+service supervisor；`container-init exec` 不继承该标志，普通 provider job 和客户端
+命令仍通过 `PrepareIdentity` 使用 peer credentials、profile policy 和 container-init
+的 UID/GID namespace 映射解析身份。
 
 `run` 会先把当前工作目录切换到 runtime workspace。目标身份解析通过 Linux
 `/proc/self/mountinfo` 确认 workspace 挂载事实后才读取其属主；镜像构建时预创建的

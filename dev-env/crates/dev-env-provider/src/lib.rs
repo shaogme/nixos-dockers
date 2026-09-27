@@ -12,10 +12,10 @@ mod context;
 mod detect;
 mod environment;
 mod error;
-mod lock;
 mod protocol;
 mod receipt;
 mod runner;
+mod supervisor;
 mod template;
 
 pub use command::{
@@ -30,7 +30,6 @@ pub use environment::{
     parse_output, DotenvParseError, EnvironmentDelta, EnvironmentParseError, JsonEnvironmentError,
 };
 pub use error::{ProviderRuntimeError, ProviderRuntimeErrorKind};
-pub use lock::{lock_key, LockError, LockManager, ProviderLockGuard};
 pub use protocol::{
     decode_request, encode_response, protocol_error, ProtocolCodecError, ProtocolDiagnostic,
     ProtocolError, ProtocolOperation, ProtocolRequest, ProtocolResponse, PROTOCOL_VERSION,
@@ -41,4 +40,5 @@ pub use receipt::{
 pub use runner::{
     GenericProvider, Provider, ProviderDiagnostic, ProviderRunResult, ProviderRunner,
 };
+pub use supervisor::{ProviderJob, ProviderSupervisor};
 pub use template::{expand_argv, TemplateError};

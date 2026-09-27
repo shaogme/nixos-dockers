@@ -18,13 +18,16 @@ pub struct CliOptions {
     pub workspace: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub config: Option<PathBuf>,
-    pub user_id: Option<u32>,
     pub patches: Vec<CliPatch>,
     pub show_secrets: bool,
+    pub offline: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CliCommand {
+    Backend {
+        command: BackendCommand,
+    },
     Exec {
         command: Vec<OsString>,
     },
@@ -59,6 +62,31 @@ pub enum CliCommand {
     Version,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendCommand {
+    Run {
+        socket: Option<PathBuf>,
+        initial: BackendInitial,
+    },
+    Status {
+        socket: Option<PathBuf>,
+        json: bool,
+    },
+    Reload {
+        socket: Option<PathBuf>,
+        wait: bool,
+    },
+    Stop {
+        socket: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendInitial {
+    Shell,
+    Exec(Vec<OsString>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputFormat {
     Dotenv,
@@ -75,7 +103,6 @@ pub enum ParseError {
     EmptyValue { option: String },
     InvalidUtf8 { index: usize },
     InvalidAssignment { option: String, value: String },
-    InvalidInteger { option: String, value: String },
     InvalidFormat { value: String },
     MissingRequiredOption { command: String, option: String },
     UnexpectedArgument { command: String, argument: String },
@@ -103,12 +130,6 @@ impl std::fmt::Display for ParseError {
                 formatter,
                 "option {option} value {value:?} must have the form PATH=VALUE"
             ),
-            Self::InvalidInteger { option, value } => {
-                write!(
-                    formatter,
-                    "option {option} value {value:?} is not a valid integer"
-                )
-            }
             Self::InvalidFormat { value } => write!(
                 formatter,
                 "unknown environment format {value:?}; expected dotenv, json, or shell"
@@ -228,6 +249,7 @@ fn parse_os_arguments(arguments: &[OsString]) -> Result<Cli, ParseError> {
         "explain" => parse_explain(arguments, index, &mut options)?,
         "doctor" => parse_doctor(arguments, index, &mut options)?,
         "trust" => parse_trust(arguments, index)?,
+        "backend" => parse_backend(arguments, index, &mut options)?,
         "version" => {
             if index != arguments.len() {
                 return Err(ParseError::UnexpectedArgument {
@@ -243,6 +265,139 @@ fn parse_os_arguments(arguments: &[OsString]) -> Result<Cli, ParseError> {
 }
 
 const DEFAULT_REAL_SHELL: &str = "/usr/local/libexec/dev-env/real/bash";
+
+fn parse_backend(
+    arguments: &[OsString],
+    mut index: usize,
+    options: &mut CliOptions,
+) -> Result<CliCommand, ParseError> {
+    if index == arguments.len() {
+        return Err(ParseError::MissingValue {
+            option: "backend command".to_owned(),
+        });
+    }
+    let subcommand = text_argument(arguments, index)?.to_owned();
+    index += 1;
+    let mut socket = None;
+    match subcommand.as_str() {
+        "run" => {
+            let mut initial = None;
+            while index < arguments.len() {
+                let argument = text_argument(arguments, index)?;
+                if argument == "--initial-shell" {
+                    if initial.is_some() {
+                        return Err(ParseError::UnexpectedArgument {
+                            command: "backend run".to_owned(),
+                            argument: argument.to_owned(),
+                        });
+                    }
+                    initial = Some(BackendInitial::Shell);
+                    index += 1;
+                } else if argument == "--initial-exec" {
+                    index += 1;
+                    if index < arguments.len() && text_argument(arguments, index)? == "--" {
+                        index += 1;
+                    }
+                    if index == arguments.len() {
+                        return Err(ParseError::MissingValue {
+                            option: "--initial-exec command".to_owned(),
+                        });
+                    }
+                    if initial.is_some() {
+                        return Err(ParseError::UnexpectedArgument {
+                            command: "backend run".to_owned(),
+                            argument: "--initial-exec".to_owned(),
+                        });
+                    }
+                    initial = Some(BackendInitial::Exec(arguments[index..].to_vec()));
+                    index = arguments.len();
+                } else if argument == "--socket" || argument.starts_with("--socket=") {
+                    socket = Some(PathBuf::from(option_value(
+                        arguments, &mut index, "--socket",
+                    )?));
+                } else if is_common_option(argument) {
+                    parse_common_option(arguments, &mut index, options)?;
+                } else if is_help(argument) {
+                    return Ok(CliCommand::Help);
+                } else {
+                    return Err(ParseError::UnknownOption {
+                        option: argument.to_owned(),
+                    });
+                }
+            }
+            let initial = initial.ok_or_else(|| ParseError::MissingRequiredOption {
+                command: "backend run".to_owned(),
+                option: "--initial-shell or --initial-exec".to_owned(),
+            })?;
+            Ok(CliCommand::Backend {
+                command: BackendCommand::Run { socket, initial },
+            })
+        }
+        "status" => {
+            while index < arguments.len() {
+                let argument = text_argument(arguments, index)?;
+                if argument == "--json" {
+                    index += 1;
+                } else if argument == "--socket" || argument.starts_with("--socket=") {
+                    socket = Some(PathBuf::from(option_value(
+                        arguments, &mut index, "--socket",
+                    )?));
+                } else {
+                    return Err(ParseError::UnexpectedArgument {
+                        command: "backend status".to_owned(),
+                        argument: argument.to_owned(),
+                    });
+                }
+            }
+            Ok(CliCommand::Backend {
+                command: BackendCommand::Status { socket, json: true },
+            })
+        }
+        "reload" => {
+            let mut wait = false;
+            while index < arguments.len() {
+                let argument = text_argument(arguments, index)?;
+                if argument == "--wait" {
+                    wait = true;
+                    index += 1;
+                } else if argument == "--socket" || argument.starts_with("--socket=") {
+                    socket = Some(PathBuf::from(option_value(
+                        arguments, &mut index, "--socket",
+                    )?));
+                } else {
+                    return Err(ParseError::UnexpectedArgument {
+                        command: "backend reload".to_owned(),
+                        argument: argument.to_owned(),
+                    });
+                }
+            }
+            Ok(CliCommand::Backend {
+                command: BackendCommand::Reload { socket, wait },
+            })
+        }
+        "stop" => {
+            while index < arguments.len() {
+                let argument = text_argument(arguments, index)?;
+                if argument == "--socket" || argument.starts_with("--socket=") {
+                    socket = Some(PathBuf::from(option_value(
+                        arguments, &mut index, "--socket",
+                    )?));
+                } else {
+                    return Err(ParseError::UnexpectedArgument {
+                        command: "backend stop".to_owned(),
+                        argument: argument.to_owned(),
+                    });
+                }
+            }
+            Ok(CliCommand::Backend {
+                command: BackendCommand::Stop { socket },
+            })
+        }
+        _ => Err(ParseError::UnknownCommand {
+            command: subcommand,
+        }),
+    }
+}
 
 fn parse_exec(
     arguments: &[OsString],
@@ -517,13 +672,6 @@ fn parse_common_option(
         "--workspace" => options.workspace = Some(PathBuf::from(value(index)?)),
         "--cwd" => options.cwd = Some(PathBuf::from(value(index)?)),
         "--config" => options.config = Some(PathBuf::from(value(index)?)),
-        "--user-id" => {
-            let raw = value(index)?;
-            options.user_id = Some(raw.parse().map_err(|_| ParseError::InvalidInteger {
-                option: name.to_owned(),
-                value: raw,
-            })?);
-        }
         "--set" => {
             let raw = value(index)?;
             let (path, value) =
@@ -560,6 +708,10 @@ fn parse_common_option(
                 },
             ));
         }
+        "--offline" => {
+            options.offline = true;
+            *index += 1;
+        }
         _ => {
             return Err(ParseError::UnknownOption {
                 option: name.to_owned(),
@@ -580,9 +732,9 @@ fn is_common_option(argument: &str) -> bool {
         "--workspace",
         "--cwd",
         "--config",
-        "--user-id",
         "--set",
         "--unset",
+        "--offline",
     ]
     .iter()
     .any(|name| argument == *name || argument.starts_with(&format!("{name}=")))
@@ -665,7 +817,7 @@ options:\n  \
     --config PATH                add an explicit workspace overlay\n  \
     --set PATH=VALUE             set an allowed configuration value\n  \
     --unset PATH                 unset an allowed configuration value\n  \
-    --user-id UID                set the runtime user id for provider locks\n  \
+    --offline                    use the file loader for diagnostics/tests\n  \
     -h, --help                   show this help\n\n\
 commands:\n  \
     exec [--] COMMAND [ARGS...]  execute a command with the materialized environment\n  \
@@ -676,6 +828,10 @@ commands:\n  \
     explain [PATH]               show configuration and provenance\n  \
     doctor [--json]              check configuration and runtime paths\n  \
     trust PATH_OR_HASH           record or inspect a workspace config hash\n  \
+    backend run [OPTIONS]       start the single-instance backend\n  \
+    backend status [--json]     query backend state\n  \
+    backend reload [--wait]     reload the backend snapshot\n  \
+    backend stop                 stop the backend\n  \
     version                      print the dev-env version"
     )
 }

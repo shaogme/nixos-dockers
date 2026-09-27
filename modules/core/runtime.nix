@@ -52,6 +52,10 @@ let
     login_shell = "/usr/bin/dev-env-login-shell"
   '';
 
+  backendInitialPrefix = if config.services.openssh.enable
+    then ''["backend", "run", "--initial-exec", "--", "/bin/sshd", "-D", "-e"]''
+    else ''["backend", "run", "--initial-shell"]'';
+
   sshActions = lib.optionalString config.services.openssh.enable ''
     [[bootstrap.actions]]
     id = "prepare-ssh"
@@ -127,8 +131,11 @@ let
 
     [bootstrap.handoff]
     runtime = "/usr/bin/dev-env"
+    # container-init exec uses the dev-env client after reconciling the
+    # target identity; only the initial shell handoff starts the backend.
     exec_prefix = ["exec", "--"]
-    shell_prefix = ["shell"]
+    shell_prefix = ${backendInitialPrefix}
+    root_service = true
     ${sshBootstrap}
 
     [bootstrap.policy]
@@ -161,11 +168,11 @@ let
     allow_outside_workspace = true
 
     [[bootstrap.actions]]
-    id = "dev-env-locks"
+    id = "dev-env-runtime"
     kind = "filesystem.ensure_dir"
-    path = "/run/dev-env/locks"
-    mode = "1777"
-    owner = "root"
+    path = "/run/dev-env"
+    mode = "0770"
+    owner = "0:${toString config.system.defaultGid}"
     run_as = "root"
 
     [[bootstrap.actions]]
@@ -215,6 +222,12 @@ in
     environment.variables = {
       DEVENV_CONTAINER_INIT = containerInitPath;
       DEVENV_BOOTSTRAP_REAL_SHELL = bootstrapRealShellPath;
+      DEVENV_BACKEND_SOCKET = "/run/dev-env/backend.sock";
+      DEVENV_IDENTITY_BROKER_SOCKET = "/run/container-init/backend.sock";
+      DEVENV_BACKEND_SOCKET_GID = toString config.system.defaultGid;
+      DEVENV_BACKEND_ALLOWED_UID = toString config.system.defaultUid;
+      DEVENV_BACKEND_INITIAL_USER = config.system.defaultUser;
+      DEVENV_BACKEND_SERVICE_COMMAND = lib.optionalString config.services.openssh.enable "/bin/sshd";
     };
     docker.extraContents = [ runtimeContents profile defaultProfile ];
     docker.extraCommands = ''

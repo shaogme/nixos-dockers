@@ -189,7 +189,6 @@ CARGO_INCREMENTAL = "1"
 | `DEVENV_CONFIG` | 显式 workspace overlay |
 | `DEVENV_TRUST_FILE` | `trust` 命令使用的 trust store 路径 |
 | `XDG_CONFIG_HOME` | user config 根目录 |
-| `XDG_RUNTIME_DIR` | provider lock 目录的父目录 |
 
 profile 中声明的输入变量，例如 `DEVBOX_AUTO_INIT`，与上述控制项不同，只有在 `[inputs.NAME]` 中声明 `runtime = true` 后才会被解析。未声明的普通环境变量不会改变配置；在 `inherit_process = true` 时，它们只作为 ambient environment 进入最终进程环境。
 

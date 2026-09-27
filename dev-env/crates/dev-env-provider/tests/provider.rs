@@ -4,9 +4,9 @@ use dev_env_model::{
 };
 use dev_env_provider::{
     decode_request, encode_response, CommandExecutor, CommandOutput, CommandRequest,
-    ExecutableLocator, GenericProvider, LockManager, ProtocolOperation, ProtocolRequest,
-    ProtocolResponse, Provider, ProviderContext, ProviderDiagnostic, ProviderRunner,
-    ProviderRuntimeError, ProviderRuntimeErrorKind, SystemExecutableLocator,
+    ExecutableLocator, GenericProvider, ProtocolOperation, ProtocolRequest, ProtocolResponse,
+    Provider, ProviderContext, ProviderDiagnostic, ProviderRunner, ProviderRuntimeError,
+    ProviderRuntimeErrorKind, SystemExecutableLocator,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -154,8 +154,7 @@ fn lifecycle_detects_files_runs_prepare_and_returns_json_delta_and_receipt() {
         FakeLocator {
             executable: Some(PathBuf::from("/fake/provider")),
         },
-    )
-    .without_locks();
+    );
     let config = provider(
         vec![prepare(
             Some("workspace.config-present && features.tool.mode == 'enabled'"),
@@ -197,8 +196,7 @@ fn file_gating_is_not_a_missing_provider_error() {
     let workspace = TempWorkspace::new();
     let executor = FakeExecutor::default();
     let runner =
-        ProviderRunner::with_executor_and_locator(executor, FakeLocator { executable: None })
-            .without_locks();
+        ProviderRunner::with_executor_and_locator(executor, FakeLocator { executable: None });
     let result = runner
         .run(
             "tool",
@@ -223,8 +221,7 @@ fn applicable_missing_provider_follows_missing_policy() {
     let runner = ProviderRunner::with_executor_and_locator(
         FakeExecutor::default(),
         FakeLocator { executable: None },
-    )
-    .without_locks();
+    );
     let result = runner
         .run("tool", &config, &context(&workspace.path))
         .unwrap();
@@ -253,8 +250,7 @@ fn shellenv_parser_rejects_shell_code_as_a_typed_error() {
         FakeLocator {
             executable: Some(PathBuf::from("/fake/provider")),
         },
-    )
-    .without_locks();
+    );
     let error = runner
         .run(
             "tool",
@@ -294,8 +290,7 @@ fn prepare_warning_preserves_exit_status_and_stderr_without_flattening_error() {
         FakeLocator {
             executable: Some(PathBuf::from("/fake/provider")),
         },
-    )
-    .without_locks();
+    );
     let result = runner
         .run(
             "tool",
@@ -313,20 +308,6 @@ fn prepare_warning_preserves_exit_status_and_stderr_without_flattening_error() {
         result.diagnostics.as_slice(),
         [ProviderDiagnostic::PrepareFailed { status: Some(23), stderr, .. }] if stderr == b"temporary failure"
     ));
-}
-
-#[test]
-fn lock_manager_serializes_the_same_workspace_user_and_provider_key() {
-    let workspace = TempWorkspace::new();
-    let locks = TempWorkspace::new();
-    let manager = LockManager::new(&locks.path).with_poll_interval(Duration::from_millis(1));
-    let key = dev_env_provider::lock_key(&workspace.path, 1000, "tool");
-    let first = manager.acquire(key, Duration::from_millis(50)).unwrap();
-    let error = manager.acquire(key, Duration::from_millis(10)).unwrap_err();
-    assert!(matches!(error, dev_env_provider::LockError::Timeout { .. }));
-    drop(first);
-    let second = manager.acquire(key, Duration::from_millis(50)).unwrap();
-    assert!(second.path().exists());
 }
 
 #[test]
@@ -394,8 +375,7 @@ fn generic_provider_trait_uses_the_same_runner_api() {
             FakeLocator {
                 executable: Some(PathBuf::from("/fake/provider")),
             },
-        )
-        .without_locks(),
+        ),
     );
     assert_eq!(Provider::id(&provider), "tool");
     assert!(
@@ -416,8 +396,7 @@ fn provider_result_applies_provider_sensitivity_and_receipt_to_model_environment
         FakeLocator {
             executable: Some(PathBuf::from("/fake/provider")),
         },
-    )
-    .without_locks();
+    );
     let mut config = provider(
         Vec::new(),
         Some(shellenv(ShellEnvFormat::Shell, FailurePolicy::Error)),

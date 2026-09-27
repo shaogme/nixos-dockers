@@ -3,9 +3,14 @@ use crate::context::{ContextError, RuntimeContext};
 use crate::environment::{apply_provider_delta, configured_provenance, initial_environment};
 use crate::error::CoreError;
 use crate::fingerprint::config_fingerprint;
-use crate::provider::ProviderRuntime;
-use dev_env_model::{Condition, EnvValue, MaterializedEnv, ModelError, ResolvedConfig, ValueTree};
-use dev_env_provider::{ProviderContext, ProviderDiagnostic, ProviderRunResult};
+use crate::provider::{LegacyProviderSupervisor, ProviderRuntime};
+use dev_env_model::{
+    Condition, EffectiveIdentity, EnvValue, Generation, MaterializedEnv, ModelError,
+    ResolvedConfig, ValueTree,
+};
+use dev_env_provider::{
+    ProviderContext, ProviderDiagnostic, ProviderJob, ProviderRunResult, ProviderSupervisor,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -46,7 +51,39 @@ pub enum MaterializationDiagnostic {
 /// Converts one validated [`ResolvedConfig`] into a process environment.
 pub struct Materializer {
     config: ResolvedConfig,
-    provider_runtime: Box<dyn ProviderRuntime>,
+    provider_supervisor: Box<dyn ProviderSupervisor>,
+}
+
+/// Request metadata owned by the backend and attached to every provider job.
+/// Keeping it out of [`RuntimeContext`] prevents callers from smuggling an
+/// identity or generation through the environment DSL.
+#[derive(Clone, Debug)]
+pub struct MaterializationMetadata {
+    pub request_id: String,
+    pub generation: Generation,
+    pub identity: EffectiveIdentity,
+}
+
+impl MaterializationMetadata {
+    pub fn new(
+        request_id: impl Into<String>,
+        generation: Generation,
+        identity: EffectiveIdentity,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            generation,
+            identity,
+        }
+    }
+
+    fn legacy() -> Self {
+        Self::new(
+            "legacy-materialize",
+            Generation::new(0),
+            EffectiveIdentity::root(),
+        )
+    }
 }
 
 impl Materializer {
@@ -65,7 +102,17 @@ impl Materializer {
     {
         Self {
             config,
-            provider_runtime: Box::new(provider_runtime),
+            provider_supervisor: Box::new(LegacyProviderSupervisor::new(provider_runtime)),
+        }
+    }
+
+    pub fn with_provider_supervisor<S>(config: ResolvedConfig, provider_supervisor: S) -> Self
+    where
+        S: ProviderSupervisor + 'static,
+    {
+        Self {
+            config,
+            provider_supervisor: Box::new(provider_supervisor),
         }
     }
 
@@ -73,7 +120,7 @@ impl Materializer {
         config: ResolvedConfig,
         provider_runner: dev_env_provider::ProviderRunner,
     ) -> Self {
-        Self::with_provider_runtime(config, provider_runner)
+        Self::with_provider_supervisor(config, provider_runner)
     }
 
     pub fn config(&self) -> &ResolvedConfig {
@@ -81,6 +128,14 @@ impl Materializer {
     }
 
     pub fn materialize(&self, context: &RuntimeContext) -> Result<Materialization, CoreError> {
+        self.materialize_with_metadata(context, &MaterializationMetadata::legacy())
+    }
+
+    pub fn materialize_with_metadata(
+        &self,
+        context: &RuntimeContext,
+        metadata: &MaterializationMetadata,
+    ) -> Result<Materialization, CoreError> {
         self.config.validate().map_err(CoreError::Model)?;
         context.validate().map_err(CoreError::Context)?;
         let shell = select_shell(&self.config, context)?;
@@ -119,13 +174,22 @@ impl Materializer {
                 fingerprint,
                 provider_is_enabled(&self.config.features, &provider_id),
             );
-            let result = self
-                .provider_runtime
-                .run(&provider_id, provider_config, &provider_context)
-                .map_err(|source| CoreError::Provider {
-                    provider: provider_id.clone(),
-                    source: Box::new(source),
-                })?;
+            let job = ProviderJob::new(
+                format!("{}:{provider_id}", metadata.request_id),
+                metadata.request_id.clone(),
+                metadata.generation,
+                provider_id.clone(),
+                provider_config.clone(),
+                provider_context,
+                metadata.identity.clone(),
+            );
+            let result =
+                self.provider_supervisor
+                    .prepare(&job)
+                    .map_err(|source| CoreError::Provider {
+                        provider: provider_id.clone(),
+                        source: Box::new(source),
+                    })?;
             apply_result(
                 &mut environment,
                 &mut diagnostics,

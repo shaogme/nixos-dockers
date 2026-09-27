@@ -3,7 +3,7 @@ use dev_env_model::{
     Sensitivity, ShellEnvConfig, ShellEnvFormat, ValueTree,
 };
 use dev_env_provider::{
-    LockManager, ProviderContext, ProviderRunner, ProviderRuntimeError, ProviderRuntimeErrorKind,
+    ProviderContext, ProviderRunner, ProviderRuntimeError, ProviderRuntimeErrorKind,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -143,8 +143,7 @@ fn runs_a_real_provider_process_and_materializes_its_environment() {
     let log = temp.path.join("provider.log");
     write_provider(&executable);
 
-    let runner =
-        ProviderRunner::default().with_lock_manager(LockManager::new(temp.path.join("locks")));
+    let runner = ProviderRunner::default();
     let result = runner
         .run(
             "tool",
@@ -201,7 +200,6 @@ fn rejects_unsafe_output_from_a_real_provider_without_executing_it() {
         .environment
         .insert("REJECT_MARKER".to_owned(), marker.display().to_string());
     let error = ProviderRunner::default()
-        .without_locks()
         .run(
             "tool",
             &provider_config(&executable, shellenv(ShellEnvFormat::Shell)),

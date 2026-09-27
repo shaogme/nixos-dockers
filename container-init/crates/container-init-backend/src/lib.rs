@@ -10,8 +10,9 @@ pub use client::{BackendClient, BackendClientError};
 pub use instance::{InstanceClaim, InstanceLock};
 pub use protocol::{
     read_message, validate_message, write_message, BackendError, BackendState, BackendStatus,
-    ClientMessage, ClientRequest, HelloInfo, PeerCredentials, PreparedHandoff, ProtocolError,
-    ReceiptSummary, ServerMessage, ServerResponse, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    ClientMessage, ClientRequest, HelloInfo, IdentityRequest, PeerCredentials, PreparedHandoff,
+    PreparedIdentity, ProtocolError, ReceiptSummary, ServerMessage, ServerResponse,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 pub use server::{BackendClaim, BackendLease, BackendPaths, BackendRunError};
 pub use socket::{
