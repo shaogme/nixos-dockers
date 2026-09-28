@@ -8,7 +8,7 @@ use dev_env_model::{
     EffectiveIdentity, IdentityPeer, IdentityRequest, IdentitySource, WorkspaceStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -69,12 +69,17 @@ struct ServerMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerResponse {
-    #[allow(dead_code)]
-    Hello(serde_json::Value),
+    Hello(BrokerHello),
     Identity(PreparedIdentity),
     Error(BrokerErrorPayload),
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrokerHello {
+    runtime_inputs: Vec<String>,
+    environment_names: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,7 +138,14 @@ pub fn resolve(
             request: ClientRequest::Hello,
         },
     )?;
-    expect_hello(&mut stream, &request_id)?;
+    let hello = expect_hello(&mut stream, &request_id)?;
+    // dev-env and container-init have separate runtime input schemas. Only
+    // values advertised by the bootstrap broker may cross this boundary;
+    // provider inputs such as DEVBOX_AUTO_INIT remain local to dev-env.
+    let allowed_inputs = hello.runtime_inputs.into_iter().collect::<BTreeSet<_>>();
+    let allowed_environment = hello.environment_names.into_iter().collect::<BTreeSet<_>>();
+    let inputs = restrict_to_allowed(inputs, &allowed_inputs);
+    let environment = restrict_to_allowed(environment, &allowed_environment);
     let request_id = format!("dev-env-{}-identity-{sequence}", std::process::id());
     write_message(
         &mut stream,
@@ -197,7 +209,7 @@ pub fn resolve(
     })
 }
 
-fn expect_hello(stream: &mut UnixStream, request_id: &str) -> Result<(), BrokerError> {
+fn expect_hello(stream: &mut UnixStream, request_id: &str) -> Result<BrokerHello, BrokerError> {
     let response: ServerMessage = read_message(stream)?;
     if response.version != PROTOCOL_VERSION || response.request_id != request_id {
         return Err(BrokerError(
@@ -205,7 +217,7 @@ fn expect_hello(stream: &mut UnixStream, request_id: &str) -> Result<(), BrokerE
         ));
     }
     match response.response {
-        ServerResponse::Hello(_) => Ok(()),
+        ServerResponse::Hello(hello) => Ok(hello),
         ServerResponse::Error(error) => {
             Err(BrokerError(format!("{}: {}", error.class, error.message)))
         }
@@ -213,6 +225,16 @@ fn expect_hello(stream: &mut UnixStream, request_id: &str) -> Result<(), BrokerE
             Err(BrokerError("identity broker hello failed".to_owned()))
         }
     }
+}
+
+fn restrict_to_allowed(
+    values: BTreeMap<String, String>,
+    allowed: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    values
+        .into_iter()
+        .filter(|(name, _)| allowed.contains(name))
+        .collect()
 }
 
 fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<(), BrokerError> {
