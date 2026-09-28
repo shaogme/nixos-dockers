@@ -13,18 +13,14 @@ services:
     # outer runtime maps image root to its regular host user; its private
     # cgroup namespace keeps cgroup management inside the delegation boundary.
     cgroup: private
-    cap_drop: [ALL]
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
       - SYS_CHROOT
-      - SETUID
-      - SETGID
-      - SETPCAP
-      - DAC_OVERRIDE
-      - CHOWN
-      - FOWNER
-      - MKNOD
+      - SYS_PTRACE
+      - SYS_RESOURCE
+      - DAC_READ_SEARCH
+      - AUDIT_WRITE
     security_opt:
       - seccomp:unconfined
       - systempaths:unconfined
