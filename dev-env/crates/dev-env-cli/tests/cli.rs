@@ -237,6 +237,36 @@ fn client_does_not_fallback_to_profile_when_backend_is_unavailable() {
     assert!(output.stdout.is_empty());
 }
 
+#[test]
+fn backend_startup_failure_is_not_reported_as_success() {
+    let fixture = Fixture::new();
+    let socket = fixture.root.join("backend.sock");
+    let output = fixture
+        .command()
+        .env(
+            "DEVENV_IDENTITY_BROKER_SOCKET",
+            fixture.root.join("missing-identity-broker.sock"),
+        )
+        .args([
+            "backend",
+            "run",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--initial-exec",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(74));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("identity broker unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_runs_a_declared_provider_and_includes_its_shellenv_delta() {

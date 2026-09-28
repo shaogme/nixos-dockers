@@ -148,6 +148,8 @@ fn run(
         stopping: AtomicBool::new(false),
         socket: socket.clone(),
         initial_pid: Mutex::new(None),
+        initial_exit_code: Mutex::new(None),
+        failure: Mutex::new(None),
     });
     install_signal_handlers();
     let runtime_for_initial = Arc::clone(&runtime);
@@ -173,7 +175,21 @@ fn run(
     *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Stopping;
     runtime.stop_initial_runtime();
     let _ = fs::remove_file(&runtime.socket);
-    Ok(0)
+    if let Some(failure) = runtime
+        .failure
+        .lock()
+        .expect("backend failure lock poisoned")
+        .take()
+    {
+        return Err(CliError::Backend(failure));
+    }
+    let exit_code = runtime
+        .initial_exit_code
+        .lock()
+        .expect("initial exit code lock poisoned")
+        .take()
+        .unwrap_or(0);
+    Ok(exit_code)
 }
 
 struct BackendRuntime {
@@ -185,6 +201,8 @@ struct BackendRuntime {
     stopping: AtomicBool,
     socket: PathBuf,
     initial_pid: Mutex<Option<u32>>,
+    initial_exit_code: Mutex<Option<i32>>,
+    failure: Mutex<Option<String>>,
 }
 
 impl BackendRuntime {
@@ -197,9 +215,20 @@ impl BackendRuntime {
         )
     }
 
-    fn fail(&self, _message: String) {
+    fn fail(&self, message: String) {
         *self.state.lock().expect("backend state lock poisoned") = BackendState::Failed;
+        let mut failure = self.failure.lock().expect("backend failure lock poisoned");
+        if failure.is_none() {
+            *failure = Some(message);
+        }
         self.stopping.store(true, Ordering::Release);
+    }
+
+    fn record_initial_exit(&self, status: std::process::ExitStatus) {
+        *self
+            .initial_exit_code
+            .lock()
+            .expect("initial exit code lock poisoned") = Some(exit_status_code(status));
     }
 
     fn stop_initial_runtime(&self) {
@@ -663,9 +692,21 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         &context,
         peer_credentials_from_current_thread(),
     );
-    let BackendResponse::Prepared(prepared) = response.response else {
-        runtime.fail("initial runtime preparation failed".to_owned());
-        return;
+    let prepared = match response.response {
+        BackendResponse::Prepared(prepared) => prepared,
+        BackendResponse::Error(error) => {
+            runtime.fail(format!(
+                "initial runtime preparation failed: {}: {}",
+                error.class, error.message
+            ));
+            return;
+        }
+        other => {
+            runtime.fail(format!(
+                "initial runtime preparation returned an unexpected response: {other:?}"
+            ));
+            return;
+        }
     };
     let command: Result<CommandLine, ()> = match initial {
         BackendInitial::Shell => {
@@ -728,16 +769,26 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
             });
         }
     }
-    let Ok(mut child) = command.spawn() else {
-        runtime.fail("could not spawn initial runtime".to_owned());
-        return;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            runtime.fail(format!(
+                "could not spawn initial runtime {}: {error}",
+                program.display()
+            ));
+            return;
+        }
     };
     *runtime
         .initial_pid
         .lock()
         .expect("initial runtime lock poisoned") = Some(child.id());
-    if child.wait().is_err() {
-        runtime.fail(format!("initial runtime {} failed", program.display()));
+    match child.wait() {
+        Ok(status) => runtime.record_initial_exit(status),
+        Err(error) => runtime.fail(format!(
+            "initial runtime {} failed: {error}",
+            program.display()
+        )),
     }
     *runtime
         .initial_pid
@@ -745,6 +796,20 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         .expect("initial runtime lock poisoned") = None;
     let _ = args;
     runtime.stopping.store(true, Ordering::Release);
+}
+
+fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            128 + status.signal().unwrap_or(libc::SIGTERM)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    })
 }
 
 fn make_snapshot(
