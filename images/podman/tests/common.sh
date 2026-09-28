@@ -89,13 +89,21 @@ engine_run() {
     # and an explicit device set without privileged mode.
     docker run \
         --cap-drop=ALL \
+        --group-add 1000 \
+        --cap-add=NET_ADMIN \
         --cap-add=SYS_ADMIN \
+        --cap-add=SYS_CHROOT \
         --cap-add=SETUID \
         --cap-add=SETGID \
+        --cap-add=SETPCAP \
         --cap-add=DAC_OVERRIDE \
+        --cap-add=CHOWN \
+        --cap-add=FOWNER \
+        --cap-add=MKNOD \
         --cgroupns=private \
         --security-opt seccomp=unconfined \
         --security-opt systempaths=unconfined \
+        --security-opt label=disable \
         --device /dev/fuse \
         --device /dev/net/tun \
         "$@"
