@@ -478,7 +478,11 @@ fn spawn_handoff(
         command
             .env("HOME", "/root")
             .env("USER", "root")
-            .env("LOGNAME", "root");
+            .env("LOGNAME", "root")
+            // The backend chooses the identity for its initial runtime from
+            // this value. Keep it aligned with the identity already resolved
+            // by container-init, including an explicit RUN_AS_ROOT request.
+            .env("DEVENV_BACKEND_INITIAL_USER", &identity.user);
     } else {
         command
             .env("HOME", &identity.home)
