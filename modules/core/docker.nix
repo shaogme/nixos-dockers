@@ -60,6 +60,36 @@ in
       description = "PATH baked into the image metadata.";
     };
 
+    cgroupMountMode = lib.mkOption {
+      type = lib.types.enum [ "default" "bind_mount" ];
+      default = "default";
+      description = "How an engine image initializes its cgroup v2 hierarchy.";
+    };
+
+    cgroupPath = lib.mkOption {
+      type = lib.types.str;
+      default = "/sys/fs/cgroup";
+      description = "Target path for the engine cgroup v2 hierarchy.";
+    };
+
+    cgroupShadowPath = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/cgroup";
+      description = "Writable shadow path used before binding the engine cgroup hierarchy.";
+    };
+
+    cgroupSubgroup = lib.mkOption {
+      type = lib.types.str;
+      default = "libpod_parent";
+      description = "Subgroup that receives processes before cgroup controllers are delegated.";
+    };
+
+    cgroupControllers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Cgroup v2 controllers to delegate; an empty list delegates all available controllers.";
+    };
+
     entrypoint = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];

@@ -148,6 +148,14 @@ assert_contains "$engine_cgroup_policy" 'cgroups = "enabled"'
 assert_contains "$engine_cgroup_policy" 'cgroupns = "private"'
 engine_cgroup_mount="$(docker exec "$container" /bin/sh -c "grep ' /sys/fs/cgroup ' /proc/self/mountinfo")"
 assert_contains "$engine_cgroup_mount" 'cgroup2'
+engine_cgroup_mount_count="$(docker exec "$container" /bin/sh -c "awk '\$5 == \"/sys/fs/cgroup\" { count++ } END { print count + 0 }' /proc/self/mountinfo")"
+[[ "$engine_cgroup_mount_count" -ge 2 ]]
+docker exec "$container" /bin/sh -c "awk '\$5 == \"/sys/fs/cgroup\" && \$6 ~ /(^|,)rw(,|\$)/ { found = 1 } END { exit !found }' /proc/self/mountinfo"
+engine_cgroup_shadow_mount="$(docker exec "$container" /bin/sh -c "grep ' /run/cgroup ' /proc/self/mountinfo")"
+assert_contains "$engine_cgroup_shadow_mount" 'cgroup2'
+docker exec "$container" /bin/sh -c 'test -d /sys/fs/cgroup/libpod_parent'
+docker exec "$container" /bin/sh -c 'test -d /run/cgroup/libpod_parent'
+docker exec "$container" /bin/sh -c 'test ! -s /run/cgroup/cgroup.procs'
 
 echo "==> validating socket permissions and engine configuration"
 socket_stat="$(docker exec "$container" /bin/sh -c "stat -c '%a:%g' /run/podman/podman.sock")"

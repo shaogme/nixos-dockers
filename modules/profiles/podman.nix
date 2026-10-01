@@ -70,9 +70,90 @@ let
       socket_path="$socket_dir/podman.sock"
       socket_gid="''${PODMAN_SOCKET_GID:-1000}"
       socket_mode="''${PODMAN_SOCKET_MODE:-0660}"
+      cgroup_mount_mode=${lib.escapeShellArg config.docker.cgroupMountMode}
+      cgroup_path=${lib.escapeShellArg config.docker.cgroupPath}
+      cgroup_shadow_path=${lib.escapeShellArg config.docker.cgroupShadowPath}
+      cgroup_subgroup=${lib.escapeShellArg config.docker.cgroupSubgroup}
+      cgroup_controller_config=${lib.escapeShellArg (lib.concatStringsSep " " config.docker.cgroupControllers)}
       map_dir=/run/user/1000/containers
       uid_map_file="$map_dir/subuid"
       gid_map_file="$map_dir/subgid"
+
+      initialize_cgroup() {
+        [ "$cgroup_mount_mode" = "bind_mount" ] || return 0
+
+        mkdir -p "$cgroup_shadow_path" "$cgroup_path"
+        if [ ! -f "$cgroup_shadow_path/cgroup.controllers" ]; then
+          if ! ${pkgs.busybox}/bin/mount -t cgroup2 none "$cgroup_shadow_path"; then
+            echo "podman engine could not mount private cgroup2 at $cgroup_shadow_path" >&2
+            exit 1
+          fi
+        fi
+
+        controllers_file="$cgroup_shadow_path/cgroup.controllers"
+        root_procs_file="$cgroup_shadow_path/cgroup.procs"
+        subtree_control_file="$cgroup_shadow_path/cgroup.subtree_control"
+        subgroup_path="$cgroup_shadow_path/$cgroup_subgroup"
+        subgroup_procs_file="$subgroup_path/cgroup.procs"
+        if [ ! -f "$controllers_file" ] || [ ! -f "$root_procs_file" ] || [ ! -f "$subtree_control_file" ]; then
+          echo "podman engine shadow path is not a cgroup2 hierarchy: $cgroup_shadow_path" >&2
+          exit 1
+        fi
+
+        mkdir -p "$subgroup_path"
+        if [ ! -f "$subgroup_procs_file" ]; then
+          echo "podman engine could not create cgroup subgroup: $subgroup_path" >&2
+          exit 1
+        fi
+
+        # cgroup v2 requires the parent cgroup to have no processes before
+        # controllers can be delegated to its children.
+        drain_attempts=0
+        while [ "$drain_attempts" -lt 5 ]; do
+          moved_process=0
+          while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            case "$pid" in
+              *[!0-9]*) continue ;;
+            esac
+            if ${pkgs.busybox}/bin/printf '%s\n' "$pid" > "$subgroup_procs_file" 2>/dev/null; then
+              moved_process=1
+            fi
+          done < "$root_procs_file"
+          [ "$moved_process" -eq 0 ] && break
+          drain_attempts=$((drain_attempts + 1))
+        done
+
+        available_controllers="$(${pkgs.busybox}/bin/cat "$controllers_file")"
+        if [ -n "$cgroup_controller_config" ]; then
+          controllers="$cgroup_controller_config"
+        else
+          controllers="$available_controllers"
+        fi
+        enabled_controllers="$(${pkgs.busybox}/bin/cat "$subtree_control_file" 2>/dev/null || true)"
+        for controller in $controllers; do
+          case " $available_controllers " in
+            *" $controller "*) ;;
+            *)
+              echo "podman engine required cgroup controller is unavailable: $controller" >&2
+              exit 1
+              ;;
+          esac
+          case " $enabled_controllers " in
+            *" $controller "*) continue ;;
+          esac
+          if ! ${pkgs.busybox}/bin/printf '+%s ' "$controller" > "$subtree_control_file"; then
+            echo "podman engine could not delegate cgroup controller: $controller" >&2
+            exit 1
+          fi
+          enabled_controllers="$enabled_controllers $controller"
+        done
+
+        if ! ${pkgs.busybox}/bin/mount --bind "$cgroup_shadow_path" "$cgroup_path"; then
+          echo "podman engine could not bind $cgroup_shadow_path over $cgroup_path" >&2
+          exit 1
+        fi
+      }
 
       # A rootless outer runtime exposes its subordinate IDs in the current
       # user namespace, not in the host namespace.  Translate the first
@@ -126,6 +207,7 @@ let
       }
 
       mkdir -p "$socket_dir" /run/user/1000/containers /var/lib/containers/storage
+      initialize_cgroup
       current_user="$(${pkgs.busybox}/bin/id -un)"
       current_group="$(${pkgs.busybox}/bin/id -gn)"
       write_nested_map /proc/self/uid_map "$uid_map_file" "$(id -u)" "$current_user"
@@ -210,6 +292,7 @@ in
   config = lib.mkIf config.profiles.podman.enable {
     docker.includeNixDB = false;
     docker.environmentPath = "/usr/bin:/bin";
+    docker.cgroupMountMode = lib.mkDefault "bind_mount";
     # The engine must not inherit /workspace as its current directory. The
     # Compose service bind-mounts that path for workloads, and a rootless
     # outer runtime may not grant the engine UID traversal permission there.
@@ -228,7 +311,7 @@ in
       group
     ];
     docker.extraCommands = ''
-      mkdir -p bin usr/bin usr/local/bin etc/containers tmp var/tmp workspace root home/podman run/podman run/user/1000/containers var/lib/containers/storage
+      mkdir -p bin usr/bin usr/local/bin etc/containers tmp var/tmp workspace root home/podman run/podman run/cgroup run/user/1000/containers var/lib/containers/storage
       chmod 1777 tmp var/tmp workspace
       # Keep the image layer root-owned so the outer runtime can map its root
       # user directly to the host user; application directories stay writable
