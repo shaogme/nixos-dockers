@@ -143,7 +143,10 @@ fn run(
         materialization: RwLock::new(Arc::new(MaterializationService::new(
             Materializer::try_new(loaded.config().clone()).map_err(CliError::Core)?,
         ))),
-        state: Mutex::new(BackendState::Ready),
+        // The socket is available while the initial runtime is being
+        // prepared, but clients must not receive Prepare responses until the
+        // initial handoff has successfully spawned.
+        state: Mutex::new(BackendState::Starting),
         active_requests: AtomicUsize::new(0),
         stopping: AtomicBool::new(false),
         socket: socket.clone(),
@@ -357,7 +360,9 @@ fn handle_request(
             &request.request_id,
             BackendResponse::Doctor(doctor_value(&snapshot)),
         ),
-        BackendRequest::Prepare { context } => handle_prepare(runtime, request, context, peer),
+        BackendRequest::Prepare { context } => {
+            handle_prepare(runtime, request, context, peer, false)
+        }
         BackendRequest::Trust { target } if peer.uid == 0 => handle_trust(runtime, request, target),
         BackendRequest::Trust { .. } => runtime.error(
             &request.request_id,
@@ -391,8 +396,10 @@ fn handle_prepare(
     request: &BackendRequestMessage,
     context: &dev_env_model::RequestContext,
     peer: dev_env_model::IdentityPeer,
+    allow_starting: bool,
 ) -> BackendResponseMessage {
-    if *runtime.state.lock().expect("backend state lock poisoned") != BackendState::Ready {
+    let state = *runtime.state.lock().expect("backend state lock poisoned");
+    if state != BackendState::Ready && !(allow_starting && state == BackendState::Starting) {
         return runtime.error(
             &request.request_id,
             "backend_busy",
@@ -691,6 +698,7 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         ),
         &context,
         peer_credentials_from_current_thread(),
+        true,
     );
     let prepared = match response.response {
         BackendResponse::Prepared(prepared) => prepared,
@@ -783,6 +791,7 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         .initial_pid
         .lock()
         .expect("initial runtime lock poisoned") = Some(child.id());
+    *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Ready;
     match child.wait() {
         Ok(status) => runtime.record_initial_exit(status),
         Err(error) => runtime.fail(format!(
