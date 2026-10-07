@@ -22,7 +22,7 @@ container-init --profile coding-images plan
 container-init --profile coding-images plan --json
 ```
 
-`plan` 优先读取运行中 backend 持有的不可变 snapshot；没有 backend 时才离线读取 profile、解析继承图、完成 schema/trust/model 校验。离线结果会标记 `offline`，不会：
+`plan` 优先读取运行中 backend 持有的不可变 snapshot；在线查询按 `snapshot_id` 和 offset 分页，CLI 校验各页属于同一快照后再合并输出。没有 backend 时才离线读取 profile、解析继承图、完成 schema/trust/model 校验。离线结果会标记 `offline`，不会：
 
 - 解析环境变量中的 typed runtime input；
 - 读取或修改 passwd/group；
@@ -31,10 +31,11 @@ container-init --profile coding-images plan --json
 - 检查 runtime 是否真实可执行；
 - 执行 SSH keygen 或 handoff。
 
-文本输出包含 profile、profile chain，以及每个 action 的序号、id、kind、phase、run_as、idempotency、origin 和 effect。`--json` 输出对象的主要字段为：
+文本输出包含 profile、profile chain，以及每个 action 的序号、id、kind、phase、run_as、idempotency、origin 和 effect。下面是离线模式 `--json` 输出的主要字段：
 
 ```json
 {
+  "online": false,
   "profile": "coding-images",
   "profile_chain": ["base", "coding-images"],
   "actions": [
@@ -130,9 +131,11 @@ container-init exec -- tool --flag 'value with spaces'
 
 `exec` 不接收 profile、profiles-dir、workspace 或旧 bootstrap lock 参数；它不会重新读取 profile。请求只会执行受限 identity action 集合，启动 filesystem、SSH、cgroup 和 service action 只在 backend 启动时执行。
 
+Backend 使用带长度前缀的 v2 消息，单帧上限为 1 MiB；客户端在连接、读写和分页读取期间共用请求 deadline。`prepare` 只会在执行请求尚未发送，或 backend 明确保证请求未分派时重试；执行请求可能已分派但结果无法确认时，会报告结果未知且不重试，以免重复执行。
+
 ### `status`
 
-`status` 查询 backend 的状态、profile id、snapshot id、backend PID、初始子进程 PID 和活跃请求数，不显示 runtime input 值。
+`status` 查询 backend 的状态、profile id、snapshot id、backend PID、初始子进程 PID 和活跃连接数，不显示 runtime input 值。
 
 ### `version`
 
@@ -154,7 +157,7 @@ container-init --version
 | `--workspace PATH` / `--cwd PATH` | runtime workspace |
 | `--input NAME=VALUE` / `--set NAME=VALUE` | 设置一个已声明的 typed bootstrap 输入，可重复 |
 | `--backend-socket PATH` | 覆盖 backend Unix socket 路径 |
-| `--request-timeout-ms MS` | backend 请求/启动连接超时 |
+| `--request-timeout-ms MS` | backend 操作的总 deadline，涵盖启动连接和请求收发 |
 | `--receipt-path PATH` | 写执行 receipt 的路径 |
 | `--json` | `plan`/`doctor`/`status` 支持 |
 | `-h` / `--help` | 打印帮助 |
@@ -185,7 +188,7 @@ CLI 环境变量的发现顺序如下；同一类配置中，命令行选项优�
 | `CONTAINER_INIT_WORKSPACE` | workspace | — |
 | `WORKSPACE` | workspace 的通用回退变量 | 当前目录 |
 | `CONTAINER_INIT_BACKEND_SOCKET` | backend Unix socket | root: `/run/container-init/backend.sock` |
-| `CONTAINER_INIT_BACKEND_TIMEOUT_MS` | backend 请求/启动连接超时 | 5000 |
+| `CONTAINER_INIT_BACKEND_TIMEOUT_MS` | backend 操作的总 deadline | 5000 |
 
 handoff runtime 如果需要为自身的 runtime ACL 使用解析后的非 root 映射身份，
 `container-init` 会在初始 handoff 中提供 `CONTAINER_INIT_HANDOFF_UID` 和
@@ -268,9 +271,9 @@ profile 的 typed input 不是由 container-init 读取全部环境变量，而�
 
 ## 6. Backend 生命周期和锁
 
-backend 在 socket 同目录持有固定实例 `flock`。锁只防止同一容器启动第二个 backend，不参与 action 调度；action 使用按账户、路径、cgroup 和 namespace 推导的资源锁。backend 退出时内核释放 `flock`，下次 `run` 才能清理经过 `lstat` 类型校验的陈旧 socket。
+backend 在 socket 同目录持有固定实例 `flock`。锁只防止同一容器启动第二个 backend，不参与 action 调度；action 使用按账户、路径、cgroup 和 namespace 推导的资源锁。backend 退出时内核释放 `flock`，下次 `run` 才能清理陈旧 socket；清理会校验 socket 类型、属主和权限，并确认 inode 未在操作期间被替换。
 
-socket 父目录拒绝 symlink 和不安全权限；Linux 使用 `SO_PEERCRED` 检查 peer。backend 不接收 profile 文本、action 描述或任意 spawn 命令，错误请求不会执行 bootstrap action。
+socket 和 lock 路径的目录组件拒绝 symlink；backend 校验父目录、socket 和 lock 文件的属主与权限，并在 Linux 上使用 `SO_PEERCRED` 检查 peer。backend 不接收 profile 文本、action 描述或任意 spawn 命令；未经授权或结构无效的请求不会触发 bootstrap action。
 
 ## 7. Receipt
 

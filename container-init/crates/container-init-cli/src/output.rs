@@ -124,7 +124,7 @@ pub fn print_backend(value: &serde_json::Value, json: bool, view: &str) -> Resul
         }
         "doctor" => {
             if let Some(backend) = value.get("backend") {
-                for name in ["state", "backend_pid", "active_requests"] {
+                for name in ["state", "backend_pid", "active_connections"] {
                     if let Some(field) = backend.get(name) {
                         println!("{name}: {field}");
                     }
@@ -152,7 +152,7 @@ pub fn print_backend(value: &serde_json::Value, json: bool, view: &str) -> Resul
                 "backend_pid",
                 "initial_child_pid",
                 "started_unix_seconds",
-                "active_requests",
+                "active_connections",
             ] {
                 if let Some(field) = value.get(name) {
                     println!("{name}: {field}");

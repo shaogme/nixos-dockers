@@ -13,13 +13,11 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DEFAULT_SOCKET: &str = "/run/container-init/backend.sock";
-static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct BrokerError(pub String);
@@ -35,7 +33,6 @@ impl std::error::Error for BrokerError {}
 #[derive(Clone, Debug, Serialize)]
 struct ClientMessage {
     version: u16,
-    request_id: String,
     request: ClientRequest,
 }
 
@@ -62,7 +59,6 @@ enum WireIdentityRequest {
 #[derive(Debug, Deserialize)]
 struct ServerMessage {
     version: u16,
-    request_id: String,
     response: ServerResponse,
 }
 
@@ -128,17 +124,14 @@ pub fn resolve(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(5))))
         .map_err(|error| BrokerError(format!("identity broker socket setup failed: {error}")))?;
-    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let request_id = format!("dev-env-{}-hello-{sequence}", std::process::id());
     write_message(
         &mut stream,
         &ClientMessage {
             version: PROTOCOL_VERSION,
-            request_id: request_id.clone(),
             request: ClientRequest::Hello,
         },
     )?;
-    let hello = expect_hello(&mut stream, &request_id)?;
+    let hello = expect_hello(&mut stream)?;
     // dev-env and container-init have separate runtime input schemas. Only
     // values advertised by the bootstrap broker may cross this boundary;
     // provider inputs such as DEVBOX_AUTO_INIT remain local to dev-env.
@@ -146,12 +139,10 @@ pub fn resolve(
     let allowed_environment = hello.environment_names.into_iter().collect::<BTreeSet<_>>();
     let inputs = restrict_to_allowed(inputs, &allowed_inputs);
     let environment = restrict_to_allowed(environment, &allowed_environment);
-    let request_id = format!("dev-env-{}-identity-{sequence}", std::process::id());
     write_message(
         &mut stream,
         &ClientMessage {
             version: PROTOCOL_VERSION,
-            request_id: request_id.clone(),
             request: ClientRequest::PrepareIdentity {
                 cwd: cwd.to_path_buf(),
                 inputs,
@@ -162,9 +153,9 @@ pub fn resolve(
     )?;
     let response: ServerMessage = read_message(&mut stream)?;
     let _ = stream.shutdown(Shutdown::Both);
-    if response.version != PROTOCOL_VERSION || response.request_id != request_id {
+    if response.version != PROTOCOL_VERSION {
         return Err(BrokerError(
-            "identity broker returned a mismatched response".to_owned(),
+            "identity broker returned an unsupported protocol version".to_owned(),
         ));
     }
     let identity = match response.response {
@@ -209,11 +200,11 @@ pub fn resolve(
     })
 }
 
-fn expect_hello(stream: &mut UnixStream, request_id: &str) -> Result<BrokerHello, BrokerError> {
+fn expect_hello(stream: &mut UnixStream) -> Result<BrokerHello, BrokerError> {
     let response: ServerMessage = read_message(stream)?;
-    if response.version != PROTOCOL_VERSION || response.request_id != request_id {
+    if response.version != PROTOCOL_VERSION {
         return Err(BrokerError(
-            "identity broker returned a mismatched hello".to_owned(),
+            "identity broker returned an unsupported protocol version".to_owned(),
         ));
     }
     match response.response {
@@ -269,5 +260,41 @@ fn read_message<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result
 impl From<io::Error> for BrokerError {
     fn from(error: io::Error) -> Self {
         Self(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientMessage, ClientRequest, ServerMessage, ServerResponse, PROTOCOL_VERSION};
+
+    #[test]
+    fn wire_messages_match_container_init_protocol_v2() {
+        let hello = serde_json::to_value(ClientMessage {
+            version: PROTOCOL_VERSION,
+            request: ClientRequest::Hello,
+        })
+        .unwrap();
+        assert_eq!(
+            hello,
+            serde_json::json!({
+                "version": 2,
+                "request": { "type": "hello" }
+            })
+        );
+
+        let response: ServerMessage = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "response": {
+                "type": "hello",
+                "state": "ready",
+                "profile": "nixos-docker",
+                "snapshot_id": "snapshot",
+                "runtime_inputs": ["HOST_UID"],
+                "environment_names": ["HOST_UID"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(response.version, 2);
+        assert!(matches!(response.response, ServerResponse::Hello(_)));
     }
 }

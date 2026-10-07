@@ -111,6 +111,12 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 - receipt 原子写入和 content 隐藏；
 - SSH host key 生成、重入、半成品拒绝、symlink 拒绝和 authorized keys 冲突。
 
+### Backend
+
+- v2 长度前缀消息、无 request id、帧大小/版本/截断校验，以及共享 deadline 下的请求读写；
+- plan 分页游标与 snapshot 一致性校验；执行帧可能已发送时不重试，并报告结果未知；
+- socket/lock 的 symlink、属主、权限和类型校验；陈旧 socket 清理拒绝删除被替换的 inode。
+
 ### CLI
 
 - `run --` 后 command 参数完整保留；

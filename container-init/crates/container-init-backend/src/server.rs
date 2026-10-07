@@ -1,7 +1,7 @@
 use crate::protocol::{
-    read_message, validate_message, write_message, BackendError, BackendState, BackendStatus,
-    ClientMessage, ClientRequest, HelloInfo, IdentityRequest, PeerCredentials, PreparedHandoff,
-    PreparedIdentity, ProtocolError, ReceiptSummary, ServerMessage, ServerResponse,
+    validate_message, BackendError, BackendState, BackendStatus, ClientMessage, ClientRequest,
+    HelloInfo, IdentityRequest, PeerCredentials, PlanPage, PreparedHandoff, PreparedIdentity,
+    ProtocolError, ReceiptSummary, ServerMessage, ServerResponse, MAX_RESPONSE_FRAME_BYTES,
     PROTOCOL_VERSION,
 };
 use crate::socket::{bind_socket, cleanup_stale_socket, ensure_socket_directory, peer_credentials};
@@ -9,7 +9,7 @@ use bootstrap_model::{ActionKind, BootstrapConfig, Condition, ConditionValue, Pl
 use container_init_core::{
     CoreError, ExecutionOptions, HandoffCommand, PlanExecutor, ResourceLockManager, RuntimeContext,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -18,12 +18,13 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_WORKERS: usize = 32;
-const MAX_REQUEST_IDS: usize = 65_536;
+const MAX_PENDING_CONNECTIONS: usize = 16;
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -162,7 +163,7 @@ impl BackendLease {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            active_requests: 0,
+            active_connections: 0,
         };
         let runtime = Arc::new(BackendRuntime {
             profile,
@@ -175,8 +176,7 @@ impl BackendLease {
             allowed,
             execution_options,
             status: RwLock::new(status),
-            active_requests: Arc::new(AtomicUsize::new(0)),
-            request_ids: Mutex::new(HashSet::new()),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         });
         supervise(listener, child, &self.paths.socket_path, runtime).map_err(BackendRunError::Io)
     }
@@ -222,8 +222,7 @@ struct BackendRuntime {
     allowed: AllowedClientValues,
     execution_options: ExecutionOptions,
     status: RwLock<BackendStatus>,
-    active_requests: Arc<AtomicUsize>,
-    request_ids: Mutex<HashSet<String>>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 struct AllowedClientValues {
@@ -238,32 +237,19 @@ impl BackendRuntime {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        status.active_requests = self.active_requests.load(Ordering::Relaxed);
+        status.active_connections = self.active_connections.load(Ordering::Relaxed);
         status
     }
 }
 
 fn prepare_lock_directory(path: &Path, owner_uid: u32) -> io::Result<()> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "backend runtime directory must be an absolute normalized path",
-        ));
-    }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_lock_directory(&metadata, owner_uid)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create_private_directories(path)?;
-            let metadata = fs::symlink_metadata(path)?;
-            validate_lock_directory(&metadata, owner_uid)?;
-        }
-        Err(error) => return Err(error),
-    }
-    Ok(())
+    let group_gid = if unsafe { libc::geteuid() } == 0 {
+        owner_uid
+    } else {
+        unsafe { libc::getegid() }
+    };
+    ensure_socket_directory(path, owner_uid, group_gid, 0o700)?;
+    validate_lock_directory(&fs::symlink_metadata(path)?, owner_uid)
 }
 
 fn validate_lock_directory(metadata: &fs::Metadata, owner_uid: u32) -> io::Result<()> {
@@ -278,44 +264,6 @@ fn validate_lock_directory(metadata: &fs::Metadata, owner_uid: u32) -> io::Resul
             io::ErrorKind::PermissionDenied,
             "backend lock parent has an unsafe owner or mode",
         ));
-    }
-    Ok(())
-}
-
-fn create_private_directories(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    let mut current = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir => continue,
-            Component::Normal(name) => current.push(name),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "backend runtime directory must be absolute and normalized",
-                ));
-            }
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "backend runtime path contains a non-directory component",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut builder = fs::DirBuilder::new();
-                builder.mode(0o700);
-                match builder.create(&current) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) => return Err(error),
-        }
     }
     Ok(())
 }
@@ -555,24 +503,61 @@ fn supplementary_groups(
 }
 
 fn reserve_worker(active: &AtomicUsize) -> bool {
-    active
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            (current < MAX_WORKERS).then_some(current + 1)
-        })
-        .is_ok()
+    let mut current = active.load(Ordering::Relaxed);
+    loop {
+        if current >= MAX_WORKERS {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
-struct ActiveRequest(Arc<AtomicUsize>);
+struct ActiveConnection(Arc<AtomicUsize>);
 
-impl ActiveRequest {
+impl ActiveConnection {
     fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::Relaxed);
         Self(active)
     }
 }
 
-impl Drop for ActiveRequest {
+impl Drop for ActiveConnection {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct WorkerSlot(Arc<AtomicUsize>);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct PendingConnection {
+    stream: UnixStream,
+    accepted_at: Instant,
+    peer: PeerCredentials,
+    _active: ActiveConnection,
+}
+
+impl PendingConnection {
+    fn new(stream: UnixStream, peer: PeerCredentials, active: Arc<AtomicUsize>) -> Self {
+        Self {
+            stream,
+            accepted_at: Instant::now(),
+            peer,
+            _active: ActiveConnection::new(active),
+        }
     }
 }
 
@@ -585,6 +570,8 @@ fn supervise(
     let child_pid = child.id();
     let mut listener = Some(listener);
     let mut workers = Vec::<JoinHandle<()>>::new();
+    let mut pending = VecDeque::<PendingConnection>::new();
+    let worker_slots = Arc::new(AtomicUsize::new(0));
     let mut child_status = None;
     let mut stopping_since = None;
     let mut sent_kill = false;
@@ -610,7 +597,7 @@ fn supervise(
                 sent_kill = true;
             }
             if child_status.is_some()
-                && runtime.active_requests.load(Ordering::Relaxed) == 0
+                && runtime.active_connections.load(Ordering::Relaxed) == 0
                 && workers.iter().all(JoinHandle::is_finished)
                 && reap_adopted_children()?
             {
@@ -626,19 +613,48 @@ fn supervise(
                 match listener.accept() {
                     Ok((stream, _)) => {
                         set_cloexec(&stream)?;
-                        if reserve_worker(&runtime.active_requests) {
-                            let runtime = Arc::clone(&runtime);
-                            workers.push(thread::spawn(move || {
-                                let _active =
-                                    ActiveRequest::new(Arc::clone(&runtime.active_requests));
-                                let _ = serve_connection(stream, runtime);
-                            }));
+                        let peer = match peer_credentials(&stream) {
+                            Ok(peer) if authorized_peer(&runtime, peer) => peer,
+                            _ => continue,
+                        };
+                        let connection = PendingConnection::new(
+                            stream,
+                            peer,
+                            Arc::clone(&runtime.active_connections),
+                        );
+                        if reserve_worker(&worker_slots) {
+                            spawn_connection_worker(
+                                connection,
+                                Arc::clone(&runtime),
+                                Arc::clone(&worker_slots),
+                                &mut workers,
+                            );
+                        } else if pending.len() < MAX_PENDING_CONNECTIONS {
+                            pending.push_back(connection);
+                        } else {
+                            reject_busy(connection, "backend connection queue is full");
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
                 }
+            }
+        }
+        if stopping_since.is_some() {
+            pending.clear();
+        } else {
+            while reserve_worker(&worker_slots) {
+                let Some(connection) = pending.pop_front() else {
+                    worker_slots.fetch_sub(1, Ordering::Relaxed);
+                    break;
+                };
+                spawn_reserved_connection_worker(
+                    connection,
+                    Arc::clone(&runtime),
+                    Arc::clone(&worker_slots),
+                    &mut workers,
+                );
             }
         }
         join_finished(&mut workers);
@@ -662,6 +678,61 @@ fn supervise(
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(libc::SIGTERM)))
+}
+
+fn spawn_connection_worker(
+    connection: PendingConnection,
+    runtime: Arc<BackendRuntime>,
+    worker_slots: Arc<AtomicUsize>,
+    workers: &mut Vec<JoinHandle<()>>,
+) {
+    spawn_reserved_connection_worker(connection, runtime, worker_slots, workers);
+}
+
+fn spawn_reserved_connection_worker(
+    connection: PendingConnection,
+    runtime: Arc<BackendRuntime>,
+    worker_slots: Arc<AtomicUsize>,
+    workers: &mut Vec<JoinHandle<()>>,
+) {
+    let fallback = connection.stream.try_clone().ok();
+    let thread_runtime = Arc::clone(&runtime);
+    let thread_slots = Arc::clone(&worker_slots);
+    match thread::Builder::new()
+        .name("container-init-rpc".to_owned())
+        .spawn(move || {
+            let _slot = WorkerSlot(thread_slots);
+            let PendingConnection {
+                mut stream,
+                accepted_at,
+                peer,
+                _active,
+            } = connection;
+            let _ = serve_connection(&mut stream, thread_runtime, peer, accepted_at);
+            drop(_active);
+        }) {
+        Ok(worker) => workers.push(worker),
+        Err(_) => {
+            worker_slots.fetch_sub(1, Ordering::Relaxed);
+            if let Some(mut stream) = fallback {
+                let _ = write_response(
+                    &mut stream,
+                    ServerResponse::Error(backend_error(
+                        "capacity",
+                        true,
+                        "backend could not create a request worker; request was not dispatched",
+                    )),
+                );
+            }
+        }
+    }
+}
+
+fn reject_busy(mut connection: PendingConnection, message: &str) {
+    let _ = write_response(
+        &mut connection.stream,
+        ServerResponse::Error(backend_error("capacity", true, message)),
+    );
 }
 
 fn begin_stopping(runtime: &BackendRuntime, listener: &mut Option<UnixListener>) {
@@ -733,115 +804,130 @@ fn install_signal_handlers() -> io::Result<()> {
     Ok(())
 }
 
-fn serve_connection(mut stream: UnixStream, runtime: Arc<BackendRuntime>) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let peer = match peer_credentials(&stream) {
-        Ok(peer) if authorized_peer(&runtime, peer) => peer,
-        _ => return Ok(()),
+fn serve_connection(
+    stream: &mut UnixStream,
+    runtime: Arc<BackendRuntime>,
+    peer: PeerCredentials,
+    accepted_at: Instant,
+) -> io::Result<()> {
+    let first = match read_client_message(stream, accepted_at + FRAME_TIMEOUT) {
+        Ok(Some(message)) => message,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            return write_response(
+                stream,
+                ServerResponse::Error(protocol_error_response(error)),
+            )
+        }
     };
-    let mut greeted = false;
-    for _ in 0..32 {
-        let message = match read_message::<ClientMessage>(&mut stream) {
-            Ok(message) => message,
-            Err(ProtocolError::Io(error))
-                if error.kind() == io::ErrorKind::UnexpectedEof
-                    || error.kind() == io::ErrorKind::TimedOut =>
-            {
-                return Ok(())
-            }
-            Err(_) => return Ok(()),
-        };
-        if validate_message(&message).is_err() {
-            return Ok(());
+    match first.request {
+        ClientRequest::Status => write_response(stream, ServerResponse::Status(runtime.status())),
+        ClientRequest::Plan {
+            snapshot_id,
+            offset,
+        } => {
+            let response = plan_page_response(&runtime, snapshot_id.as_deref(), offset)
+                .unwrap_or_else(ServerResponse::Error);
+            write_response(stream, response)
         }
-        if let Err(error) = reserve_request_id(&runtime, &message.request_id) {
-            write_response(
-                &mut stream,
-                &message.request_id,
-                ServerResponse::Error(error),
-            )?;
-            continue;
+        ClientRequest::Doctor => {
+            write_response(stream, ServerResponse::Doctor(doctor_response(&runtime)))
         }
-        let response = match message.request {
-            ClientRequest::Hello => {
-                greeted = true;
-                ServerResponse::Hello(HelloInfo {
-                    state: runtime.status().state,
-                    profile: runtime.profile.clone(),
-                    snapshot_id: runtime.snapshot_id.clone(),
-                    runtime_inputs: runtime.allowed.runtime_inputs.iter().cloned().collect(),
-                    environment_names: runtime.allowed.environment_names.iter().cloned().collect(),
-                })
-            }
-            ClientRequest::Exec {
-                argv,
-                cwd,
-                inputs,
-                environment,
-            } => {
-                if !greeted {
-                    ServerResponse::Error(backend_error(
-                        "protocol",
-                        false,
-                        "exec requires a hello request on this connection",
-                    ))
-                } else {
-                    match prepare_exec(&runtime, peer, argv, cwd, inputs, environment) {
-                        Ok(prepared) => ServerResponse::Prepared(prepared),
-                        Err(error) => ServerResponse::Error(error),
-                    }
+        ClientRequest::Hello => {
+            let hello = ServerResponse::Hello(HelloInfo {
+                state: runtime.status().state,
+                profile: runtime.profile.clone(),
+                snapshot_id: runtime.snapshot_id.clone(),
+                runtime_inputs: runtime.allowed.runtime_inputs.iter().cloned().collect(),
+                environment_names: runtime.allowed.environment_names.iter().cloned().collect(),
+            });
+            write_response(stream, hello)?;
+            let second = match read_client_message(stream, Instant::now() + FRAME_TIMEOUT) {
+                Ok(Some(message)) => message,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    return write_response(
+                        stream,
+                        ServerResponse::Error(protocol_error_response(error)),
+                    )
                 }
-            }
-            ClientRequest::PrepareIdentity {
-                cwd,
-                inputs,
-                environment,
-                requested,
-            } => {
-                if !greeted {
-                    ServerResponse::Error(backend_error(
-                        "protocol",
-                        false,
-                        "prepare_identity requires a hello request on this connection",
-                    ))
-                } else {
-                    match prepare_identity(&runtime, peer, requested, cwd, inputs, environment) {
-                        Ok(identity) => ServerResponse::Identity(identity),
-                        Err(error) => ServerResponse::Error(error),
-                    }
-                }
-            }
-            ClientRequest::Status => ServerResponse::Status(runtime.status()),
-            ClientRequest::Plan => ServerResponse::Plan(plan_response(&runtime)),
-            ClientRequest::Doctor => ServerResponse::Doctor(doctor_response(&runtime)),
-        };
-        write_response(&mut stream, &message.request_id, response)?;
+            };
+            let response = match second.request {
+                ClientRequest::Exec {
+                    argv,
+                    cwd,
+                    inputs,
+                    environment,
+                } => match prepare_exec(&runtime, peer, argv, cwd, inputs, environment) {
+                    Ok(prepared) => ServerResponse::Prepared(prepared),
+                    Err(error) => ServerResponse::Error(error),
+                },
+                ClientRequest::PrepareIdentity {
+                    cwd,
+                    inputs,
+                    environment,
+                    requested,
+                } => match prepare_identity(&runtime, peer, requested, cwd, inputs, environment) {
+                    Ok(identity) => ServerResponse::Identity(identity),
+                    Err(error) => ServerResponse::Error(error),
+                },
+                _ => ServerResponse::Error(backend_error(
+                    "protocol",
+                    false,
+                    "hello must be followed by exactly one exec or prepare_identity request",
+                )),
+            };
+            write_response(stream, response)
+        }
+        ClientRequest::Exec { .. } | ClientRequest::PrepareIdentity { .. } => write_response(
+            stream,
+            ServerResponse::Error(backend_error(
+                "protocol",
+                false,
+                "execution requests require hello as the first message on this connection",
+            )),
+        ),
     }
-    Ok(())
 }
 
-fn reserve_request_id(runtime: &BackendRuntime, request_id: &str) -> Result<(), BackendError> {
-    let mut ids = runtime
-        .request_ids
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if ids.contains(request_id) {
-        return Err(backend_error(
-            "duplicate_request",
+fn read_client_message(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<Option<ClientMessage>, ProtocolError> {
+    let message = match crate::protocol::read_message_until(
+        stream,
+        deadline,
+        crate::protocol::MAX_REQUEST_FRAME_BYTES,
+    ) {
+        Ok(message) => message,
+        Err(ProtocolError::Io(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    validate_message(&message)?;
+    Ok(Some(message))
+}
+
+fn protocol_error_response(error: ProtocolError) -> BackendError {
+    match error {
+        ProtocolError::UnsupportedVersion(version) => backend_error(
+            "unsupported_version",
             false,
-            "request id has already been used",
-        ));
+            &format!("protocol version {version} is not supported; expected {PROTOCOL_VERSION}"),
+        ),
+        ProtocolError::FrameTooLarge { length, limit } => backend_error(
+            "request_too_large",
+            false,
+            &format!("request frame length {length} exceeds the {limit} byte limit"),
+        ),
+        other => backend_error("protocol", false, &other.to_string()),
     }
-    if ids.len() >= MAX_REQUEST_IDS {
-        return Err(backend_error(
-            "capacity",
-            true,
-            "backend request id capacity is exhausted",
-        ));
-    }
-    ids.insert(request_id.to_owned());
-    Ok(())
 }
 
 fn authorized_peer(runtime: &BackendRuntime, peer: PeerCredentials) -> bool {
@@ -1277,13 +1363,69 @@ fn peer_groups(pid: u32, primary_gid: u32) -> BTreeSet<u32> {
     groups
 }
 
-fn plan_response(runtime: &BackendRuntime) -> serde_json::Value {
-    serde_json::json!({
-        "online": true,
-        "profile": runtime.profile,
-        "snapshot_id": runtime.snapshot_id,
-        "actions": runtime.plan.actions(),
-    })
+fn plan_page_response(
+    runtime: &BackendRuntime,
+    requested_snapshot: Option<&str>,
+    offset: usize,
+) -> Result<ServerResponse, BackendError> {
+    let actions = runtime.plan.actions();
+    let total_actions = actions.len();
+    if offset > total_actions
+        || (offset == 0
+            && requested_snapshot.is_some_and(|snapshot| snapshot != runtime.snapshot_id))
+        || (offset != 0 && requested_snapshot != Some(runtime.snapshot_id.as_str()))
+    {
+        return Err(backend_error(
+            "invalid_cursor",
+            false,
+            "plan cursor does not match the current backend snapshot",
+        ));
+    }
+    let remaining = total_actions - offset;
+    let max_count = remaining.min(64);
+    if max_count == 0 {
+        return Ok(ServerResponse::PlanPage(PlanPage {
+            online: true,
+            profile: runtime.profile.clone(),
+            snapshot_id: runtime.snapshot_id.clone(),
+            offset,
+            next_offset: None,
+            total_actions,
+            actions: Vec::new(),
+        }));
+    }
+    for count in (1..=max_count).rev() {
+        let page_actions = actions[offset..offset + count]
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| backend_error("internal", false, "could not serialize plan page"))?;
+        let next_offset = (offset + count < total_actions).then_some(offset + count);
+        let page = PlanPage {
+            online: true,
+            profile: runtime.profile.clone(),
+            snapshot_id: runtime.snapshot_id.clone(),
+            offset,
+            next_offset,
+            total_actions,
+            actions: page_actions,
+        };
+        let response = ServerResponse::PlanPage(page);
+        let envelope = ServerMessage {
+            version: PROTOCOL_VERSION,
+            response: response.clone(),
+        };
+        let payload = serde_json::to_vec(&envelope)
+            .map_err(|_| backend_error("internal", false, "could not serialize plan page"))?;
+        if payload.len() <= MAX_RESPONSE_FRAME_BYTES {
+            return Ok(response);
+        }
+    }
+    Err(backend_error(
+        "response_too_large",
+        false,
+        "a single plan action exceeds the response frame limit",
+    ))
 }
 
 fn doctor_response(runtime: &BackendRuntime) -> serde_json::Value {
@@ -1331,20 +1473,40 @@ fn backend_error(class: &str, retryable: bool, message: &str) -> BackendError {
     }
 }
 
-fn write_response(
-    stream: &mut UnixStream,
-    request_id: &str,
-    response: ServerResponse,
-) -> io::Result<()> {
-    write_message(
+fn write_response(stream: &mut UnixStream, response: ServerResponse) -> io::Result<()> {
+    let message = ServerMessage {
+        version: PROTOCOL_VERSION,
+        response,
+    };
+    match crate::protocol::write_message_until(
         stream,
-        &ServerMessage {
-            version: PROTOCOL_VERSION,
-            request_id: request_id.to_owned(),
-            response,
+        &message,
+        Instant::now() + FRAME_TIMEOUT,
+        MAX_RESPONSE_FRAME_BYTES,
+    ) {
+        Ok(_) => Ok(()),
+        Err(failure) => match failure.error {
+            ProtocolError::FrameTooLarge { .. } if failure.bytes_written == 0 => {
+                let fallback = ServerMessage {
+                    version: PROTOCOL_VERSION,
+                    response: ServerResponse::Error(backend_error(
+                        "response_too_large",
+                        false,
+                        "backend response exceeded the response frame limit",
+                    )),
+                };
+                crate::protocol::write_message_until(
+                    stream,
+                    &fallback,
+                    Instant::now() + FRAME_TIMEOUT,
+                    MAX_RESPONSE_FRAME_BYTES,
+                )
+                .map(|_| ())
+                .map_err(|error| error.error.as_io_error())
+            }
+            error => Err(error.as_io_error()),
         },
-    )
-    .map_err(|error| error.as_io_error())
+    }
 }
 
 fn request_existing_status(path: &Path, timeout: Duration) -> io::Result<BackendStatus> {

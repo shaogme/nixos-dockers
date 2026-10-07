@@ -77,7 +77,7 @@ profile 仍然可以有意把 `bootstrap.handoff.runtime` 配成 `/bin/sh`，并
 
 文件创建采用临时文件、写入、`fsync`、rename；passwd/group 也使用原子替换。SSH host key 使用更严格的成对检查和 non-overwriting hard-link 安装。
 
-这些检查是当前实现的路径级保护，不应被理解为完整的内核级 sandbox 或 dirfd 级 TOCTOU 防护。对于可被不可信进程并发改写的目录，应该使用容器 mount、目录权限和外部隔离策略；不要把 workspace overlay 当作 root 配置来源。
+这些针对 bootstrap 文件 action 的检查是路径级保护，不应被理解为完整的内核级 sandbox 或 dirfd 级 TOCTOU 防护。backend socket 和实例锁另行使用 no-follow 目录描述符、属主/权限校验及 inode 比较；这不改变 bootstrap 文件 action 的保护边界。对于可被不可信进程并发改写的目录，应该使用容器 mount、目录权限和外部隔离策略；不要把 workspace overlay 当作 root 配置来源。
 
 ## 5. 权限阶段
 

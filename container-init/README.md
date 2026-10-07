@@ -208,7 +208,7 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 发布 Unix socket 并监督 handoff child
 ```
 
-计划由 `bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。`plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统。
+计划由 `bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。离线 `plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统；backend 在线时，`plan` 从不可变快照分页读取并合并结果。
 
 执行时，条件会针对实际的 workspace、输入、环境和目标身份求值。条件为假时 action 被跳过；依赖未成功完成时，依赖它的 action 也会跳过。`failure = "warn"` 或 `"ignore"` 允许当前 action 记录失败并继续处理无关 action，但不会让依赖该 action 的后续 action 执行。
 
