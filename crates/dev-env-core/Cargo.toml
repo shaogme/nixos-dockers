@@ -1,0 +1,16 @@
+[package]
+name = "dev-env-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Runtime materializer for the dev-env environment DSL"
+license.workspace = true
+
+[dependencies]
+dev-env-model = { workspace = true }
+dev-env-provider = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+dev-env-shell = { workspace = true }

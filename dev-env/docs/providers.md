@@ -227,7 +227,7 @@ coding-images
 └── devbox-init      条件 init
 ```
 
-Rust、QEMU 等派生 profile 通过 `extends` 增加环境变量或 bootstrap action，不需要修改 `dev-env` Rust 核心。完整示例见 [`images/common/.config/dev-env.toml`](../../../images/common/.config/dev-env.toml) 和 [`images/rust/common/.config/dev-env.toml`](../../../images/rust/common/.config/dev-env.toml)。
+Rust、QEMU 等派生镜像在 Nix 模块中组合运行时配置，不需要修改 `dev-env` Rust 核心。基础 profile 见 [`modules/core/runtime.nix`](../../modules/core/runtime.nix)，Rust 镜像入口见 [`images/rust/image.nix`](../../images/rust/image.nix)。
 
 ## 10. 外部 provider 协议的当前边界
 

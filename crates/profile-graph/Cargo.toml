@@ -1,0 +1,8 @@
+[package]
+name = "profile-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Data-driven profile inheritance graph validation and traversal"
+license.workspace = true
+

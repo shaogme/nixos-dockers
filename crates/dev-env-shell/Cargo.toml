@@ -1,0 +1,11 @@
+[package]
+name = "dev-env-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shell command construction, environment formatting, and shim support for dev-env"
+license.workspace = true
+
+[dependencies]
+dev-env-model = { workspace = true }
+serde_json = { workspace = true }

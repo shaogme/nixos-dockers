@@ -128,7 +128,7 @@ docker exec -e RUN_AS_ROOT=1 -it <container> bash
 ### 从源码构建
 
 ```bash
-cd nixos-dockers/dev-env
+cd nixos-dockers
 cargo build --locked --release -p dev-env-cli
 ./target/release/dev-env --help
 ```
@@ -146,7 +146,7 @@ cargo build --locked --release -p dev-env-cli
 只做本地文件诊断或离线测试时可以显式使用 `--offline`；该路径不会被生产 handoff
 调用。
 
-最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。快速验证 Rust workspace 本身：
+最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。从 `nixos-dockers` workspace 根目录快速验证 Rust workspace 本身：
 
 ```bash
 cargo test --workspace --locked
@@ -189,20 +189,31 @@ child process 由 `CommandLine` 使用 `env_clear()` 后注入 `MaterializedEnv`
 | `coding-images-qemu` | `coding-images-podman` | QEMU 数据目录；`/dev/kvm` 权限由容器运行时设备配置提供 |
 | `coding-images-qemu-rust` | `coding-images-qemu` | QEMU + Rust 环境 |
 
-实际的派生 profile 示例位于 [`images/common/.config/dev-env.toml`](../../images/common/.config/dev-env.toml)、[`images/rust/common/.config/dev-env.toml`](../../images/rust/common/.config/dev-env.toml) 等文件中。Dockerfile 负责安装工具和复制 profile；provider 的运行时行为由 profile 声明。
+基础运行时 profile 由 [`modules/core/runtime.nix`](../modules/core/runtime.nix) 生成；Rust 派生镜像的模块入口见 [`images/rust/image.nix`](../images/rust/image.nix)。
 
 ## Rust workspace 结构
 
 ```text
-dev-env/
+nixos-dockers/
 ├── Cargo.toml
+├── Cargo.lock
 └── crates/
+    ├── condition-expr/   # environment 和 Bootstrap DSL 共用的条件语法
+    ├── profile-graph/    # 共用的 profile 继承图
+    ├── unix-frame/       # Unix socket JSON frame
+    ├── container-init-protocol/ # dev-env 身份握手使用的 v2 协议 client
     ├── dev-env-model/     # schema、值树、条件、输入、来源和静态校验
     ├── dev-env-loader/    # TOML 读取、profile graph、overlay 和严格合并
     ├── dev-env-core/      # RuntimeContext、Materializer、PATH 和 provider 编排
     ├── dev-env-provider/  # provider 探测、argv 执行、输出解析、锁和 receipt
     ├── dev-env-shell/     # shell argv、环境格式化和 shim
-    └── dev-env-cli/       # CLI 参数、配置发现、进程边界和诊断命令
+    ├── dev-env-cli/       # CLI 参数、配置发现、进程边界和诊断命令
+    ├── container-init-bootstrap-model/
+    ├── container-init-bootstrap-loader/
+    ├── container-init-posix/
+    ├── container-init-core/
+    ├── container-init-backend/
+    └── container-init-cli/
 ```
 
 各 crate 刻意保持边界：model 不读文件也不启动进程，loader 不执行 provider，core 不解析 TOML，shell crate 不执行 shell source，CLI 只负责把这些组件接到进程边界。

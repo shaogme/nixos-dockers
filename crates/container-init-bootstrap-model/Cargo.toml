@@ -1,0 +1,14 @@
+[package]
+name = "container-init-bootstrap-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure data model and static planning rules for the container-init Bootstrap DSL"
+license.workspace = true
+
+[dependencies]
+condition-expr = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,6 +1,6 @@
 # dev-env 开发与测试
 
-`dev-env` 是一个独立的 Rust workspace。它负责配置加载、环境物化、provider 编排和 shell 入口；`container-init` 负责容器启动阶段的用户、目录、网络和初始化脚本。修改其中一侧时，应先确认问题属于哪一个边界。
+`dev-env` 与 `container-init` 共用 `nixos-dockers` 根目录下的 Rust workspace。`dev-env` 负责配置加载、环境物化、provider 编排和 shell 入口；`container-init` 负责容器启动阶段的用户、目录、网络和初始化脚本。修改其中一侧时，应先确认问题属于哪一个边界，并用 `-p <package>` 选择单个 crate。
 
 ## 1. Crate 分层
 
@@ -12,15 +12,20 @@
 | `dev-env-provider` | provider 检测、依赖排序、命令执行、输出解析和 receipt |
 | `dev-env-shell` | shell argv 构造、环境导出、shim 行为 |
 | `dev-env-cli` | 命令行入口、配置发现、进程边界、诊断和 trust 命令 |
+| `container-init-protocol` | container-init v2 身份握手的 DTO 与 client，供 `dev-env-cli` 调用 |
 
-源码入口见 [`Cargo.toml`](../Cargo.toml) 及各 crate 的 `src/lib.rs`、`src/main.rs`。
+workspace 入口见 [`Cargo.toml`](../../Cargo.toml)，源码位于 `nixos-dockers/crates/<package>/`。
+
+`dev-env-cli::identity_broker` 是协议适配层：它把 dev-env 的身份请求映射为
+`container-init-protocol` 请求，再将协议 DTO 转成 `EffectiveIdentity`。v2 envelope、版本
+检查和 Unix frame 处理只由共享协议 crate 实现。
 
 ## 2. 本地构建和静态检查
 
-在 `nixos-dockers/dev-env` 目录执行：
+从仓库根目录进入 `nixos-dockers` 后执行：
 
 ```bash
-cargo build --locked
+cargo build --locked -p dev-env-cli
 cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked
@@ -60,7 +65,7 @@ DEV_ENV_CLI_TEST_IMAGE=... ./crates/dev-env-cli/tests/docker.sh
 运行单个 harness 的完整示例：
 
 ```bash
-cd nixos-dockers/dev-env
+cd nixos-dockers
 ./crates/dev-env-core/tests/docker.sh
 ./crates/dev-env-provider/tests/docker.sh
 ./crates/dev-env-shell/tests/docker.sh
@@ -119,7 +124,8 @@ docker run --rm --entrypoint /usr/bin/dev-env-login-shell image:tag -c 'printf "
 | shell 导出、argv 和 shim | `crates/dev-env-shell/src` |
 | 配置发现、命令和进程替换 | `crates/dev-env-cli/src` |
 | Nix 安装路径、profile 和 shim 链接 | [`modules/core/runtime.nix`](../../modules/core/runtime.nix) |
-| 镜像 profile | [`images/common/.config/dev-env.toml`](../../../images/common/.config/dev-env.toml)、[`images/rust/common/.config/dev-env.toml`](../../../images/rust/common/.config/dev-env.toml) |
+| 基础 runtime profile | [`modules/core/runtime.nix`](../../modules/core/runtime.nix) |
+| Rust 派生镜像入口 | [`images/rust/image.nix`](../../images/rust/image.nix) |
 
 ## 7. 当前实现边界
 

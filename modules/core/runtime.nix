@@ -2,12 +2,28 @@
 let
   containerInitPath = "/usr/bin/container-init";
   bootstrapRealShellPath = "/usr/local/libexec/dev-env/real/bash";
+  workspaceRoot = ../..;
+  workspaceSrc = lib.cleanSourceWith {
+    src = workspaceRoot;
+    filter = path: type:
+      let
+        root = toString workspaceRoot;
+        pathString = toString path;
+        relativePath = lib.removePrefix "${root}/" pathString;
+        isWorkspaceFile = relativePath == "Cargo.toml"
+          || relativePath == "Cargo.lock"
+          || relativePath == "crates"
+          || lib.hasPrefix "crates/" relativePath;
+      in
+      lib.cleanSourceFilter path type
+      && (pathString == root || isWorkspaceFile);
+  };
 
   containerInit = pkgs.rustPlatform.buildRustPackage {
     pname = "container-init";
     version = "0.1.0";
-    src = ../../container-init;
-    cargoLock.lockFile = ../../container-init/Cargo.lock;
+    src = workspaceSrc;
+    cargoLock.lockFile = ../../Cargo.lock;
     cargoBuildFlags = [ "--package" "container-init-cli" ];
     doCheck = false;
     installPhase = ''
@@ -18,8 +34,8 @@ let
   devEnv = pkgs.rustPlatform.buildRustPackage {
     pname = "dev-env";
     version = "0.1.0";
-    src = ../../dev-env;
-    cargoLock.lockFile = ../../dev-env/Cargo.lock;
+    src = workspaceSrc;
+    cargoLock.lockFile = ../../Cargo.lock;
     cargoBuildFlags = [ "--package" "dev-env-cli" ];
     doCheck = false;
     installPhase = ''

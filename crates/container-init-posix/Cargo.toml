@@ -1,0 +1,13 @@
+[package]
+name = "container-init-posix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Portable POSIX primitives for container-init"
+license.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "unix-frame"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Length-limited JSON framing for Unix socket protocols"
+license.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

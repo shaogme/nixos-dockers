@@ -1,0 +1,20 @@
+[package]
+name = "container-init-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Single-instance Unix socket backend and PID 1 supervisor for container-init"
+license.workspace = true
+
+[dependencies]
+container-init-bootstrap-model = { workspace = true }
+container-init-core = { workspace = true }
+container-init-posix = { workspace = true }
+container-init-protocol = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+unix-frame = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

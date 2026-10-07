@@ -1,0 +1,27 @@
+[package]
+name = "dev-env-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line entry point for the dev-env environment DSL"
+license.workspace = true
+
+[lib]
+name = "dev_env_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dev-env"
+path = "src/main.rs"
+
+[dependencies]
+dev-env-core = { workspace = true }
+dev-env-loader = { workspace = true }
+dev-env-model = { workspace = true }
+dev-env-provider = { workspace = true }
+dev-env-shell = { workspace = true }
+container-init-protocol = { workspace = true }
+fs2 = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

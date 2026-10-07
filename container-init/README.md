@@ -208,7 +208,7 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 发布 Unix socket 并监督 handoff child
 ```
 
-计划由 `bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。离线 `plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统；backend 在线时，`plan` 从不可变快照分页读取并合并结果。
+计划由 `container-init-bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。离线 `plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统；backend 在线时，`plan` 从不可变快照分页读取并合并结果。
 
 执行时，条件会针对实际的 workspace、输入、环境和目标身份求值。条件为假时 action 被跳过；依赖未成功完成时，依赖它的 action 也会跳过。`failure = "warn"` 或 `"ignore"` 允许当前 action 记录失败并继续处理无关 action，但不会让依赖该 action 的后续 action 执行。
 
@@ -224,7 +224,7 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 - 可选 `cgroup.v2_init`，自动化 cgroup v2 根进程子组迁移与控制器（`cpu`、`io`、`memory`、`pids`）委托，支持默认就地模式与只读环境下的挂载覆挂重定向（bind-mount shadowing），供嵌套容器引擎使用；
 - `plan --json`、`doctor --json`、结构化错误、非阻塞锁和原子 receipt；
 - Linux mountinfo workspace 挂载证据、UID/GID namespace 映射和 group 成员 reconcile；
-- 独立的 `bootstrap-model`、`bootstrap-loader`、`container-init-core`、`container-init-posix`、`container-init-backend` 和 `container-init-cli` crate。
+- `container-init-bootstrap-model`、`container-init-bootstrap-loader`、`container-init-core`、`container-init-posix`、`container-init-backend` 和 `container-init-cli` crate；所有产品 crate 由 `nixos-dockers/Cargo.toml` 的根 workspace 管理。
 
 当前 CLI/源码没有实现或不负责：
 
@@ -239,18 +239,22 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 
 | 层 | 目录 | 责任 |
 | --- | --- | --- |
-| 模型与计划 | [`crates/bootstrap-model`](crates/bootstrap-model) | DSL 类型、字段校验、条件 AST、路径模板、依赖图和静态计划 |
-| 加载与合并 | [`crates/bootstrap-loader`](crates/bootstrap-loader) | TOML 解析、action kind 归一化、继承、来源和信任、冲突处理 |
-| POSIX 边界 | [`crates/container-init-posix`](crates/container-init-posix) | passwd/group、UID/GID、`chown`、权限、`flock` 等系统原语 |
-| 执行核心 | [`crates/container-init-core`](crates/container-init-core) | 身份解析、条件求值、文件 action、SSH capability、资源锁、receipt 和 handoff |
-| Backend | [`crates/container-init-backend`](crates/container-init-backend) | 单实例 snapshot、Unix socket RPC、实例 flock 和 PID 1 supervisor |
-| CLI | [`crates/container-init-cli`](crates/container-init-cli) | 参数解析、profile 路径发现、backend `run/exec/plan/doctor/status/version` |
+| 条件语法 | [`crates/condition-expr`](../crates/condition-expr) | 两套 DSL 共用的条件表达式 parser |
+| Profile 继承图 | [`crates/profile-graph`](../crates/profile-graph) | 两个 loader 共用的 `extends` 图校验和遍历 |
+| Unix frame | [`crates/unix-frame`](../crates/unix-frame) | 有长度上限的 JSON frame 读写 |
+| v2 身份协议 | [`crates/container-init-protocol`](../crates/container-init-protocol) | server/client 共用的身份握手 DTO 与 client |
+| 模型与计划 | [`crates/container-init-bootstrap-model`](../crates/container-init-bootstrap-model) | DSL 类型、字段校验、条件 AST、路径模板、依赖图和静态计划 |
+| 加载与合并 | [`crates/container-init-bootstrap-loader`](../crates/container-init-bootstrap-loader) | TOML 解析、action kind 归一化、继承、来源和信任、冲突处理 |
+| POSIX 边界 | [`crates/container-init-posix`](../crates/container-init-posix) | passwd/group、UID/GID、`chown`、权限、`flock` 等系统原语 |
+| 执行核心 | [`crates/container-init-core`](../crates/container-init-core) | 身份解析、条件求值、文件 action、SSH capability、资源锁、receipt 和 handoff |
+| Backend | [`crates/container-init-backend`](../crates/container-init-backend) | 单实例 snapshot、Unix socket RPC、实例 flock 和 PID 1 supervisor |
+| CLI | [`crates/container-init-cli`](../crates/container-init-cli) | 参数解析、profile 路径发现、backend `run/exec/plan/doctor/status/version` |
 
 几个关键入口：
 
-- [`bootstrap-model/src/action.rs`](crates/bootstrap-model/src/action.rs)：action 字段和内置 kind；
-- [`bootstrap-model/src/plan.rs`](crates/bootstrap-model/src/plan.rs)：阶段和稳定拓扑排序；
-- [`bootstrap-loader/src/merge.rs`](crates/bootstrap-loader/src/merge.rs)：继承合并与冲突规则；
-- [`container-init-core/src/executor.rs`](crates/container-init-core/src/executor.rs)：执行和 handoff；
-- [`container-init-core/src/filesystem.rs`](crates/container-init-core/src/filesystem.rs)：安全路径及文件操作；
-- [`container-init-core/src/identity.rs`](crates/container-init-core/src/identity.rs)：输入和身份解析。
+- [`container-init-bootstrap-model/src/action.rs`](../crates/container-init-bootstrap-model/src/action.rs)：action 字段和内置 kind；
+- [`container-init-bootstrap-model/src/plan.rs`](../crates/container-init-bootstrap-model/src/plan.rs)：阶段和稳定拓扑排序；
+- [`container-init-bootstrap-loader/src/merge.rs`](../crates/container-init-bootstrap-loader/src/merge.rs)：继承合并与冲突规则；
+- [`container-init-core/src/executor.rs`](../crates/container-init-core/src/executor.rs)：执行和 handoff；
+- [`container-init-core/src/filesystem.rs`](../crates/container-init-core/src/filesystem.rs)：安全路径及文件操作；
+- [`container-init-core/src/identity.rs`](../crates/container-init-core/src/identity.rs)：输入和身份解析。

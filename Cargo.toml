@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "crates/condition-expr",
+    "crates/container-init-backend",
+    "crates/container-init-bootstrap-loader",
+    "crates/container-init-bootstrap-model",
+    "crates/container-init-cli",
+    "crates/container-init-core",
+    "crates/container-init-posix",
+    "crates/container-init-protocol",
+    "crates/dev-env-cli",
+    "crates/dev-env-core",
+    "crates/dev-env-loader",
+    "crates/dev-env-model",
+    "crates/dev-env-provider",
+    "crates/dev-env-shell",
+    "crates/profile-graph",
+    "crates/unix-frame",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+
+[workspace.dependencies]
+condition-expr = { path = "crates/condition-expr" }
+container-init-backend = { path = "crates/container-init-backend" }
+container-init-bootstrap-loader = { path = "crates/container-init-bootstrap-loader" }
+container-init-bootstrap-model = { path = "crates/container-init-bootstrap-model" }
+container-init-cli = { path = "crates/container-init-cli" }
+container-init-core = { path = "crates/container-init-core" }
+container-init-posix = { path = "crates/container-init-posix" }
+container-init-protocol = { path = "crates/container-init-protocol" }
+dev-env-cli = { path = "crates/dev-env-cli" }
+dev-env-core = { path = "crates/dev-env-core" }
+dev-env-loader = { path = "crates/dev-env-loader" }
+dev-env-model = { path = "crates/dev-env-model" }
+dev-env-provider = { path = "crates/dev-env-provider" }
+dev-env-shell = { path = "crates/dev-env-shell" }
+profile-graph = { path = "crates/profile-graph" }
+unix-frame = { path = "crates/unix-frame" }
+
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = { version = "3", default-features = false }
+toml = "0.8"
+
+[profile.release]
+debug = 1

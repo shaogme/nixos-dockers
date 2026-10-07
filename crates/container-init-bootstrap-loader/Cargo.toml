@@ -1,0 +1,13 @@
+[package]
+name = "container-init-bootstrap-loader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Profile graph loader and trust-aware merger for the container-init Bootstrap DSL"
+license.workspace = true
+
+[dependencies]
+container-init-bootstrap-model = { workspace = true }
+profile-graph = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

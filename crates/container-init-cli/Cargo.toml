@@ -1,0 +1,24 @@
+[package]
+name = "container-init-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line entry point for the container-init Bootstrap DSL runtime"
+license.workspace = true
+
+[[bin]]
+name = "container-init"
+path = "src/main.rs"
+
+[dependencies]
+container-init-bootstrap-loader = { workspace = true }
+container-init-bootstrap-model = { workspace = true }
+container-init-core = { workspace = true }
+container-init-posix = { workspace = true }
+container-init-backend = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }
+tempfile = { workspace = true }

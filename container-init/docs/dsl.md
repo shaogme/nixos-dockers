@@ -1,6 +1,6 @@
 # Bootstrap DSL 参考
 
-本文描述当前 `bootstrap-loader` 和 `bootstrap-model` 实际接受的 TOML。它是容器基础设施配置，不是 shell 配置语言：所有副作用都必须落在固定的 action kind 上，不能写任意命令、管道、重定向或 `eval`。
+本文描述当前 `container-init-bootstrap-loader` 和 `container-init-bootstrap-model` 实际接受的 TOML。它是容器基础设施配置，不是 shell 配置语言：所有副作用都必须落在固定的 action kind 上，不能写任意命令、管道、重定向或 `eval`。
 
 ## 1. Profile 外层结构
 

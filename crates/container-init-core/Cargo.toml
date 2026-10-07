@@ -1,0 +1,17 @@
+[package]
+name = "container-init-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "POSIX bootstrap action executor for container-init"
+license.workspace = true
+
+[dependencies]
+container-init-bootstrap-model = { workspace = true }
+container-init-posix = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

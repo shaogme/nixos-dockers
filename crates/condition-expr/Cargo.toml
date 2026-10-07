@@ -1,0 +1,8 @@
+[package]
+name = "condition-expr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared parser for boolean condition expressions"
+license.workspace = true
+

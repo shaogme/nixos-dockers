@@ -1,13 +1,14 @@
 # 开发与测试
 
-`container-init` 是 Rust 2021 workspace，最低声明 Rust 版本为 1.74。当前 workspace 包含六个 crate：
+`container-init` 与 `dev-env` 共用 `nixos-dockers` 根目录下的 Rust 2021 workspace，最低声明 Rust 版本为 1.74。Container-init 的源码 crate 位于根 `crates/` 目录：
 
 ```text
-container-init/
+nixos-dockers/
 ├── Cargo.toml
+├── Cargo.lock
 └── crates/
-    ├── bootstrap-model/
-    ├── bootstrap-loader/
+    ├── container-init-bootstrap-model/
+    ├── container-init-bootstrap-loader/
     ├── container-init-posix/
     ├── container-init-core/
     ├── container-init-backend/
@@ -17,15 +18,15 @@ container-init/
 ## 1. Crate 依赖方向
 
 ```text
-bootstrap-model  ←  bootstrap-loader
+container-init-bootstrap-model  ←  container-init-bootstrap-loader
        ↑                 ↑
 container-init-posix ← container-init-core ← container-init-backend ← container-init-cli
 ```
 
 更具体地说：
 
-- `bootstrap-model` 只包含 serde 数据模型、验证、受限条件 AST、路径模板和静态 plan；不读取文件系统、不访问进程、不依赖 POSIX；
-- `bootstrap-loader` 负责 TOML 和 profile graph，直到得到已验证的 `BootstrapConfig` 为止；不执行 action；
+- `container-init-bootstrap-model` 只包含 serde 数据模型、验证、受限条件 AST、路径模板和静态 plan；不读取文件系统、不访问进程、不依赖 POSIX；
+- `container-init-bootstrap-loader` 负责 TOML 和 profile graph，直到得到已验证的 `BootstrapConfig` 为止；不执行 action；
 - `container-init-posix` 封装 passwd/group、UID/GID、文件 owner/mode 和 `flock` 等 POSIX 原语；
 - `container-init-core` 执行 plan，处理 identity、condition、filesystem、SSH、资源锁、receipt 和 handoff；
 - `container-init-backend` 持有单实例 snapshot，提供版本化 Unix socket RPC 和 PID 1 supervisor；
@@ -35,7 +36,7 @@ container-init-posix ← container-init-core ← container-init-backend ← cont
 
 ## 2. 本地构建和测试
 
-在 `nixos-dockers/container-init` 目录执行：
+在 `nixos-dockers` workspace 根目录执行：
 
 ```bash
 cargo fmt --all -- --check
@@ -46,8 +47,8 @@ cargo test --workspace --locked
 常用的定向测试：
 
 ```bash
-cargo test --locked -p bootstrap-model
-cargo test --locked -p bootstrap-loader
+cargo test --locked -p container-init-bootstrap-model
+cargo test --locked -p container-init-bootstrap-loader
 cargo test --locked -p container-init-posix
 cargo test --locked -p container-init-core
 cargo test --locked -p container-init-backend
@@ -61,6 +62,8 @@ cargo test --locked -p container-init-cli --test cli -- --nocapture
 ```
 
 `Cargo.lock` 是 workspace 的锁定依赖清单；修改依赖时应保持 `--locked` 测试，避免本地隐式更新依赖版本。
+
+如果只构建或测试 container-init 的一个 crate，从 workspace 根目录使用 `-p <package>` 选择目标。
 
 ## 3. Docker 集成测试
 

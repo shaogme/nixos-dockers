@@ -1,0 +1,18 @@
+[package]
+name = "dev-env-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure data model and static validation for the dev-env DSL"
+license.workspace = true
+
+[dependencies]
+condition-expr = { workspace = true }
+profile-graph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+unix-frame = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
