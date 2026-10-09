@@ -245,7 +245,6 @@ bash images/podman/tests/docker.sh
 ```
 
 CI 对开发镜像运行 container-init/dev-env 测试，对 `podman` 单独运行 socket、远程 API
-和持久化数据测试。`coding-images` 暂不纳入本次迁移。
 
 ## 项目结构
 

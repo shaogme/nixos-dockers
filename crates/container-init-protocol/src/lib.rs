@@ -392,15 +392,26 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
             ));
         }
     }
-    if argv.is_some_and(|argv| {
-        argv.len() > 256
-            || argv
-                .iter()
-                .any(|argument| argument.contains('\0') || argument.len() > 16 * 1024)
-    }) {
-        return Err(ProtocolError::invalid_frame(
-            "argv fields are invalid or oversized",
-        ));
+    if let Some(argv) = argv {
+        if argv.len() > 256 {
+            return Err(ProtocolError::invalid_frame(format!(
+                "argv contains {} arguments; maximum is 256",
+                argv.len()
+            )));
+        }
+        for (index, argument) in argv.iter().enumerate() {
+            if argument.contains('\0') {
+                return Err(ProtocolError::invalid_frame(format!(
+                    "argv[{index}] contains NUL"
+                )));
+            }
+            if argument.len() > 16 * 1024 {
+                return Err(ProtocolError::invalid_frame(format!(
+                    "argv[{index}] is {} bytes; maximum is 16384 bytes",
+                    argument.len()
+                )));
+            }
+        }
     }
     if inputs.len() > 64 || environment.len() > 128 {
         return Err(ProtocolError::invalid_frame("too many runtime values"));
