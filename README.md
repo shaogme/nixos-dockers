@@ -92,20 +92,6 @@ docker run -it --rm \
 ghcr.io/shaogme/nixos-dockers/rust:latest
 ```
 
-### 3. 使用独立 Podman engine
-
-`coding-images/podman` 及其 Rust/QEMU 派生镜像必须使用双服务 Compose：
-
-```bash
-cd images/podman
-PODMAN_SOCKET_GID=$(id -g) docker compose up -d podman dev
-docker compose exec dev bash
-```
-
-`dev` 与 `podman` 都挂载 `/workspace`，并通过 `podman-socket` 共享
-`CONTAINER_HOST=unix:///run/podman/podman.sock` 和 `DOCKER_HOST`。`podman-data` 只挂载
-到 engine；旧的 `/var/lib/containers` 工具容器卷不会自动复用。
-
 ### 3. 使用 Docker Compose (VS Code Remote)
 
 ```yaml
