@@ -9,7 +9,7 @@ mod client;
 
 pub use client::{IdentityBrokerClient, IdentityBrokerError};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_REQUEST_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -70,13 +70,34 @@ pub struct ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientRequest {
     Hello,
-    Exec {
+    /// Parsed only so a v3 server can return an explicit unsupported-version
+    /// error for the retired v2 operation. This request is never accepted.
+    #[serde(rename = "exec")]
+    UnsupportedV2Exec {
         argv: Vec<String>,
         cwd: PathBuf,
         #[serde(default)]
         inputs: BTreeMap<String, String>,
         #[serde(default)]
         environment: BTreeMap<String, String>,
+    },
+    PrepareExec {
+        argv: Vec<String>,
+        cwd: PathBuf,
+        #[serde(default)]
+        inputs: BTreeMap<String, String>,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
+        request_budget_ms: u64,
+    },
+    CommitExec {
+        prepare_id: String,
+    },
+    AbortExec {
+        prepare_id: String,
+    },
+    GetExecResult {
+        prepare_id: String,
     },
     /// Resolve a request identity for a trusted long-lived runtime. The
     /// caller never supplies a UID/GID pair as the identity itself; the
@@ -109,7 +130,8 @@ pub struct ServerMessage {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerResponse {
     Hello(HelloInfo),
-    Prepared(PreparedHandoff),
+    PreparedExec(PreparedHandoff),
+    CommitResult(CommitResult),
     Identity(PreparedIdentity),
     Status(BackendStatus),
     PlanPage(PlanPage),
@@ -164,15 +186,44 @@ pub struct HelloInfo {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedHandoff {
+    pub prepare_id: String,
+    pub snapshot_id: String,
     pub command: HandoffCommand,
-    /// Canonical request working directory selected by the backend.
+    /// Canonical path bound to `cwd_object` by one open directory descriptor.
     pub cwd: PathBuf,
+    pub cwd_object: CwdObject,
     /// The complete login environment that must be applied to the handoff.
     pub login_environment: BTreeMap<String, String>,
     pub identity: ResolvedIdentity,
     pub supplemental_groups: Vec<u32>,
     pub root_service: bool,
-    pub receipt_summary: ReceiptSummary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CwdObject {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecTransactionState {
+    Prepared,
+    Committing,
+    Committed,
+    Aborted,
+    Failed,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitResult {
+    pub prepare_id: String,
+    pub state: ExecTransactionState,
+    pub receipt_summary: Option<ReceiptSummary>,
+    pub error: Option<BackendError>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -346,12 +397,20 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
         return Err(ProtocolError::UnsupportedVersion(message.version));
     }
     let (argv, cwd, inputs, environment) = match &message.request {
-        ClientRequest::Exec {
+        ClientRequest::PrepareExec {
             argv,
             cwd,
             inputs,
             environment,
-        } => (Some(argv.as_slice()), Some(cwd), inputs, environment),
+            request_budget_ms,
+        } => {
+            if *request_budget_ms == 0 || *request_budget_ms > 300_000 {
+                return Err(ProtocolError::invalid_frame(
+                    "request budget must be between 1 and 300000 milliseconds",
+                ));
+            }
+            (Some(argv.as_slice()), Some(cwd), inputs, environment)
+        }
         ClientRequest::PrepareIdentity {
             cwd,
             inputs,
@@ -391,6 +450,21 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
                 "cwd exceeds the 4096 byte limit",
             ));
         }
+    }
+    let prepare_id = match &message.request {
+        ClientRequest::CommitExec { prepare_id }
+        | ClientRequest::AbortExec { prepare_id }
+        | ClientRequest::GetExecResult { prepare_id } => Some(prepare_id),
+        _ => None,
+    };
+    if prepare_id.is_some_and(|prepare_id| {
+        prepare_id.is_empty()
+            || prepare_id.len() > 128
+            || !prepare_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(ProtocolError::invalid_frame(
+            "prepare_id must be a nonempty hexadecimal token no longer than 128 bytes",
+        ));
     }
     if let Some(argv) = argv {
         if argv.len() > 256 {
@@ -458,31 +532,44 @@ mod tests {
     }
 
     #[test]
-    fn v2_framed_messages_round_trip_without_request_ids() {
-        let original = message(ClientRequest::Exec {
+    fn v3_framed_prepare_messages_round_trip_without_request_ids() {
+        let original = message(ClientRequest::PrepareExec {
             argv: vec!["echo".to_owned(), "hello".to_owned()],
             cwd: PathBuf::from("/workspace"),
             inputs: BTreeMap::new(),
             environment: BTreeMap::new(),
+            request_budget_ms: 1000,
         });
         let mut frame = Vec::new();
         write_message(&mut frame, &original).unwrap();
         let decoded: ClientMessage = read_message(&mut Cursor::new(frame)).unwrap();
         assert_eq!(decoded, original);
 
-        let malformed = br#"{"version":2,"request_id":"x","request":{"type":"hello"}}"#;
+        let malformed = br#"{"version":3,"request_id":"x","request":{"type":"hello"}}"#;
         let mut frame = (malformed.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(malformed);
         assert!(read_message::<ClientMessage>(&mut Cursor::new(frame)).is_err());
     }
 
     #[test]
-    fn v2_identity_handshake_keeps_hello_and_prepare_wire_shapes() {
+    fn v2_exec_is_parsed_only_to_return_an_unsupported_version_error() {
+        let legacy: ClientMessage = serde_json::from_slice(
+            br#"{"version":2,"request":{"type":"exec","argv":["true"],"cwd":"/tmp","inputs":{},"environment":{}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_message(&legacy),
+            Err(ProtocolError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[test]
+    fn v3_identity_handshake_keeps_hello_and_prepare_wire_shapes() {
         let hello = serde_json::to_value(message(ClientRequest::Hello)).unwrap();
         assert_eq!(
             hello,
             serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "request": { "type": "hello" }
             })
         );
@@ -499,7 +586,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(prepare).unwrap(),
             serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "request": {
                     "type": "prepare_identity",
                     "cwd": "/workspace",
@@ -511,7 +598,7 @@ mod tests {
         );
 
         let hello: ServerMessage = serde_json::from_value(serde_json::json!({
-            "version": 2,
+            "version": 3,
             "response": {
                 "type": "hello",
                 "state": "ready",
@@ -525,7 +612,7 @@ mod tests {
         assert!(matches!(hello.response, ServerResponse::Hello(_)));
 
         let identity: ServerMessage = serde_json::from_value(serde_json::json!({
-            "version": 2,
+            "version": 3,
             "response": {
                 "type": "identity",
                 "uid": 1000,
@@ -557,11 +644,12 @@ mod tests {
             Err(ProtocolError::UnsupportedVersion(1))
         ));
 
-        let invalid_argv = message(ClientRequest::Exec {
+        let invalid_argv = message(ClientRequest::PrepareExec {
             argv: vec!["bad\0arg".to_owned()],
             cwd: PathBuf::from("/workspace"),
             inputs: BTreeMap::new(),
             environment: BTreeMap::new(),
+            request_budget_ms: 1000,
         });
         assert!(validate_message(&invalid_argv).is_err());
 

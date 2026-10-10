@@ -34,6 +34,7 @@ trap cleanup EXIT
 command -v docker >/dev/null
 command -v nix-build >/dev/null
 command -v nix-instantiate >/dev/null
+command -v script >/dev/null
 
 assert_contains() {
     local value="$1"
@@ -61,6 +62,26 @@ wait_for_running() {
         sleep 1
     done
     echo "timed out waiting for container $container" >&2
+    docker logs "$container" >&2 || true
+    return 1
+}
+
+wait_for_container_init_backend() {
+    local container="$1"
+    local attempt state
+    for attempt in {1..30}; do
+        state="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)"
+        if [[ "$state" == false ]]; then
+            echo "container $container exited before the container-init backend became ready" >&2
+            docker logs "$container" >&2 || true
+            return 1
+        fi
+        if [[ "$state" == true ]] && docker exec "$container" /usr/bin/container-init status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "timed out waiting for the container-init backend in $container" >&2
     docker logs "$container" >&2 || true
     return 1
 }
@@ -164,6 +185,7 @@ test_loaded_image() {
         --env HOST_UID="$host_uid:$host_gid" \
         "$attr:latest" /bin/sleep 300 >/dev/null
     wait_for_running "$exec_container"
+    wait_for_container_init_backend "$exec_container"
 
     exec_output="$(docker exec --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" bash -lc \
         'test "$USER" = dev && test "$HOME" = /home/dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID" && test "$(stat -c %u:%g /home/dev)" = "$EXPECTED_UID:$EXPECTED_GID"')"
@@ -176,6 +198,12 @@ test_loaded_image() {
     root_output="$(docker exec -e RUN_AS_ROOT=1 "$exec_container" bash -lc \
         'test "$USER" = root && test "$HOME" = /root && test "$(id -u)" = 0 && test "$(id -g)" = 0 && test "$(stat -c %u:%g /root)" = "0:0" && test "$(stat -c %U /root)" = root')"
     [[ -z "$root_output" ]]
+
+    exec_output="$(printf '%s\n' 'printf "%s" "nixos-docker stdin handoff"' | docker exec -i "$exec_container" bash)"
+    [[ "$exec_output" == 'nixos-docker stdin handoff' ]]
+
+    interactive_output="$(printf '%s\n' 'printf "%s\n" "nixos-docker interactive shell"' 'exit' | script --quiet --return --command "docker exec -it \"$exec_container\" bash" /dev/null)"
+    assert_contains "$interactive_output" 'nixos-docker interactive shell'
 
     low_level="$(docker exec "$exec_container" /bin/sh -c 'test "$(id -u)" = 0 && printf "%s" "${BASH-unset}"')"
     [[ "$low_level" == /bin/sh ]]

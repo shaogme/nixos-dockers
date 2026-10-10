@@ -1,6 +1,8 @@
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -734,4 +736,337 @@ depends_on = ["resolve"]
     );
     assert_eq!(unsafe { libc::kill(run_dev.id() as i32, libc::SIGTERM) }, 0);
     assert_eq!(run_dev.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn exec_preflight_uses_kernel_acl_checks_and_commits_only_after_chdir() {
+    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(
+        container_init_core::PosixSystem::new().current_ids().0,
+        0,
+        "Docker fixture must run as root"
+    );
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let profiles = root.join("profiles");
+    let workspace = root.join("workspace");
+    let socket = root.join("backend.sock");
+    let startup_home = root.join("startup-home");
+    let allowed_home = root.join("allowed-home");
+    let denied_home = root.join("denied-home");
+    let allowed_cwd = workspace.join("acl-allowed");
+    let denied_cwd = workspace.join("acl-denied");
+    let denied_parent = workspace.join("acl-parent-denied");
+    let denied_parent_cwd = denied_parent.join("nested");
+    fs::create_dir(&profiles).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&allowed_cwd).unwrap();
+    fs::create_dir(&denied_cwd).unwrap();
+    fs::create_dir_all(&denied_parent_cwd).unwrap();
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&workspace, fs::Permissions::from_mode(0o755)).unwrap();
+
+    const PEER_SUPPLEMENTARY_GID: u32 = 54321;
+    let groups = fs::read_to_string("/etc/group").unwrap();
+    assert!(
+        !groups
+            .lines()
+            .any(|line| line.split(':').nth(2) == Some("54321")),
+        "fixture supplementary GID must be unused"
+    );
+    let mut group_file = fs::OpenOptions::new()
+        .append(true)
+        .open("/etc/group")
+        .unwrap();
+    writeln!(
+        group_file,
+        "container-init-acl:x:{PEER_SUPPLEMENTARY_GID}:nobody"
+    )
+    .unwrap();
+
+    for directory in [
+        &allowed_cwd,
+        &denied_cwd,
+        &denied_parent,
+        &denied_parent_cwd,
+    ] {
+        assert!(Command::new("chown")
+            .arg("0:20000")
+            .arg(directory)
+            .status()
+            .unwrap()
+            .success());
+    }
+    assert!(Command::new("setfacl")
+        .args(["-m", "u::rwx,g::---,g:54321:--x,m::--x,o::---"])
+        .arg(&allowed_cwd)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("setfacl")
+        .args(["-m", "u::rwx,g::---,g:54321:---,m::---,o::---"])
+        .arg(&denied_cwd)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("setfacl")
+        .args(["-m", "u::rwx,g::---,g:54321:---,m::---,o::---"])
+        .arg(&denied_parent)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("setfacl")
+        .args(["-m", "u::rwx,g::---,g:54321:--x,m::--x,o::---"])
+        .arg(&denied_parent_cwd)
+        .status()
+        .unwrap()
+        .success());
+
+    fs::write(
+        profiles.join("acl.toml"),
+        format!(
+            r#"
+schema = 1
+id = "acl"
+
+[bootstrap]
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "nobody"
+default_uid = 65534
+default_gid = 65534
+default_home = "{}"
+home_input = "CONTAINER_HOME"
+auto_mapping = false
+
+[bootstrap.inputs.CONTAINER_HOME]
+target = "identity.home"
+type = "path"
+runtime = true
+allow_outside_workspace = true
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "resolve"
+kind = "identity.resolve"
+run_as = "root"
+
+[[bootstrap.actions]]
+id = "home"
+kind = "identity.ensure_home"
+path = "${{identity.home}}"
+mode = "0750"
+owner = "identity.target"
+run_as = "root"
+depends_on = ["resolve"]
+"#,
+            workspace.display(),
+            startup_home.display()
+        ),
+    )
+    .unwrap();
+
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("container-init");
+    let mut backend = Command::new(&binary)
+        .args([
+            "--profiles-dir",
+            profiles.to_str().unwrap(),
+            "--profile",
+            "acl",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "run",
+            "--",
+            "trap 'exit 0' TERM; while :; do sleep 1; done",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let client =
+        container_init_backend::BackendClient::new(&socket, std::time::Duration::from_secs(2));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if client.status().is_ok() {
+            break;
+        }
+        if let Some(status) = backend.try_wait().unwrap() {
+            panic!("ACL backend exited before becoming ready: {status}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(client.status().is_ok(), "ACL backend did not become ready");
+
+    let allowed_marker = format!("/tmp/container-init-acl-{}-allowed", std::process::id());
+    let denied_marker = format!("/tmp/container-init-acl-{}-denied", std::process::id());
+    let parent_denied_marker = format!(
+        "/tmp/container-init-acl-{}-parent-denied",
+        std::process::id()
+    );
+    let _ = fs::remove_file(&allowed_marker);
+    let _ = fs::remove_file(&denied_marker);
+    let _ = fs::remove_file(&parent_denied_marker);
+    let allowed_command = format!("printf allowed > {allowed_marker}");
+    let allowed_input = format!("CONTAINER_HOME={}", allowed_home.display());
+    let allowed = Command::new(&binary)
+        .args([
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "--input",
+            allowed_input.as_str(),
+            "exec",
+            "--",
+        ])
+        .arg(allowed_command)
+        .current_dir(&allowed_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "named supplementary-group ACL should allow chdir: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(fs::read_to_string(&allowed_marker).unwrap(), "allowed");
+    assert!(
+        allowed_home.is_dir(),
+        "successful Preflight must be followed by Commit"
+    );
+
+    let peer_marker = format!("/tmp/container-init-acl-{}-peer", std::process::id());
+    let _ = fs::remove_file(&peer_marker);
+    let peer_input = format!("CONTAINER_HOME={}", allowed_home.display());
+    let peer_script = format!("printf peer > {peer_marker}");
+    let peer = Command::new("setpriv")
+        .args([
+            "--reuid=65534",
+            "--regid=65534",
+            "--groups=65534,54321",
+            "--",
+            binary.to_str().unwrap(),
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "--input",
+            peer_input.as_str(),
+            "exec",
+            "--",
+        ])
+        .arg(peer_script)
+        .current_dir(&allowed_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        peer.status.success(),
+        "non-root peer with matching supplementary groups should pass: {}",
+        String::from_utf8_lossy(&peer.stderr)
+    );
+    assert_eq!(fs::read_to_string(&peer_marker).unwrap(), "peer");
+
+    let mismatch_home = root.join("mismatch-home");
+    let mismatch_input = format!("CONTAINER_HOME={}", mismatch_home.display());
+    let mismatch = Command::new("setpriv")
+        .args([
+            "--reuid=65534",
+            "--regid=65534",
+            "--groups=65534",
+            "--",
+            binary.to_str().unwrap(),
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "--input",
+            mismatch_input.as_str(),
+            "exec",
+            "--",
+            "true",
+        ])
+        .current_dir(&allowed_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        !mismatch.status.success(),
+        "non-root peer missing a resolved supplementary group must be rejected"
+    );
+    assert!(
+        !mismatch_home.exists(),
+        "credential rejection must precede Commit"
+    );
+
+    let denied_command = format!("printf denied > {denied_marker}");
+    let denied_input = format!("CONTAINER_HOME={}", denied_home.display());
+    let denied = Command::new(&binary)
+        .args([
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "--input",
+            denied_input.as_str(),
+            "exec",
+            "--",
+        ])
+        .arg(denied_command)
+        .current_dir(&denied_cwd)
+        .output()
+        .unwrap();
+    assert!(!denied.status.success(), "ACL denial must fail Preflight");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("Permission denied"),
+        "expected an explicit handoff permission error, got: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        !denied_home.exists(),
+        "failed Preflight must not Commit request actions"
+    );
+    assert!(!Path::new(&denied_marker).exists());
+
+    let parent_denied_input = format!(
+        "CONTAINER_HOME={}",
+        root.join("parent-denied-home").display()
+    );
+    let parent_denied_command = format!("printf denied > {parent_denied_marker}");
+    let parent_denied = Command::new(&binary)
+        .args([
+            "--backend-socket",
+            socket.to_str().unwrap(),
+            "--input",
+            parent_denied_input.as_str(),
+            "exec",
+            "--",
+        ])
+        .arg(parent_denied_command)
+        .current_dir(&denied_parent_cwd)
+        .output()
+        .unwrap();
+    assert!(
+        !parent_denied.status.success(),
+        "missing execute permission on a parent directory must fail Preflight"
+    );
+    assert!(
+        String::from_utf8_lossy(&parent_denied.stderr).contains("Permission denied"),
+        "expected parent traversal denial, got: {}",
+        String::from_utf8_lossy(&parent_denied.stderr)
+    );
+    assert!(
+        !root.join("parent-denied-home").exists(),
+        "parent traversal denial must happen before Commit"
+    );
+    assert!(!Path::new(&parent_denied_marker).exists());
+
+    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+    let _ = fs::remove_file(allowed_marker);
+    let _ = fs::remove_file(denied_marker);
+    let _ = fs::remove_file(peer_marker);
+    let _ = fs::remove_file(parent_denied_marker);
 }

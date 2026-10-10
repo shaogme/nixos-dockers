@@ -1,18 +1,24 @@
-use container_init_backend::BackendClient;
+use container_init_backend::{BackendClient, BackendClientError};
 use container_init_bootstrap_loader::LoaderError;
-use container_init_bootstrap_model::ModelError;
+use container_init_bootstrap_model::{ModelError, SourceKind};
 use container_init_cli::{Cli, CliCommand, CliError};
-use serde_json::Value;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+use container_init_core::PosixSystem;
+use container_init_protocol::{BackendState, ExecTransactionState};
+use libc::{kill, SIGTERM};
+use serde_json::{from_slice, Value};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 
 fn binary() -> PathBuf {
-    std::env::current_exe()
+    env::current_exe()
         .unwrap()
         .parent()
         .unwrap()
@@ -91,12 +97,7 @@ fn common_args(profiles: &Path, workspace: &Path, lock: &Path) -> Vec<String> {
     ]
 }
 
-fn start_backend(
-    profiles: &Path,
-    workspace: &Path,
-    socket: &Path,
-    initial_command: &str,
-) -> std::process::Child {
+fn start_backend(profiles: &Path, workspace: &Path, socket: &Path, initial_command: &str) -> Child {
     Command::new(binary())
         .args([
             "--profiles-dir",
@@ -117,18 +118,18 @@ fn start_backend(
         .unwrap()
 }
 
-fn wait_for_backend(child: &mut std::process::Child, socket: &Path) {
+fn wait_for_backend(child: &mut Child, socket: &Path) {
     let client = BackendClient::new(socket, Duration::from_millis(500));
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(status) = client.status() {
-            assert_eq!(status.state, container_init_backend::BackendState::Ready);
+            assert_eq!(status.state, BackendState::Ready);
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
             panic!("backend exited before becoming ready: {status}");
         }
-        std::thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(20));
     }
     panic!("backend did not become ready");
 }
@@ -161,7 +162,7 @@ fn parser_keeps_command_arguments_after_double_dash() {
 
 #[test]
 fn plan_is_side_effect_free_and_json_contains_provenance() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let (temp, profiles, workspace, marker, _) = profile_fixture();
@@ -176,7 +177,7 @@ fn plan_is_side_effect_free_and_json_contains_provenance() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let document: Value = from_slice(&output.stdout).unwrap();
     assert_eq!(document["profile"], "fixture");
     assert_eq!(document["actions"][0]["id"], "marker");
     assert_eq!(document["actions"][0]["origin"]["profile"], "fixture");
@@ -186,7 +187,7 @@ fn plan_is_side_effect_free_and_json_contains_provenance() {
 
 #[test]
 fn doctor_checks_the_real_handoff_and_workspace_without_mutation() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let (temp, profiles, workspace, marker, _) = profile_fixture();
@@ -201,7 +202,7 @@ fn doctor_checks_the_real_handoff_and_workspace_without_mutation() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let document: Value = from_slice(&output.stdout).unwrap();
     assert_eq!(document["ok"], true);
     assert_eq!(document["handoff"]["runtime"], "/bin/sh");
     assert!(document["checks"]
@@ -215,7 +216,7 @@ fn doctor_checks_the_real_handoff_and_workspace_without_mutation() {
 
 #[test]
 fn run_executes_actions_then_handoffs_to_the_declared_runtime() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let (temp, profiles, workspace, marker, handoff) = profile_fixture();
@@ -249,7 +250,7 @@ fn run_executes_actions_then_handoffs_to_the_declared_runtime() {
 
 #[test]
 fn startup_failure_exits_without_publishing_a_backend_socket() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let temp = TempDir::new().unwrap();
@@ -340,7 +341,7 @@ fn parser_parses_exec_command_with_double_dash_and_arguments() {
 
 #[test]
 fn exec_hands_off_through_the_running_backend() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let (temp, profiles, workspace, marker, handoff) = profile_fixture();
@@ -365,14 +366,174 @@ fn exec_hands_off_through_the_running_backend() {
     );
     assert!(marker.exists(), "startup actions belong to run");
     assert_eq!(fs::read_to_string(&handoff).unwrap(), "exec-handoff\n");
-    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
     assert_eq!(backend.wait().unwrap().code(), Some(0));
     assert!(!socket.exists());
 }
 
 #[test]
+fn prepare_has_no_reconcile_effect_until_commit_and_abort_is_final() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let profiles = temp.path().join("profiles");
+    let workspace = temp.path().join("workspace");
+    let socket = temp.path().join("backend.sock");
+    let startup_home = temp.path().join("startup-home");
+    let deferred_home = temp.path().join("deferred-home");
+    fs::create_dir(&profiles).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    fs::write(
+        profiles.join("fixture.toml"),
+        format!(
+            r#"
+schema = 1
+id = "fixture"
+
+[bootstrap]
+workspace_root = "{}"
+
+[bootstrap.identity]
+default_user = "dev"
+default_uid = 1000
+default_gid = 1000
+default_home = "{}"
+home_input = "CONTAINER_HOME"
+auto_mapping = false
+
+[bootstrap.inputs.CONTAINER_HOME]
+target = "identity.home"
+type = "path"
+runtime = true
+allow_outside_workspace = true
+
+[bootstrap.handoff]
+runtime = "/bin/sh"
+exec_prefix = ["-c"]
+shell_prefix = ["-c", "true"]
+
+[[bootstrap.actions]]
+id = "resolve"
+kind = "identity.resolve"
+run_as = "root"
+
+[[bootstrap.actions]]
+id = "home"
+kind = "identity.ensure_home"
+path = "${{identity.home}}"
+mode = "0750"
+owner = "identity.target"
+run_as = "root"
+depends_on = ["resolve"]
+"#,
+            workspace.display(),
+            startup_home.display()
+        ),
+    )
+    .unwrap();
+
+    let mut backend = start_backend(
+        &profiles,
+        &workspace,
+        &socket,
+        "trap 'exit 0' TERM; while :; do sleep 1; done",
+    );
+    wait_for_backend(&mut backend, &socket);
+    let client = BackendClient::new(&socket, Duration::from_secs(5));
+    let inputs = BTreeMap::from([(
+        "CONTAINER_HOME".to_owned(),
+        deferred_home.display().to_string(),
+    )]);
+    let deadline = client.deadline().unwrap();
+    let prepared = client
+        .prepare_until(
+            vec!["true".to_owned()],
+            workspace.clone(),
+            inputs.clone(),
+            &BTreeMap::new(),
+            deadline,
+        )
+        .unwrap();
+    assert!(
+        !deferred_home.exists(),
+        "Prepare must not reconcile the requested HOME"
+    );
+
+    client.abort_until(&prepared.prepare_id, deadline).unwrap();
+    let aborted = client
+        .get_exec_result_until(&prepared.prepare_id, deadline)
+        .unwrap();
+    assert_eq!(aborted.state, ExecTransactionState::Aborted);
+    assert!(
+        !deferred_home.exists(),
+        "Abort must leave request actions unapplied"
+    );
+
+    let deadline = client.deadline().unwrap();
+    let prepared = client
+        .prepare_until(
+            vec!["true".to_owned()],
+            workspace,
+            inputs,
+            &BTreeMap::new(),
+            deadline,
+        )
+        .unwrap();
+    let committed = client.commit_until(&prepared.prepare_id, deadline).unwrap();
+    assert!(committed.receipt_summary.succeeded);
+    assert!(
+        deferred_home.is_dir(),
+        "Commit must apply the prepared request plan"
+    );
+    assert_eq!(
+        client.commit_until(&prepared.prepare_id, deadline).unwrap(),
+        committed,
+        "repeating Commit with the same token must return the same result"
+    );
+
+    let expired_home = temp.path().join("expired-home");
+    let expired_inputs = BTreeMap::from([(
+        "CONTAINER_HOME".to_owned(),
+        expired_home.display().to_string(),
+    )]);
+    let short_deadline = Instant::now() + Duration::from_millis(500);
+    let expired = client
+        .prepare_until(
+            vec!["true".to_owned()],
+            temp.path().join("workspace"),
+            expired_inputs,
+            &BTreeMap::new(),
+            short_deadline,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(650));
+    let result_deadline = client.deadline().unwrap();
+    assert_eq!(
+        client
+            .get_exec_result_until(&expired.prepare_id, result_deadline)
+            .unwrap()
+            .state,
+        ExecTransactionState::Aborted,
+        "an expired Prepare must become aborted"
+    );
+    assert!(
+        matches!(
+            client.commit_until(&expired.prepare_id, client.deadline().unwrap()),
+            Err(BackendClientError::Backend(error))
+                if error.class == "transaction_aborted"
+        ),
+        "an expired Prepare must not be committed"
+    );
+    assert!(!expired_home.exists(), "expired Prepare must not reconcile");
+
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+}
+
+#[test]
 fn exec_supports_parallel_execution_without_lock_contention() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let (temp, profiles, workspace, _, _) = profile_fixture();
@@ -388,7 +549,7 @@ fn exec_supports_parallel_execution_without_lock_contention() {
     for i in 0..4 {
         let socket = socket.clone();
         let out_file = temp.path().join(format!("parallel-{i}"));
-        handles.push(std::thread::spawn(move || {
+        handles.push(thread::spawn(move || {
             let script = format!("printf '{i}\\n' > {}", out_file.display());
             let output = Command::new(binary())
                 .args(["--backend-socket", socket.to_str().unwrap(), "exec", "--"])
@@ -406,13 +567,13 @@ fn exec_supports_parallel_execution_without_lock_contention() {
     for handle in handles {
         handle.join().unwrap();
     }
-    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
     assert_eq!(backend.wait().unwrap().code(), Some(0));
 }
 
 #[test]
 fn duplicate_run_uses_the_existing_backend_without_reloading_config() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let (temp, profiles, workspace, marker, _) = profile_fixture();
@@ -446,7 +607,7 @@ fn duplicate_run_uses_the_existing_backend_without_reloading_config() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("backend already running"));
     assert!(marker.exists());
-    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
     assert_eq!(backend.wait().unwrap().code(), Some(0));
 }
 
@@ -462,7 +623,7 @@ fn removed_bootstrap_lock_option_is_rejected() {
 
 #[test]
 fn run_exports_resolved_identity_environment_before_non_root_handoff() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
 
@@ -570,7 +731,7 @@ depends_on = ["drop"]
 
 #[test]
 fn cli_enables_the_ssh_capability_for_a_declared_service_action() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
 
@@ -650,7 +811,7 @@ content = "ssh-ed25519 AAAAcli-test\n"
         "{}",
         String::from_utf8_lossy(&plan.stderr)
     );
-    let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let plan: Value = from_slice(&plan.stdout).unwrap();
     assert_eq!(plan["actions"][1]["id"], "ssh");
     assert_eq!(
         plan["actions"][1]["effect"]["service_ssh_prepare"]["authorized_keys"],
@@ -668,7 +829,7 @@ content = "ssh-ed25519 AAAAcli-test\n"
         "{}",
         String::from_utf8_lossy(&doctor.stderr)
     );
-    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let doctor: Value = from_slice(&doctor.stdout).unwrap();
     assert_eq!(doctor["ok"], true);
     assert_eq!(
         doctor["checks"]
@@ -737,7 +898,7 @@ fn default_profile_file_is_used_when_no_profile_flag_is_given() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let document: Value = from_slice(&output.stdout).unwrap();
     assert_eq!(document["profile"], "fixture");
 }
 
@@ -745,7 +906,7 @@ fn default_profile_file_is_used_when_no_profile_flag_is_given() {
 fn trust_exit_code_uses_the_structured_error_variant() {
     let trust_error = CliError::Loader(LoaderError::Model(ModelError::TrustViolation {
         action: "root-action".to_owned(),
-        source: container_init_bootstrap_model::SourceKind::UserOverlay,
+        source: SourceKind::UserOverlay,
         message: "root actions require a trusted profile".to_owned(),
     }));
     assert_eq!(trust_error.exit_code(), 66);
@@ -759,7 +920,7 @@ fn trust_exit_code_uses_the_structured_error_variant() {
 
 #[test]
 fn cli_plans_cgroup_v2_init_action() {
-    if container_init_core::PosixSystem::new().current_ids().0 != 0 {
+    if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
     let (temp, profiles, workspace, _, _) = profile_fixture();
@@ -822,7 +983,7 @@ run_as = "root"
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let document: Value = from_slice(&output.stdout).unwrap();
     assert_eq!(document["profile"], "fixture-cgroup");
     let cg_action = document["actions"]
         .as_array()
@@ -898,7 +1059,7 @@ run_as = "root"
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let document: Value = from_slice(&output.stdout).unwrap();
     assert_eq!(document["profile"], "fixture-cgroup-bind");
     let cg_action = document["actions"]
         .as_array()

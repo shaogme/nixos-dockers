@@ -79,6 +79,14 @@ profile 仍然可以有意把 `bootstrap.handoff.runtime` 配成 `/bin/sh`，并
 
 这些针对 bootstrap 文件 action 的检查是路径级保护，不应被理解为完整的内核级 sandbox 或 dirfd 级 TOCTOU 防护。backend socket 和实例锁另行使用 no-follow 目录描述符、属主/权限校验及 inode 比较；这不改变 bootstrap 文件 action 的保护边界。对于可被不可信进程并发改写的目录，应该使用容器 mount、目录权限和外部隔离策略；不要把 workspace overlay 当作 root 配置来源。
 
+### Backend `exec` 的身份和 cwd 预检
+
+v3 `PrepareExec` 只解析身份、构造 handoff 候选并绑定 cwd 对象，不执行 request reconcile。非 root peer 必须以自身 UID、有效 GID 和完整 supplementary-group 集合发起普通 handoff；服务端将解析身份与 socket 内核凭据及 `/proc/<pid>/status` 观察到的组集合比较。CLI 也会在发送 Commit 前复核候选凭据。需要切换 UID、GID 或组成员关系的 profile 必须由 root 发起请求。
+
+cwd 权限由 handoff 子进程在目标凭据下对客户端原始路径执行 `chdir` 判定，因此采用内核的 POSIX ACL、ACL mask、逐级目录和 supplementary-group 规则。Prepare 会通过单个 `O_PATH | O_DIRECTORY` FD 绑定 canonical cwd、设备号和 inode；Preflight 对原始路径执行 `chdir` 后核对对象标识，并在 Commit 期间保持该 cwd。路径或 symlink 在 Prepare 与 Preflight 之间被替换时会拒绝提交。不要用 `stat` 的 group mode 位替代这次内核授权检查。
+
+每个候选由随机 `prepare_id`、snapshot、原始 peer UID/GID 和短期 deadline 绑定。Abort/过期事务不能 Commit；同一 token 的重复 Commit 不会重复执行 request plan。Commit 回包不确定时只能查询原 token；backend 崩溃会丢失内存状态，所以 action 仍必须可幂等收敛。
+
 ## 5. 权限阶段
 
 `run_as` 只描述 action 的执行身份；它不会自动授予权限：

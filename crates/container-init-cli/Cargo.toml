@@ -16,9 +16,10 @@ container-init-bootstrap-model = { workspace = true }
 container-init-core = { workspace = true }
 container-init-posix = { workspace = true }
 container-init-backend = { workspace = true }
+container-init-protocol = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-libc = { workspace = true }
 tempfile = { workspace = true }

@@ -1,23 +1,33 @@
-use crate::args::{Cli, CliCommand, CliOptions, ParseError};
-use crate::config;
-use crate::doctor;
-use crate::error::CliError;
-use crate::output;
+use crate::{
+    args::{Cli, CliCommand, CliOptions, ParseError},
+    config, doctor,
+    error::CliError,
+    output,
+    preflight::PreflightChild,
+};
 use container_init_backend::{
     BackendClaim, BackendClient, BackendClientError, BackendLease, BackendPaths, BackendRunError,
-    ProtocolError,
+    BackendStartOptions,
 };
+use container_init_bootstrap_model::ActionKind;
 use container_init_core::{ExecutionOptions, PosixSystem, SshCapability};
-use std::collections::BTreeMap;
-use std::env;
-use std::path::PathBuf;
-use std::time::Duration;
+use container_init_protocol::ProtocolError;
+use serde_json::to_value;
+use std::{
+    collections::BTreeMap,
+    env,
+    ffi::OsString,
+    io,
+    os::unix::process::ExitStatusExt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const DEFAULT_BACKEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run<I>(arguments: I) -> Result<i32, CliError>
 where
-    I: IntoIterator<Item = std::ffi::OsString>,
+    I: IntoIterator<Item = OsString>,
 {
     let cli = Cli::parse(arguments).map_err(parse_error)?;
     match cli.command {
@@ -70,7 +80,7 @@ where
             let status = backend_client(&cli.options)?
                 .status()
                 .map_err(backend_client_error)?;
-            let value = serde_json::to_value(status).map_err(CliError::Output)?;
+            let value = to_value(status).map_err(CliError::Output)?;
             output::print_backend(&value, json, "status")?;
             Ok(0)
         }
@@ -83,7 +93,7 @@ where
                 BackendClaim::Acquired(lease) => lease,
                 BackendClaim::AlreadyRunning(status) => {
                     println!("backend already running");
-                    let value = serde_json::to_value(status).map_err(CliError::Output)?;
+                    let value = to_value(status).map_err(CliError::Output)?;
                     output::print_backend(&value, false, "status")?;
                     return Ok(0);
                 }
@@ -93,14 +103,14 @@ where
             let context = config::runtime_context(&cli.options, true)?;
             let execution_options = build_execution_options(&cli.options, &loaded);
             lease
-                .start(
-                    loaded.profile().to_owned(),
-                    loaded.config().clone(),
-                    loaded.plan().clone(),
-                    context,
-                    &command,
+                .start(BackendStartOptions {
+                    profile: loaded.profile().to_owned(),
+                    config: loaded.config().clone(),
+                    plan: loaded.plan().clone(),
+                    startup_context: context,
+                    command,
                     execution_options,
-                )
+                })
                 .map_err(backend_run_error)
         }
         CliCommand::Exec { command } => {
@@ -118,17 +128,46 @@ where
                 ));
             }
             let ambient = env::vars().collect::<BTreeMap<_, _>>();
-            let prepared = backend_client(&cli.options)?
-                .prepare(command, cwd, inputs, &ambient)
+            let client = backend_client(&cli.options)?;
+            let deadline = client.deadline().map_err(backend_client_error)?;
+            let prepared = client
+                .prepare_until(command, cwd.clone(), inputs, &ambient, deadline)
                 .map_err(backend_client_error)?;
-            prepared.command.exec_with_credentials_and_context(
-                &prepared.identity,
-                &prepared.supplemental_groups,
-                prepared.root_service,
-                Some(&prepared.cwd),
-                &prepared.login_environment,
-            )?;
-            Ok(0)
+            let mut child = match PreflightChild::spawn(&prepared, cwd) {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = client.abort_until(&prepared.prepare_id, deadline);
+                    return Err(CliError::Backend(format!(
+                        "handoff preflight could not start: {error}"
+                    )));
+                }
+            };
+            if let Err(error) = child.wait_ready(deadline) {
+                child.abort();
+                let _ = client.abort_until(&prepared.prepare_id, deadline);
+                return Err(CliError::Backend(error.to_string()));
+            }
+            if let Err(error) = client.commit_until(&prepared.prepare_id, deadline) {
+                child.abort();
+                let _ = client.abort_until(&prepared.prepare_id, deadline);
+                return Err(backend_client_error(error));
+            }
+            if let Err(error) = child.release() {
+                child.abort();
+                return Err(CliError::Backend(format!(
+                    "request reconcile committed but handoff release failed: {error}"
+                )));
+            }
+            if let Err(error) = child.wait_for_exec(deadline) {
+                child.abort();
+                return Err(CliError::Backend(error.to_string()));
+            }
+            let status = child.wait_for_runtime().map_err(|error| {
+                CliError::Backend(format!("handoff process wait failed: {error}"))
+            })?;
+            Ok(status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
         }
     }
 }
@@ -141,10 +180,7 @@ fn backend_client(options: &CliOptions) -> Result<BackendClient, CliError> {
     ))
 }
 
-fn backend_paths(
-    options: &CliOptions,
-    workspace: &std::path::Path,
-) -> Result<BackendPaths, CliError> {
+fn backend_paths(options: &CliOptions, workspace: &Path) -> Result<BackendPaths, CliError> {
     let socket_path = backend_socket(options, workspace);
     let parent = socket_path
         .parent()
@@ -157,7 +193,7 @@ fn backend_paths(
     })
 }
 
-fn backend_socket(options: &CliOptions, workspace: &std::path::Path) -> PathBuf {
+fn backend_socket(options: &CliOptions, workspace: &Path) -> PathBuf {
     if let Some(path) = &options.backend_socket {
         return path.clone();
     }
@@ -221,7 +257,7 @@ fn backend_unavailable(error: &BackendClientError) -> bool {
     io_error.is_some_and(|error| {
         matches!(
             error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
         )
     })
 }
@@ -246,15 +282,13 @@ fn build_execution_options(
         .plan()
         .actions()
         .iter()
-        .any(|action| action.kind == container_init_bootstrap_model::ActionKind::ServiceSshPrepare)
+        .any(|action| action.kind == ActionKind::ServiceSshPrepare)
     {
         let keygen = loaded
             .config()
             .actions
             .iter()
-            .find(|action| {
-                action.kind == container_init_bootstrap_model::ActionKind::ServiceSshPrepare
-            })
+            .find(|action| action.kind == ActionKind::ServiceSshPrepare)
             .and_then(|action| action.ssh_keygen.clone())
             .unwrap_or_else(|| SshCapability::default().keygen().display().to_string());
         execution_options = execution_options.with_ssh(SshCapability::new(keygen));

@@ -100,7 +100,8 @@ impl IdentityBrokerClient {
                 )))
             }
             ServerResponse::Hello(_)
-            | ServerResponse::Prepared(_)
+            | ServerResponse::PreparedExec(_)
+            | ServerResponse::CommitResult(_)
             | ServerResponse::Status(_)
             | ServerResponse::PlanPage(_)
             | ServerResponse::Doctor(_)
@@ -131,7 +132,8 @@ fn expect_hello(stream: &mut UnixStream) -> Result<crate::HelloInfo, IdentityBro
             error.class, error.message
         ))),
         ServerResponse::Identity(_)
-        | ServerResponse::Prepared(_)
+        | ServerResponse::PreparedExec(_)
+        | ServerResponse::CommitResult(_)
         | ServerResponse::Status(_)
         | ServerResponse::PlanPage(_)
         | ServerResponse::Doctor(_)

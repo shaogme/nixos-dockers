@@ -1,10 +1,20 @@
-use std::ffi::CString;
-use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use libc::{
+    fchmod, fchown, flock, fstatat, geteuid, open, openat, stat, AT_SYMLINK_NOFOLLOW, EAGAIN,
+    EWOULDBLOCK, LOCK_EX, LOCK_NB, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_RDWR,
+    S_IFMT, S_IFREG,
+};
+use std::{
+    ffi::CString,
+    fs::{self, File},
+    io::{self, Seek, SeekFrom, Write},
+    mem,
+    os::{
+        fd::{AsRawFd, FromRawFd, RawFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt},
+    },
+    path::{Component, Path, PathBuf},
+    process,
+};
 
 #[derive(Debug)]
 pub enum InstanceClaim {
@@ -32,13 +42,13 @@ impl InstanceLock {
             io::Error::new(io::ErrorKind::InvalidInput, "lock filename contains NUL")
         })?;
         let directory = open_directory_chain(parent)?;
-        validate_lock_directory(&directory, unsafe { libc::geteuid() })?;
+        validate_lock_directory(&directory, unsafe { geteuid() })?;
         validate_directory_path(parent, &directory)?;
         let fd = unsafe {
-            libc::openat(
+            openat(
                 directory.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
                 0o600,
             )
         };
@@ -46,7 +56,7 @@ impl InstanceLock {
             return Err(io::Error::last_os_error());
         }
         let mut file = unsafe { File::from_raw_fd(fd) };
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
         if result != 0 {
             let error = io::Error::last_os_error();
             if is_lock_contended(&error) {
@@ -57,7 +67,7 @@ impl InstanceLock {
         validate_lock_file(&file)?;
         let opened = file.metadata()?;
         let current = stat_at(directory.as_raw_fd(), &name)?;
-        if current.st_mode & libc::S_IFMT != libc::S_IFREG
+        if current.st_mode & S_IFMT != S_IFREG
             || current.st_dev != opened.dev()
             || current.st_ino != opened.ino()
         {
@@ -69,7 +79,7 @@ impl InstanceLock {
         validate_directory_path(parent, &directory)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        writeln!(file, "pid={}", std::process::id())?;
+        writeln!(file, "pid={}", process::id())?;
         file.sync_all()?;
         Ok(InstanceClaim::Acquired(Self { path, file }))
     }
@@ -79,14 +89,14 @@ impl InstanceLock {
     }
 
     pub fn allow_peer_group(&mut self, gid: u32) -> io::Result<()> {
-        if unsafe { libc::geteuid() } != 0 {
+        if unsafe { geteuid() } != 0 {
             return Ok(());
         }
         let fd = self.file.as_raw_fd();
-        if unsafe { libc::fchown(fd, u32::MAX, gid) } != 0 {
+        if unsafe { fchown(fd, u32::MAX, gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        if unsafe { libc::fchmod(fd, 0o660) } != 0 {
+        if unsafe { fchmod(fd, 0o660) } != 0 {
             return Err(io::Error::last_os_error());
         }
         validate_lock_file(&self.file)
@@ -111,9 +121,9 @@ fn open_directory_chain(path: &Path) -> io::Result<File> {
     validate_normalized_path(path)?;
     let root = CString::new("/").expect("literal has no NUL");
     let fd = unsafe {
-        libc::open(
+        open(
             root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
         )
     };
     if fd < 0 {
@@ -128,10 +138,10 @@ fn open_directory_chain(path: &Path) -> io::Result<File> {
             io::Error::new(io::ErrorKind::InvalidInput, "directory name contains NUL")
         })?;
         let fd = unsafe {
-            libc::openat(
+            openat(
                 directory.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW,
             )
         };
         if fd < 0 {
@@ -160,7 +170,7 @@ fn validate_lock_directory(directory: &File, owner_uid: u32) -> io::Result<()> {
 }
 
 fn validate_directory_path(path: &Path, directory: &File) -> io::Result<()> {
-    let path_metadata = std::fs::symlink_metadata(path)?;
+    let path_metadata = fs::symlink_metadata(path)?;
     let fd_metadata = directory.metadata()?;
     if !path_metadata.file_type().is_dir()
         || path_metadata.dev() != fd_metadata.dev()
@@ -182,7 +192,7 @@ fn validate_lock_file(file: &File) -> io::Result<()> {
             "backend instance lock must be a regular file",
         ));
     }
-    if metadata.uid() != unsafe { libc::geteuid() } {
+    if metadata.uid() != unsafe { geteuid() } {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "backend instance lock is not owned by this user",
@@ -197,17 +207,9 @@ fn validate_lock_file(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn stat_at(directory_fd: std::os::fd::RawFd, name: &CString) -> io::Result<libc::stat> {
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe {
-        libc::fstatat(
-            directory_fd,
-            name.as_ptr(),
-            &mut stat,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
+fn stat_at(directory_fd: RawFd, name: &CString) -> io::Result<stat> {
+    let mut stat: stat = unsafe { mem::zeroed() };
+    if unsafe { fstatat(directory_fd, name.as_ptr(), &mut stat, AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(stat)
@@ -215,14 +217,14 @@ fn stat_at(directory_fd: std::os::fd::RawFd, name: &CString) -> io::Result<libc:
 
 fn is_lock_contended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
-        || error.raw_os_error() == Some(libc::EWOULDBLOCK)
-        || error.raw_os_error() == Some(libc::EAGAIN)
+        || error.raw_os_error() == Some(EWOULDBLOCK)
+        || error.raw_os_error() == Some(EAGAIN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{InstanceClaim, InstanceLock};
-    use std::fs;
+    use std::{fs, os::unix::fs::symlink};
     use tempfile::TempDir;
 
     #[test]
@@ -250,7 +252,7 @@ mod tests {
         let target = temp.path().join("target");
         fs::write(&target, "preserve").unwrap();
         let link = temp.path().join("backend.lock");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        symlink(&target, &link).unwrap();
 
         assert!(InstanceLock::try_acquire(&link).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "preserve");

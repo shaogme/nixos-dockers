@@ -168,10 +168,34 @@ impl PlanExecutor {
         plan: &Plan,
         command: &[String],
     ) -> Result<ExecutionReport, CoreError> {
+        self.execute_internal(plan, command, None)
+    }
+
+    /// Execute a prevalidated plan with the identity already resolved for the
+    /// request. Trusted backend transactions use this to keep the committed
+    /// reconcile bound to the candidate that passed Preflight.
+    pub fn execute_prevalidated_with_identity(
+        &self,
+        plan: &Plan,
+        command: &[String],
+        identity: &ResolvedIdentity,
+    ) -> Result<ExecutionReport, CoreError> {
+        self.execute_internal(plan, command, Some(identity))
+    }
+
+    fn execute_internal(
+        &self,
+        plan: &Plan,
+        command: &[String],
+        identity_override: Option<&ResolvedIdentity>,
+    ) -> Result<ExecutionReport, CoreError> {
         let resolver = IdentityResolver::with_posix(self.options.posix.clone());
-        let identity = {
-            let _account_locks = self.acquire_account_locks()?;
-            resolver.resolve_prevalidated(&self.config, &self.context)?
+        let identity = match identity_override {
+            Some(identity) => identity.clone(),
+            None => {
+                let _account_locks = self.acquire_account_locks()?;
+                resolver.resolve_prevalidated(&self.config, &self.context)?
+            }
         };
         let root_service_handoff = self.is_root_service_handoff(command);
         let warnings = identity_warnings(&self.config, &identity);

@@ -1,34 +1,34 @@
-use crate::protocol::{
-    validate_message, BackendError, BackendState, BackendStatus, ClientMessage, ClientRequest,
-    HandoffCommand as WireHandoffCommand, HelloInfo, IdentityRequest, PeerCredentials, PlanPage,
-    PreparedHandoff as WirePreparedHandoff, PreparedIdentity, ProtocolError, ReceiptSummary,
-    ResolvedIdentity as WireResolvedIdentity, ServerMessage, ServerResponse,
-    MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
+use self::{
+    lifecycle::BackendSupervisor,
+    runtime::{BackendRuntime, BackendRuntimeOptions},
 };
-use crate::socket::{bind_socket, cleanup_stale_socket, ensure_socket_directory, peer_credentials};
-use container_init_bootstrap_model::{
-    ActionKind, BootstrapConfig, Condition, ConditionValue, Plan,
+use crate::{
+    client::BackendClient,
+    instance::{InstanceClaim, InstanceLock},
+    socket::BackendSocket,
 };
+use container_init_bootstrap_model::{BootstrapConfig, Plan};
 use container_init_core::{
-    CoreError, ExecutionOptions, HandoffCommand, PlanExecutor, ResourceLockManager, RuntimeContext,
+    CoreError, ExecutionOptions, PlanExecutor, ResourceLockManager, RuntimeContext,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
-use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use container_init_protocol::{BackendState, BackendStatus};
+use libc::{getegid, geteuid};
+use std::{
+    error::Error,
+    fmt, io,
+    path::{Path, PathBuf},
+    process,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
-const MAX_WORKERS: usize = 32;
-const MAX_PENDING_CONNECTIONS: usize = 16;
-const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+mod connection;
+mod identity;
+mod inspection;
+mod lifecycle;
+mod runtime;
+mod transaction;
 
 #[derive(Clone, Debug)]
 pub struct BackendPaths {
@@ -44,7 +44,17 @@ pub enum BackendClaim {
 
 pub struct BackendLease {
     paths: BackendPaths,
-    _lock: crate::InstanceLock,
+    _lock: InstanceLock,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackendStartOptions {
+    pub profile: String,
+    pub config: BootstrapConfig,
+    pub plan: Plan,
+    pub startup_context: RuntimeContext,
+    pub command: Vec<String>,
+    pub execution_options: ExecutionOptions,
 }
 
 impl BackendLease {
@@ -61,61 +71,61 @@ impl BackendLease {
                 "backend socket path has no parent",
             )
         })?;
-        if parent != socket_parent || paths.owner_uid != unsafe { libc::geteuid() } {
+        if parent != socket_parent || paths.owner_uid != unsafe { geteuid() } {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backend socket and lock must share a runtime directory owned by this user",
             ));
         }
-        prepare_lock_directory(parent, paths.owner_uid)?;
-        match crate::InstanceLock::try_acquire(&paths.lock_path)? {
-            crate::InstanceClaim::Acquired(lock) => {
-                cleanup_stale_socket(&paths.socket_path)?;
+        BackendRuntime::prepare_lock_directory(parent, paths.owner_uid)?;
+        match InstanceLock::try_acquire(&paths.lock_path)? {
+            InstanceClaim::Acquired(lock) => {
+                BackendSocket::cleanup_stale_socket(&paths.socket_path)?;
                 Ok(BackendClaim::Acquired(Self { paths, _lock: lock }))
             }
-            crate::InstanceClaim::Occupied => Ok(BackendClaim::AlreadyRunning(
-                request_existing_status(&paths.socket_path, timeout)?,
-            )),
+            InstanceClaim::Occupied => Ok(BackendClaim::AlreadyRunning(request_existing_status(
+                &paths.socket_path,
+                timeout,
+            )?)),
         }
     }
 
-    pub fn start(
-        mut self,
-        profile: String,
-        config: BootstrapConfig,
-        plan: Plan,
-        startup_context: RuntimeContext,
-        command: &[String],
-        mut execution_options: ExecutionOptions,
-    ) -> Result<i32, BackendRunError> {
-        install_signal_handlers()?;
-        let snapshot_id = snapshot_id(&profile, &config, &plan)?;
-        let startup_config = startup_config(&config);
+    pub fn start(mut self, mut options: BackendStartOptions) -> Result<i32, BackendRunError> {
+        BackendSupervisor::install_signal_handlers()?;
+        let snapshot_id = BackendRuntime::calculate_snapshot_id(
+            &options.profile,
+            &options.config,
+            &options.plan,
+        )?;
+        let startup_config = BackendRuntime::startup_config(&options.config);
         let startup_plan = startup_config.build_plan().map_err(CoreError::Model)?;
-        let request_config = Arc::new(request_config(&config));
+        let request_config = Arc::new(BackendRuntime::trimmed_request_config(&options.config));
         let request_plan = Arc::new(request_config.build_plan().map_err(CoreError::Model)?);
-        let allowed = allowed_client_values(&request_config)?;
-        let config = Arc::new(config);
-        let plan = Arc::new(plan);
-        execution_options = execution_options
+        let allowed = BackendRuntime::allowed_client_values(&request_config)?;
+        let config = Arc::new(options.config);
+        let plan = Arc::new(options.plan);
+        options.execution_options = options
+            .execution_options
             .with_resource_locks(ResourceLockManager::default())
             .preserve_current_process_in_cgroup();
 
-        let startup = PlanExecutor::new(startup_config, startup_context.clone())
-            .with_options(execution_options.clone())
+        let startup = PlanExecutor::new(startup_config, options.startup_context.clone())
+            .with_options(options.execution_options.clone())
             .execute_prevalidated(&startup_plan, &[])?;
         let identity = startup.identity;
-        // Startup receipts describe the one-time reconcile. Request workers
-        // must not overwrite that report with a partial identity plan.
-        execution_options.receipt_path = None;
+        options.execution_options.receipt_path = None;
         self._lock.allow_peer_group(identity.gid)?;
-        let root_service = is_root_service(&config, command, self.paths.owner_uid, true);
+        let root_service = BackendSupervisor::is_root_service(
+            &config,
+            &options.command,
+            self.paths.owner_uid,
+            true,
+        );
         let handoff =
-            PlanExecutor::with_shared_config(Arc::clone(&config), startup_context.clone())
-                .build_initial_handoff_command(command)?;
-        if unsafe { libc::geteuid() } != 0
-            && (identity.uid != unsafe { libc::geteuid() }
-                || identity.gid != unsafe { libc::getegid() })
+            PlanExecutor::with_shared_config(Arc::clone(&config), options.startup_context.clone())
+                .build_initial_handoff_command(&options.command)?;
+        if unsafe { geteuid() } != 0
+            && (identity.uid != unsafe { geteuid() } || identity.gid != unsafe { getegid() })
         {
             return Err(CoreError::Permission {
                 action: None,
@@ -133,34 +143,38 @@ impl BackendLease {
         let socket_dir = self.paths.socket_path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "socket path has no parent")
         })?;
-        ensure_socket_directory(
+        BackendSocket::ensure_socket_directory(
             socket_dir,
             owner_uid,
             group_gid,
             if owner_uid == 0 { 0o710 } else { 0o700 },
         )?;
-        cleanup_stale_socket(&self.paths.socket_path)?;
-        let listener = bind_socket(
+        BackendSocket::cleanup_stale_socket(&self.paths.socket_path)?;
+        let listener = BackendSocket::bind_socket(
             &self.paths.socket_path,
             owner_uid,
             group_gid,
             if owner_uid == 0 { 0o660 } else { 0o600 },
         )?;
         listener.set_nonblocking(true)?;
-        let child = match spawn_handoff(&handoff, &identity, root_service, startup_context.cwd()) {
+        let child = match BackendSupervisor::spawn_handoff(
+            &handoff,
+            &identity,
+            root_service,
+            options.startup_context.cwd(),
+        ) {
             Ok(child) => child,
             Err(error) => {
                 drop(listener);
-                cleanup_stale_socket(&self.paths.socket_path)?;
+                BackendSocket::cleanup_stale_socket(&self.paths.socket_path)?;
                 return Err(error.into());
             }
         };
-
         let status = BackendStatus {
             state: BackendState::Ready,
-            profile: profile.clone(),
+            profile: options.profile.clone(),
             snapshot_id: snapshot_id.clone(),
-            backend_pid: std::process::id(),
+            backend_pid: process::id(),
             initial_child_pid: Some(child.id()),
             started_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -168,8 +182,8 @@ impl BackendLease {
                 .as_secs(),
             active_connections: 0,
         };
-        let runtime = Arc::new(BackendRuntime {
-            profile,
+        let runtime = Arc::new(BackendRuntime::new(BackendRuntimeOptions {
+            profile: options.profile,
             snapshot_id,
             config,
             plan,
@@ -177,11 +191,11 @@ impl BackendLease {
             request_plan,
             startup_identity: identity,
             allowed,
-            execution_options,
-            status: RwLock::new(status),
-            active_connections: Arc::new(AtomicUsize::new(0)),
-        });
-        supervise(listener, child, &self.paths.socket_path, runtime).map_err(BackendRunError::Io)
+            execution_options: options.execution_options,
+            status,
+        }));
+        BackendSupervisor::supervise(listener, child, &self.paths.socket_path, runtime)
+            .map_err(BackendRunError::Io)
     }
 }
 
@@ -191,8 +205,8 @@ pub enum BackendRunError {
     Io(io::Error),
 }
 
-impl std::fmt::Display for BackendRunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for BackendRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Core(error) => error.fmt(f),
             Self::Io(error) => write!(f, "backend failed: {error}"),
@@ -200,7 +214,7 @@ impl std::fmt::Display for BackendRunError {
     }
 }
 
-impl std::error::Error for BackendRunError {}
+impl Error for BackendRunError {}
 
 impl From<CoreError> for BackendRunError {
     fn from(error: CoreError) -> Self {
@@ -214,1364 +228,25 @@ impl From<io::Error> for BackendRunError {
     }
 }
 
-struct BackendRuntime {
-    profile: String,
-    snapshot_id: String,
-    config: Arc<BootstrapConfig>,
-    plan: Arc<Plan>,
-    request_config: Arc<BootstrapConfig>,
-    request_plan: Arc<Plan>,
-    startup_identity: container_init_core::ResolvedIdentity,
-    allowed: AllowedClientValues,
-    execution_options: ExecutionOptions,
-    status: RwLock<BackendStatus>,
-    active_connections: Arc<AtomicUsize>,
-}
-
-struct AllowedClientValues {
-    runtime_inputs: BTreeSet<String>,
-    environment_names: BTreeSet<String>,
-}
-
-impl BackendRuntime {
-    fn status(&self) -> BackendStatus {
-        let mut status = self
-            .status
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        status.active_connections = self.active_connections.load(Ordering::Relaxed);
-        status
-    }
-}
-
-fn prepare_lock_directory(path: &Path, owner_uid: u32) -> io::Result<()> {
-    let group_gid = if unsafe { libc::geteuid() } == 0 {
-        owner_uid
-    } else {
-        unsafe { libc::getegid() }
-    };
-    ensure_socket_directory(path, owner_uid, group_gid, 0o700)?;
-    validate_lock_directory(&fs::symlink_metadata(path)?, owner_uid)
-}
-
-fn validate_lock_directory(metadata: &fs::Metadata, owner_uid: u32) -> io::Result<()> {
-    if !metadata.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "backend lock parent is not a real directory",
-        ));
-    }
-    if metadata.uid() != owner_uid || metadata.mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "backend lock parent has an unsafe owner or mode",
-        ));
-    }
-    Ok(())
-}
-
-fn startup_config(config: &BootstrapConfig) -> BootstrapConfig {
-    let mut startup = config.clone();
-    startup.actions.retain(|action| {
-        !action.origin.source.is_workspace()
-            && !matches!(
-                action.kind,
-                ActionKind::ProcessDropPrivileges | ActionKind::HandoffExec
-            )
-    });
-    let action_ids = startup
-        .actions
-        .iter()
-        .map(|action| action.id.clone())
-        .collect::<BTreeSet<_>>();
-    for action in &mut startup.actions {
-        action
-            .depends_on
-            .retain(|dependency| action_ids.contains(dependency));
-    }
-    startup
-}
-
-fn request_config(config: &BootstrapConfig) -> BootstrapConfig {
-    let mut request = config.clone();
-    request.actions.retain(|action| {
-        action.origin.source.is_workspace()
-            || matches!(
-                action.kind,
-                ActionKind::IdentityResolve
-                    | ActionKind::IdentityMapUser
-                    | ActionKind::IdentityEnsureHome
-                    | ActionKind::ProcessSetUserShell
-            )
-    });
-    let action_ids = request
-        .actions
-        .iter()
-        .map(|action| action.id.clone())
-        .collect::<BTreeSet<_>>();
-    for action in &mut request.actions {
-        action
-            .depends_on
-            .retain(|dependency| action_ids.contains(dependency));
-    }
-    request
-}
-
-fn allowed_client_values(config: &BootstrapConfig) -> Result<AllowedClientValues, CoreError> {
-    let mut runtime_inputs = BTreeSet::new();
-    for (name, input) in &config.inputs {
-        if input.runtime {
-            runtime_inputs.insert(name.clone());
-            runtime_inputs.extend(input.aliases.iter().cloned());
-        }
-    }
-    let mut environment_names = runtime_inputs.clone();
-    for action in &config.actions {
-        if matches!(
-            action.kind,
-            ActionKind::IdentityResolve
-                | ActionKind::IdentityMapUser
-                | ActionKind::IdentityEnsureHome
-                | ActionKind::ProcessSetUserShell
-        ) {
-            let condition = action.condition().map_err(CoreError::Model)?;
-            collect_environment_names(&condition, &mut environment_names);
-        }
-    }
-    Ok(AllowedClientValues {
-        runtime_inputs,
-        environment_names,
-    })
-}
-
-fn collect_environment_names(condition: &Condition, names: &mut BTreeSet<String>) {
-    fn value(reference: &ConditionValue, names: &mut BTreeSet<String>) {
-        if let ConditionValue::Reference(reference) = reference {
-            if let Some(name) = reference.strip_prefix("env.") {
-                names.insert(name.to_owned());
-            }
-        }
-    }
-    match condition {
-        Condition::Equal(left, right) | Condition::NotEqual(left, right) => {
-            value(left, names);
-            value(right, names);
-        }
-        Condition::And(parts) | Condition::Or(parts) => {
-            for part in parts {
-                collect_environment_names(part, names);
-            }
-        }
-        Condition::Not(part) => collect_environment_names(part, names),
-        Condition::Always
-        | Condition::Boolean(_)
-        | Condition::ContextPathExistsOrCreate
-        | Condition::Exists(_)
-        | Condition::Writable(_)
-        | Condition::InputSet(_)
-        | Condition::Feature(_) => {}
-    }
-}
-
-fn snapshot_id(profile: &str, config: &BootstrapConfig, plan: &Plan) -> Result<String, CoreError> {
-    let bytes = serde_json::to_vec(&(profile, config, plan)).map_err(|source| {
-        CoreError::Serialization {
-            operation: "serialize backend snapshot id".to_owned(),
-            source,
-        }
-    })?;
-    let hash = bytes
-        .into_iter()
-        .fold(0xcbf29ce484222325_u64, |mut hash, byte| {
-            hash ^= u64::from(byte);
-            hash.wrapping_mul(0x100000001b3)
-        });
-    Ok(format!("{hash:016x}"))
-}
-
-fn is_root_service(
-    config: &BootstrapConfig,
-    command: &[String],
-    owner_uid: u32,
-    initial_handoff: bool,
-) -> bool {
-    owner_uid == 0
-        && initial_handoff
-        && (config.handoff.root_service
-            || config
-                .handoff
-                .ssh_daemon
-                .as_deref()
-                .is_some_and(|daemon| command.first().is_some_and(|candidate| candidate == daemon)))
-}
-
-fn spawn_handoff(
-    handoff: &HandoffCommand,
-    identity: &container_init_core::ResolvedIdentity,
-    root_service: bool,
-    cwd: &Path,
-) -> io::Result<Child> {
-    let mut command = Command::new(&handoff.program);
-    command
-        .args(&handoff.args)
-        .current_dir(cwd)
-        .process_group(0);
-    if identity.uid != 0 {
-        // Handoff runtimes may need a mapped non-root identity to set their
-        // own runtime ACLs. Keep this contract runtime-neutral. Root service
-        // handoffs retain the runtime's configured peer ACL.
-        command
-            .env("CONTAINER_INIT_HANDOFF_UID", identity.uid.to_string())
-            .env("CONTAINER_INIT_HANDOFF_GID", identity.gid.to_string());
-    }
-    if root_service {
-        command
-            .env("HOME", "/root")
-            .env("USER", "root")
-            .env("LOGNAME", "root")
-            // The backend chooses the identity for its initial runtime from
-            // this value. Keep it aligned with the identity already resolved
-            // by container-init, including an explicit RUN_AS_ROOT request.
-            .env("DEVENV_BACKEND_INITIAL_USER", &identity.user);
-    } else {
-        command
-            .env("HOME", &identity.home)
-            .env("USER", &identity.user)
-            .env("LOGNAME", &identity.user);
-    }
-    let current_uid = unsafe { libc::geteuid() };
-    let current_gid = unsafe { libc::getegid() };
-    if !root_service && (identity.uid != current_uid || identity.gid != current_gid) {
-        if current_uid != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "backend cannot switch initial handoff credentials",
-            ));
-        }
-        let groups = supplementary_groups(identity)?;
-        let uid = identity.uid;
-        let gid = identity.gid;
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::setgid(gid) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::setuid(uid) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    command.spawn()
-}
-
-fn supplementary_groups(
-    identity: &container_init_core::ResolvedIdentity,
-) -> io::Result<Vec<libc::gid_t>> {
-    let username = std::ffi::CString::new(identity.user.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "user name contains NUL"))?;
-    let mut count = 16_i32;
-    loop {
-        let mut groups = vec![identity.gid as libc::gid_t; count as usize];
-        let result = unsafe {
-            libc::getgrouplist(
-                username.as_ptr(),
-                identity.gid as libc::gid_t,
-                groups.as_mut_ptr(),
-                &mut count,
-            )
-        };
-        if result >= 0 {
-            groups.truncate(count as usize);
-            groups.sort_unstable();
-            groups.dedup();
-            if !groups.contains(&(identity.gid as libc::gid_t)) {
-                groups.push(identity.gid as libc::gid_t);
-            }
-            groups.sort_unstable();
-            return Ok(groups);
-        }
-        if count <= 0 || count > 4096 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "supplementary group list is invalid or too large",
-            ));
-        }
-    }
-}
-
-fn reserve_worker(active: &AtomicUsize) -> bool {
-    let mut current = active.load(Ordering::Relaxed);
-    loop {
-        if current >= MAX_WORKERS {
-            return false;
-        }
-        match active.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-struct ActiveConnection(Arc<AtomicUsize>);
-
-impl ActiveConnection {
-    fn new(active: Arc<AtomicUsize>) -> Self {
-        active.fetch_add(1, Ordering::Relaxed);
-        Self(active)
-    }
-}
-
-impl Drop for ActiveConnection {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-struct WorkerSlot(Arc<AtomicUsize>);
-
-impl Drop for WorkerSlot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-struct PendingConnection {
-    stream: UnixStream,
-    accepted_at: Instant,
-    peer: PeerCredentials,
-    _active: ActiveConnection,
-}
-
-impl PendingConnection {
-    fn new(stream: UnixStream, peer: PeerCredentials, active: Arc<AtomicUsize>) -> Self {
-        Self {
-            stream,
-            accepted_at: Instant::now(),
-            peer,
-            _active: ActiveConnection::new(active),
-        }
-    }
-}
-
-fn supervise(
-    listener: UnixListener,
-    mut child: Child,
-    socket_path: &Path,
-    runtime: Arc<BackendRuntime>,
-) -> io::Result<i32> {
-    let child_pid = child.id();
-    let mut listener = Some(listener);
-    let mut workers = Vec::<JoinHandle<()>>::new();
-    let mut pending = VecDeque::<PendingConnection>::new();
-    let worker_slots = Arc::new(AtomicUsize::new(0));
-    let mut child_status = None;
-    let mut stopping_since = None;
-    let mut sent_kill = false;
-
-    loop {
-        reap_main_child(&mut child, &mut child_status)?;
-        if child_status.is_some() && stopping_since.is_none() {
-            begin_stopping(&runtime, &mut listener);
-            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGTERM) };
-            stopping_since = Some(Instant::now());
-        }
-
-        let signal = PENDING_SIGNAL.swap(0, Ordering::Relaxed);
-        if signal != 0 && stopping_since.is_none() {
-            begin_stopping(&runtime, &mut listener);
-            let _ = unsafe { libc::kill(-(child_pid as i32), signal) };
-            stopping_since = Some(Instant::now());
-        }
-
-        if let Some(started) = stopping_since {
-            if child_status.is_none() && !sent_kill && started.elapsed() >= SHUTDOWN_GRACE {
-                let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
-                sent_kill = true;
-            }
-            if child_status.is_some()
-                && runtime.active_connections.load(Ordering::Relaxed) == 0
-                && workers.iter().all(JoinHandle::is_finished)
-                && reap_adopted_children()?
-            {
-                break;
-            }
-            if started.elapsed() >= SHUTDOWN_GRACE + Duration::from_secs(1) {
-                break;
-            }
-        }
-
-        if let Some(listener) = &listener {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        set_cloexec(&stream)?;
-                        let peer = match peer_credentials(&stream) {
-                            Ok(peer) if authorized_peer(&runtime, peer) => peer,
-                            _ => continue,
-                        };
-                        let connection = PendingConnection::new(
-                            stream,
-                            peer,
-                            Arc::clone(&runtime.active_connections),
-                        );
-                        if reserve_worker(&worker_slots) {
-                            spawn_connection_worker(
-                                connection,
-                                Arc::clone(&runtime),
-                                Arc::clone(&worker_slots),
-                                &mut workers,
-                            );
-                        } else if pending.len() < MAX_PENDING_CONNECTIONS {
-                            pending.push_back(connection);
-                        } else {
-                            reject_busy(connection, "backend connection queue is full");
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        if stopping_since.is_some() {
-            pending.clear();
-        } else {
-            while reserve_worker(&worker_slots) {
-                let Some(connection) = pending.pop_front() else {
-                    worker_slots.fetch_sub(1, Ordering::Relaxed);
-                    break;
-                };
-                spawn_reserved_connection_worker(
-                    connection,
-                    Arc::clone(&runtime),
-                    Arc::clone(&worker_slots),
-                    &mut workers,
-                );
-            }
-        }
-        join_finished(&mut workers);
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    if let Some(listener) = listener.take() {
-        drop(listener);
-    }
-    if child_status.is_some() && workers.is_empty() {
-        let _ = reap_adopted_children()?;
-    }
-    runtime
-        .status
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .state = BackendState::Stopping;
-    cleanup_stale_socket(socket_path)?;
-    let status = child_status
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "initial handoff did not exit"))?;
-    Ok(status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(libc::SIGTERM)))
-}
-
-fn spawn_connection_worker(
-    connection: PendingConnection,
-    runtime: Arc<BackendRuntime>,
-    worker_slots: Arc<AtomicUsize>,
-    workers: &mut Vec<JoinHandle<()>>,
-) {
-    spawn_reserved_connection_worker(connection, runtime, worker_slots, workers);
-}
-
-fn spawn_reserved_connection_worker(
-    connection: PendingConnection,
-    runtime: Arc<BackendRuntime>,
-    worker_slots: Arc<AtomicUsize>,
-    workers: &mut Vec<JoinHandle<()>>,
-) {
-    let fallback = connection.stream.try_clone().ok();
-    let thread_runtime = Arc::clone(&runtime);
-    let thread_slots = Arc::clone(&worker_slots);
-    match thread::Builder::new()
-        .name("container-init-rpc".to_owned())
-        .spawn(move || {
-            let _slot = WorkerSlot(thread_slots);
-            let PendingConnection {
-                mut stream,
-                accepted_at,
-                peer,
-                _active,
-            } = connection;
-            let _ = serve_connection(&mut stream, thread_runtime, peer, accepted_at);
-            drop(_active);
-        }) {
-        Ok(worker) => workers.push(worker),
-        Err(_) => {
-            worker_slots.fetch_sub(1, Ordering::Relaxed);
-            if let Some(mut stream) = fallback {
-                let _ = write_response(
-                    &mut stream,
-                    ServerResponse::Error(backend_error(
-                        "capacity",
-                        true,
-                        "backend could not create a request worker; request was not dispatched",
-                    )),
-                );
-            }
-        }
-    }
-}
-
-fn reject_busy(mut connection: PendingConnection, message: &str) {
-    let _ = write_response(
-        &mut connection.stream,
-        ServerResponse::Error(backend_error("capacity", true, message)),
-    );
-}
-
-fn begin_stopping(runtime: &BackendRuntime, listener: &mut Option<UnixListener>) {
-    runtime
-        .status
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .state = BackendState::Stopping;
-    listener.take();
-}
-
-fn join_finished(workers: &mut Vec<JoinHandle<()>>) {
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            let worker = workers.swap_remove(index);
-            let _ = worker.join();
-        } else {
-            index += 1;
-        }
-    }
-}
-
-fn reap_main_child(child: &mut Child, main_status: &mut Option<ExitStatus>) -> io::Result<()> {
-    if main_status.is_none() {
-        *main_status = child.try_wait()?;
-    }
-    Ok(())
-}
-
-fn reap_adopted_children() -> io::Result<bool> {
-    loop {
-        let mut status = 0_i32;
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if pid == 0 {
-            return Ok(false);
-        }
-        if pid < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted
-                || error.raw_os_error() == Some(libc::ECHILD)
-            {
-                return Ok(true);
-            }
-            return Err(error);
-        }
-    }
-}
-
-static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn signal_handler(signal: libc::c_int) {
-    PENDING_SIGNAL.store(signal, Ordering::Relaxed);
-}
-
-fn install_signal_handlers() -> io::Result<()> {
-    PENDING_SIGNAL.store(0, Ordering::Relaxed);
-    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = signal_handler as *const () as usize;
-        action.sa_flags = 0;
-        unsafe {
-            libc::sigemptyset(&mut action.sa_mask);
-        }
-        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn serve_connection(
-    stream: &mut UnixStream,
-    runtime: Arc<BackendRuntime>,
-    peer: PeerCredentials,
-    accepted_at: Instant,
-) -> io::Result<()> {
-    let first = match read_client_message(stream, accepted_at + FRAME_TIMEOUT) {
-        Ok(Some(message)) => message,
-        Ok(None) => return Ok(()),
-        Err(error) => {
-            return write_response(
-                stream,
-                ServerResponse::Error(protocol_error_response(error)),
-            )
-        }
-    };
-    match first.request {
-        ClientRequest::Status => write_response(stream, ServerResponse::Status(runtime.status())),
-        ClientRequest::Plan {
-            snapshot_id,
-            offset,
-        } => {
-            let response = plan_page_response(&runtime, snapshot_id.as_deref(), offset)
-                .unwrap_or_else(ServerResponse::Error);
-            write_response(stream, response)
-        }
-        ClientRequest::Doctor => {
-            write_response(stream, ServerResponse::Doctor(doctor_response(&runtime)))
-        }
-        ClientRequest::Hello => {
-            let hello = ServerResponse::Hello(HelloInfo {
-                state: runtime.status().state,
-                profile: runtime.profile.clone(),
-                snapshot_id: runtime.snapshot_id.clone(),
-                runtime_inputs: runtime.allowed.runtime_inputs.iter().cloned().collect(),
-                environment_names: runtime.allowed.environment_names.iter().cloned().collect(),
-            });
-            write_response(stream, hello)?;
-            let second = match read_client_message(stream, Instant::now() + FRAME_TIMEOUT) {
-                Ok(Some(message)) => message,
-                Ok(None) => return Ok(()),
-                Err(error) => {
-                    return write_response(
-                        stream,
-                        ServerResponse::Error(protocol_error_response(error)),
-                    )
-                }
-            };
-            let response = match second.request {
-                ClientRequest::Exec {
-                    argv,
-                    cwd,
-                    inputs,
-                    environment,
-                } => match prepare_exec(&runtime, peer, argv, cwd, inputs, environment) {
-                    Ok(prepared) => ServerResponse::Prepared(prepared),
-                    Err(error) => ServerResponse::Error(error),
-                },
-                ClientRequest::PrepareIdentity {
-                    cwd,
-                    inputs,
-                    environment,
-                    requested,
-                } => match prepare_identity(&runtime, peer, requested, cwd, inputs, environment) {
-                    Ok(identity) => ServerResponse::Identity(identity),
-                    Err(error) => ServerResponse::Error(error),
-                },
-                _ => ServerResponse::Error(backend_error(
-                    "protocol",
-                    false,
-                    "hello must be followed by exactly one exec or prepare_identity request",
-                )),
-            };
-            write_response(stream, response)
-        }
-        ClientRequest::Exec { .. } | ClientRequest::PrepareIdentity { .. } => write_response(
-            stream,
-            ServerResponse::Error(backend_error(
-                "protocol",
-                false,
-                "execution requests require hello as the first message on this connection",
-            )),
-        ),
-    }
-}
-
-fn read_client_message(
-    stream: &mut UnixStream,
-    deadline: Instant,
-) -> Result<Option<ClientMessage>, ProtocolError> {
-    let message = match crate::protocol::read_message_until(
-        stream,
-        deadline,
-        crate::protocol::MAX_REQUEST_FRAME_BYTES,
-    ) {
-        Ok(message) => message,
-        Err(ProtocolError::Io(error))
-            if matches!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof | io::ErrorKind::TimedOut
-            ) =>
-        {
-            return Ok(None)
-        }
-        Err(error) => return Err(error),
-    };
-    validate_message(&message)?;
-    Ok(Some(message))
-}
-
-fn protocol_error_response(error: ProtocolError) -> BackendError {
-    match error {
-        ProtocolError::UnsupportedVersion(version) => backend_error(
-            "unsupported_version",
-            false,
-            &format!("protocol version {version} is not supported; expected {PROTOCOL_VERSION}"),
-        ),
-        ProtocolError::FrameTooLarge { length, limit } => backend_error(
-            "request_too_large",
-            false,
-            &format!("request frame length {length} exceeds the {limit} byte limit"),
-        ),
-        other => backend_error("protocol", false, &other.to_string()),
-    }
-}
-
-fn authorized_peer(runtime: &BackendRuntime, peer: PeerCredentials) -> bool {
-    authorized_peer_uid(runtime.startup_identity.uid, peer)
-}
-
-fn authorized_peer_uid(startup_uid: u32, peer: PeerCredentials) -> bool {
-    peer.pid > 0 && (peer.uid == 0 || peer.uid == startup_uid)
-}
-
-fn prepare_exec(
-    runtime: &BackendRuntime,
-    peer: PeerCredentials,
-    argv: Vec<String>,
-    cwd: PathBuf,
-    inputs: BTreeMap<String, String>,
-    environment: BTreeMap<String, String>,
-) -> Result<WirePreparedHandoff, BackendError> {
-    if runtime.status().state != BackendState::Ready {
-        return Err(backend_error(
-            "backend_not_ready",
-            true,
-            "backend is not ready to prepare commands",
-        ));
-    }
-    if argv.len() > 256 {
-        return Err(backend_error(
-            "invalid_request",
-            false,
-            "too many argv fields",
-        ));
-    }
-    if inputs
-        .keys()
-        .any(|name| !runtime.allowed.runtime_inputs.contains(name))
-    {
-        return Err(backend_error(
-            "invalid_input",
-            false,
-            "request contains an undeclared or non-runtime input",
-        ));
-    }
-    if environment
-        .keys()
-        .any(|name| !runtime.allowed.environment_names.contains(name))
-    {
-        return Err(backend_error(
-            "invalid_environment",
-            false,
-            "request contains an environment name not used by identity reconciliation",
-        ));
-    }
-    if inputs
-        .values()
-        .chain(environment.values())
-        .any(|value| value.contains('\0'))
-    {
-        return Err(backend_error(
-            "invalid_request",
-            false,
-            "runtime values may not contain NUL bytes",
-        ));
-    }
-    let cwd = accessible_cwd(&cwd, peer).map_err(|_| {
-        backend_error(
-            "permission",
-            false,
-            "request working directory is unavailable to the peer",
-        )
-    })?;
-    validate_inputs(&runtime.request_config, &inputs)?;
-    let mut context = RuntimeContext::new(cwd.clone()).with_environment(environment);
-    for (name, value) in inputs {
-        context = context.with_cli_input(name, value);
-    }
-    let executor = PlanExecutor::with_shared_config(Arc::clone(&runtime.request_config), context)
-        .with_options(runtime.execution_options.clone());
-    let identity = executor
-        .resolve_identity_prevalidated()
-        .map_err(|error| backend_core_error(&error))?;
-    // A request is always a client handoff. The root_service flag belongs to
-    // the initial container-init -> backend/sshd handoff only.
-    let root_service = is_root_service(&runtime.config, &argv, unsafe { libc::geteuid() }, false);
-    if root_service && peer.uid != 0 {
-        return Err(backend_error(
-            "permission",
-            false,
-            "root service handoff requires a root peer",
-        ));
-    }
-    if peer.uid != 0 && (identity.uid != peer.uid || identity.run_as_root) {
-        return Err(backend_error(
-            "permission",
-            false,
-            "non-root peers may only hand off as their own UID",
-        ));
-    }
-    let report = executor
-        .execute_prevalidated(&runtime.request_plan, &[])
-        .map_err(|error| backend_core_error(&error))?;
-    let command = executor
-        .build_handoff_command(&argv)
-        .map_err(|error| backend_core_error(&error))?;
-    if !command.program.is_absolute() || command.args.iter().any(|argument| argument.contains('\0'))
-    {
-        return Err(backend_error(
-            "invalid_snapshot",
-            false,
-            "snapshot produced an invalid handoff command",
-        ));
-    }
-    let supplemental_groups = if root_service {
-        Vec::new()
-    } else {
-        supplementary_groups(&report.identity)
-            .map_err(|_| backend_error("identity", false, "supplementary groups unavailable"))?
-            .into_iter()
-            .collect()
-    };
-    let login_environment = BTreeMap::from([
-        (
-            "HOME".to_owned(),
-            if root_service {
-                "/root".to_owned()
-            } else {
-                report.identity.home.to_string_lossy().into_owned()
-            },
-        ),
-        (
-            "USER".to_owned(),
-            if root_service {
-                "root".to_owned()
-            } else {
-                report.identity.user.clone()
-            },
-        ),
-        (
-            "LOGNAME".to_owned(),
-            if root_service {
-                "root".to_owned()
-            } else {
-                report.identity.user.clone()
-            },
-        ),
-    ]);
-    let receipt_summary = ReceiptSummary {
-        succeeded: report.succeeded(),
-        action_count: report.outcomes.len(),
-        warning_count: report.warnings.len(),
-    };
-    let prepared_identity = report.identity;
-    Ok(WirePreparedHandoff {
-        command: WireHandoffCommand {
-            program: command.program,
-            args: command.args,
-        },
-        cwd,
-        login_environment,
-        identity: to_wire_identity(prepared_identity),
-        supplemental_groups,
-        root_service,
-        receipt_summary,
-    })
-}
-
-fn to_wire_identity(identity: container_init_core::ResolvedIdentity) -> WireResolvedIdentity {
-    WireResolvedIdentity {
-        uid: identity.uid,
-        gid: identity.gid,
-        user: identity.user,
-        home: identity.home,
-        run_as_root: identity.run_as_root,
-        uid_source: to_wire_identity_source(identity.uid_source),
-        gid_source: to_wire_identity_source(identity.gid_source),
-        workspace: match identity.workspace {
-            container_init_core::WorkspaceStatus::Mounted => {
-                container_init_protocol::WorkspaceStatus::Mounted
-            }
-            container_init_core::WorkspaceStatus::NotMounted => {
-                container_init_protocol::WorkspaceStatus::NotMounted
-            }
-            container_init_core::WorkspaceStatus::Unavailable => {
-                container_init_protocol::WorkspaceStatus::Unavailable
-            }
-        },
-    }
-}
-
-fn to_wire_identity_source(
-    source: container_init_core::IdentitySource,
-) -> container_init_protocol::IdentitySource {
-    match source {
-        container_init_core::IdentitySource::RunAsRoot => {
-            container_init_protocol::IdentitySource::RunAsRoot
-        }
-        container_init_core::IdentitySource::ExplicitHost => {
-            container_init_protocol::IdentitySource::ExplicitHost
-        }
-        container_init_core::IdentitySource::ExplicitContainer => {
-            container_init_protocol::IdentitySource::ExplicitContainer
-        }
-        container_init_core::IdentitySource::WorkspaceMount => {
-            container_init_protocol::IdentitySource::WorkspaceMount
-        }
-        container_init_core::IdentitySource::ProfileDefault => {
-            container_init_protocol::IdentitySource::ProfileDefault
-        }
-        container_init_core::IdentitySource::Current => {
-            container_init_protocol::IdentitySource::Current
-        }
-    }
-}
-
-fn prepare_identity(
-    runtime: &BackendRuntime,
-    peer: PeerCredentials,
-    requested: IdentityRequest,
-    cwd: PathBuf,
-    inputs: BTreeMap<String, String>,
-    environment: BTreeMap<String, String>,
-) -> Result<PreparedIdentity, BackendError> {
-    if runtime.status().state != BackendState::Ready {
-        return Err(backend_error(
-            "backend_not_ready",
-            true,
-            "container-init is not ready to prepare an identity",
-        ));
-    }
-    let requested_peer = match &requested {
-        IdentityRequest::Peer { uid, gid } => PeerCredentials {
-            pid: peer.pid,
-            uid: *uid,
-            gid: *gid,
-        },
-        IdentityRequest::Root => PeerCredentials {
-            pid: peer.pid,
-            uid: 0,
-            gid: 0,
-        },
-        IdentityRequest::User { .. } => peer,
-    };
-    if peer.uid != 0 && (requested_peer.uid != peer.uid || requested_peer.gid != peer.gid) {
-        return Err(backend_error(
-            "permission",
-            false,
-            "non-root broker peers may only request their observed identity",
-        ));
-    }
-    if matches!(
-        requested,
-        IdentityRequest::Root | IdentityRequest::User { .. }
-    ) && peer.uid != 0
-    {
-        return Err(backend_error(
-            "permission",
-            false,
-            "only the root backend may request a named or root identity",
-        ));
-    }
-    if peer.uid == 0 {
-        match &requested {
-            IdentityRequest::Peer { uid, gid } if !allowed_peer_identity(runtime, *uid, *gid) => {
-                return Err(backend_error(
-                    "permission",
-                    false,
-                    "root broker peer identity is not allowed by the profile",
-                ));
-            }
-            IdentityRequest::User { name }
-                if name != "root"
-                    && runtime.request_config.identity.default_user.as_deref() != Some(name) =>
-            {
-                return Err(backend_error(
-                    "permission",
-                    false,
-                    "named identity is not allowed by the profile",
-                ));
-            }
-            IdentityRequest::Peer { .. } | IdentityRequest::Root | IdentityRequest::User { .. } => {
-            }
-        }
-    }
-    let cwd = if peer.uid == 0 {
-        fs::canonicalize(&cwd).and_then(|path| {
-            if fs::metadata(&path)?.is_dir() {
-                Ok(path)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cwd is not a directory",
-                ))
-            }
-        })
-    } else {
-        accessible_cwd(&cwd, requested_peer)
-    }
-    .map_err(|_| {
-        backend_error(
-            "permission",
-            false,
-            "identity request working directory is unavailable",
-        )
-    })?;
-    let mut config = (*runtime.request_config).clone();
-    let mut inputs = inputs;
-    let identity_inputs = [
-        config.identity.run_as_root_input.clone(),
-        config.identity.uid_input.clone(),
-        config.identity.gid_input.clone(),
-        config.identity.home_input.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<BTreeSet<_>>();
-    inputs.retain(|name, _| !identity_inputs.contains(name));
-    let mut environment = environment;
-    environment.retain(|name, _| !identity_inputs.contains(name));
-    match requested {
-        IdentityRequest::Peer { uid, gid } => {
-            config.identity.default_user = None;
-            config.identity.default_uid = Some(uid);
-            config.identity.default_gid = Some(gid);
-            config.identity.auto_mapping = false;
-        }
-        IdentityRequest::Root => {
-            if let Some(name) = config.identity.run_as_root_input.clone() {
-                inputs.entry(name).or_insert_with(|| "1".to_owned());
-            } else {
-                config.identity.default_user = Some("root".to_owned());
-                config.identity.default_uid = Some(0);
-                config.identity.default_gid = Some(0);
-                config.identity.auto_mapping = false;
-            }
-        }
-        IdentityRequest::User { name } => {
-            config.identity.default_user = Some(name);
-            config.identity.default_uid = None;
-            config.identity.default_gid = None;
-            config.identity.auto_mapping = false;
-        }
-    }
-    validate_inputs(&config, &inputs)?;
-    let mut context = RuntimeContext::new(cwd).with_environment(environment);
-    for (name, value) in inputs {
-        context = context.with_cli_input(name, value);
-    }
-    let executor = PlanExecutor::with_shared_config(Arc::new(config), context)
-        .with_options(runtime.execution_options.clone());
-    let report = executor
-        .execute_prevalidated(&runtime.request_plan, &[])
-        .map_err(|error| backend_core_error(&error))?;
-    let groups = supplementary_groups(&report.identity)
-        .map_err(|_| backend_error("identity", false, "supplementary groups unavailable"))?;
-    let supplemental_groups = groups
-        .into_iter()
-        .map(u32::try_from)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| backend_error("identity", false, "supplementary group is out of range"))?;
-    Ok(PreparedIdentity {
-        uid: report.identity.uid,
-        gid: report.identity.gid,
-        user: report.identity.user,
-        home: report.identity.home,
-        supplemental_groups,
-        run_as_root: report.identity.run_as_root,
-    })
-}
-
-fn allowed_peer_identity(runtime: &BackendRuntime, uid: u32, gid: u32) -> bool {
-    let startup = &runtime.startup_identity;
-    if uid == startup.uid && gid == startup.gid {
-        return true;
-    }
-    runtime
-        .request_config
-        .identity
-        .default_uid
-        .zip(runtime.request_config.identity.default_gid)
-        .is_some_and(|(default_uid, default_gid)| uid == default_uid && gid == default_gid)
-}
-
-fn set_cloexec(stream: &UnixStream) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let fd = stream.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_inputs(
-    config: &BootstrapConfig,
-    inputs: &BTreeMap<String, String>,
-) -> Result<(), BackendError> {
-    let mut targets = BTreeSet::new();
-    for (name, value) in inputs {
-        let declaration = config
-            .inputs
-            .get(name)
-            .or_else(|| {
-                config
-                    .inputs
-                    .values()
-                    .find(|input| input.aliases.iter().any(|alias| alias == name))
-            })
-            .filter(|input| input.runtime)
-            .ok_or_else(|| {
-                backend_error("invalid_input", false, "runtime input is not declared")
-            })?;
-        if !targets.insert(declaration.target.as_str()) {
-            return Err(backend_error(
-                "invalid_input",
-                false,
-                "request sets an input target more than once",
-            ));
-        }
-        declaration.parse_value(value).map_err(|_| {
-            backend_error("invalid_input", false, "runtime input has an invalid value")
-        })?;
-    }
-    Ok(())
-}
-
-fn accessible_cwd(path: &Path, peer: PeerCredentials) -> io::Result<PathBuf> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cwd must be absolute",
-        ));
-    }
-    let path = fs::canonicalize(path)?;
-    if !fs::metadata(&path)?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cwd is not a directory",
-        ));
-    }
-    if peer.uid == 0 {
-        return Ok(path);
-    }
-    let groups = peer_groups(peer.pid, peer.gid);
-    let mut current = PathBuf::from("/");
-    for component in path.components() {
-        if let Component::Normal(name) = component {
-            current.push(name);
-            let metadata = fs::metadata(&current)?;
-            let mode = metadata.mode();
-            let searchable = if metadata.uid() == peer.uid {
-                mode & 0o100 != 0
-            } else if groups.contains(&metadata.gid()) {
-                mode & 0o010 != 0
-            } else {
-                mode & 0o001 != 0
-            };
-            if !searchable {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "peer cannot traverse cwd path",
-                ));
-            }
-        }
-    }
-    Ok(path)
-}
-
-fn peer_groups(pid: u32, primary_gid: u32) -> BTreeSet<u32> {
-    let mut groups = BTreeSet::from([primary_gid]);
-    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
-        if let Some(line) = status.lines().find(|line| line.starts_with("Groups:")) {
-            groups.extend(
-                line.split_whitespace()
-                    .skip(1)
-                    .filter_map(|group| group.parse::<u32>().ok()),
-            );
-        }
-    }
-    groups
-}
-
-fn plan_page_response(
-    runtime: &BackendRuntime,
-    requested_snapshot: Option<&str>,
-    offset: usize,
-) -> Result<ServerResponse, BackendError> {
-    let actions = runtime.plan.actions();
-    let total_actions = actions.len();
-    if offset > total_actions
-        || (offset == 0
-            && requested_snapshot.is_some_and(|snapshot| snapshot != runtime.snapshot_id))
-        || (offset != 0 && requested_snapshot != Some(runtime.snapshot_id.as_str()))
-    {
-        return Err(backend_error(
-            "invalid_cursor",
-            false,
-            "plan cursor does not match the current backend snapshot",
-        ));
-    }
-    let remaining = total_actions - offset;
-    let max_count = remaining.min(64);
-    if max_count == 0 {
-        return Ok(ServerResponse::PlanPage(PlanPage {
-            online: true,
-            profile: runtime.profile.clone(),
-            snapshot_id: runtime.snapshot_id.clone(),
-            offset,
-            next_offset: None,
-            total_actions,
-            actions: Vec::new(),
-        }));
-    }
-    for count in (1..=max_count).rev() {
-        let page_actions = actions[offset..offset + count]
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| backend_error("internal", false, "could not serialize plan page"))?;
-        let next_offset = (offset + count < total_actions).then_some(offset + count);
-        let page = PlanPage {
-            online: true,
-            profile: runtime.profile.clone(),
-            snapshot_id: runtime.snapshot_id.clone(),
-            offset,
-            next_offset,
-            total_actions,
-            actions: page_actions,
-        };
-        let response = ServerResponse::PlanPage(page);
-        let envelope = ServerMessage {
-            version: PROTOCOL_VERSION,
-            response: response.clone(),
-        };
-        let payload = serde_json::to_vec(&envelope)
-            .map_err(|_| backend_error("internal", false, "could not serialize plan page"))?;
-        if payload.len() <= MAX_RESPONSE_FRAME_BYTES {
-            return Ok(response);
-        }
-    }
-    Err(backend_error(
-        "response_too_large",
-        false,
-        "a single plan action exceeds the response frame limit",
-    ))
-}
-
-fn doctor_response(runtime: &BackendRuntime) -> serde_json::Value {
-    let executable = Path::new(&runtime.config.handoff.runtime);
-    let exists = executable.is_file();
-    let executable_ok = is_executable(executable);
-    serde_json::json!({
-        "online": true,
-        "ok": exists && executable_ok,
-        "profile": runtime.profile,
-        "snapshot_id": runtime.snapshot_id,
-        "backend": runtime.status(),
-        "identity": runtime.startup_identity,
-        "handoff": {
-            "runtime": runtime.config.handoff.runtime,
-            "exists": exists,
-            "executable": executable_ok,
-        },
-    })
-}
-
-fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-fn backend_core_error(error: &CoreError) -> BackendError {
-    BackendError {
-        class: format!("{:?}", error.class()).to_ascii_lowercase(),
-        retryable: false,
-        message: "request identity could not be reconciled".to_owned(),
-        action_id: None,
-        path: None,
-    }
-}
-
-fn backend_error(class: &str, retryable: bool, message: &str) -> BackendError {
-    BackendError {
-        class: class.to_owned(),
-        retryable,
-        message: message.to_owned(),
-        action_id: None,
-        path: None,
-    }
-}
-
-fn write_response(stream: &mut UnixStream, response: ServerResponse) -> io::Result<()> {
-    let message = ServerMessage {
-        version: PROTOCOL_VERSION,
-        response,
-    };
-    match crate::protocol::write_message_until(
-        stream,
-        &message,
-        Instant::now() + FRAME_TIMEOUT,
-        MAX_RESPONSE_FRAME_BYTES,
-    ) {
-        Ok(_) => Ok(()),
-        Err(failure) => match failure.error {
-            ProtocolError::FrameTooLarge { .. } if failure.bytes_written == 0 => {
-                let fallback = ServerMessage {
-                    version: PROTOCOL_VERSION,
-                    response: ServerResponse::Error(backend_error(
-                        "response_too_large",
-                        false,
-                        "backend response exceeded the response frame limit",
-                    )),
-                };
-                crate::protocol::write_message_until(
-                    stream,
-                    &fallback,
-                    Instant::now() + FRAME_TIMEOUT,
-                    MAX_RESPONSE_FRAME_BYTES,
-                )
-                .map(|_| ())
-                .map_err(|error| error.error.as_io_error())
-            }
-            error => Err(error.as_io_error()),
-        },
-    }
-}
-
 fn request_existing_status(path: &Path, timeout: Duration) -> io::Result<BackendStatus> {
-    let started = Instant::now();
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "status deadline is invalid"))?;
     let mut delay = Duration::from_millis(10);
     loop {
-        match crate::BackendClient::new(path, Duration::from_millis(200)).status() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "backend status request exceeded its deadline",
+            ));
+        }
+        match BackendClient::new(path, remaining).status_until(deadline) {
             Ok(status) => return Ok(status),
-            Err(error) if started.elapsed() < timeout => {
+            Err(error) if Instant::now() < deadline => {
                 let _ = error;
-                thread::sleep(delay.min(timeout.saturating_sub(started.elapsed())));
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(delay.min(remaining));
                 delay = delay.saturating_mul(2).min(Duration::from_millis(100));
             }
             Err(error) => {
@@ -1586,13 +261,13 @@ fn request_existing_status(path: &Path, timeout: Duration) -> io::Result<Backend
 
 #[cfg(test)]
 mod tests {
-    use super::authorized_peer_uid;
-    use crate::PeerCredentials;
+    use super::connection::ConnectionService;
+    use container_init_protocol::PeerCredentials;
 
     #[test]
     fn peer_authorization_allows_root_and_startup_uid_only() {
         let startup_uid = 1000;
-        assert!(authorized_peer_uid(
+        assert!(ConnectionService::peer_uid_authorized(
             startup_uid,
             PeerCredentials {
                 pid: 42,
@@ -1600,7 +275,7 @@ mod tests {
                 gid: 0,
             }
         ));
-        assert!(authorized_peer_uid(
+        assert!(ConnectionService::peer_uid_authorized(
             startup_uid,
             PeerCredentials {
                 pid: 43,
@@ -1608,7 +283,7 @@ mod tests {
                 gid: 100,
             }
         ));
-        assert!(!authorized_peer_uid(
+        assert!(!ConnectionService::peer_uid_authorized(
             startup_uid,
             PeerCredentials {
                 pid: 44,
@@ -1616,7 +291,7 @@ mod tests {
                 gid: 100,
             }
         ));
-        assert!(!authorized_peer_uid(
+        assert!(!ConnectionService::peer_uid_authorized(
             startup_uid,
             PeerCredentials {
                 pid: 0,
