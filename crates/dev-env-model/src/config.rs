@@ -423,6 +423,12 @@ impl ProfileSet {
                 location: format!("profile {profile}.extends"),
                 reason: ModelErrorReason::Duplicate,
             },
+            profile_graph::TraverseError::Graph(
+                profile_graph::ProfileGraphError::InheritanceDepthExceeded { limit: _ },
+            ) => ModelError::InvalidValue {
+                location: "profile inheritance".to_owned(),
+                reason: ModelErrorReason::Unsupported,
+            },
         })?;
         Ok(result)
     }

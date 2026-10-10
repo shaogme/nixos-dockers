@@ -1,6 +1,6 @@
 use container_init_bootstrap_model::{
     Action, ActionKind, BootstrapConfig, BootstrapInput, BootstrapMode, BootstrapPolicy,
-    HandoffConfig, IdentityConfig, InputType, NonInteractivePolicy, Origin, RunAs,
+    HandoffConfig, IdentityConfig, InputType, ModelError, NonInteractivePolicy, Origin, RunAs,
     BOOTSTRAP_SCHEMA_V1,
 };
 use serde_json::Value;
@@ -87,6 +87,37 @@ fn flat_dsl_action_model_keeps_provider_concerns_out() {
         .build_plan()
         .expect("model should build a static plan");
     assert_eq!(plan.ids().collect::<Vec<_>>(), vec!["resolve", "workspace"]);
+}
+
+#[test]
+fn handoff_prefixes_and_action_count_obey_resource_budgets() {
+    let mut oversized_prefix = minimal_config(Vec::new());
+    oversized_prefix.handoff.exec_prefix = vec!["x".to_owned(); 65];
+    assert!(matches!(
+        oversized_prefix.validate(),
+        Err(ModelError::Invalid { .. })
+    ));
+
+    let mut oversized_prefix_bytes = minimal_config(Vec::new());
+    oversized_prefix_bytes.handoff.exec_prefix = vec!["x".repeat(64 * 1024); 5];
+    assert!(matches!(
+        oversized_prefix_bytes.validate(),
+        Err(ModelError::Invalid { .. })
+    ));
+
+    let actions = (0..8_193)
+        .map(|index| {
+            Action::new(
+                format!("action-{index}"),
+                ActionKind::FilesystemEnsureDir,
+                Origin::image("fixture"),
+            )
+        })
+        .collect();
+    assert!(matches!(
+        minimal_config(actions).validate(),
+        Err(ModelError::Invalid { .. })
+    ));
 }
 
 #[test]

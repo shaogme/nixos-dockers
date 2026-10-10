@@ -3,9 +3,12 @@ use crate::merge::MergedBootstrap;
 use crate::raw::{parse_profile, validate_profile_id};
 use crate::source::{LoadedBootstrap, LoadedProfile, ProfileSource};
 use container_init_bootstrap_model::SourceKind;
-use profile_graph::{traverse, ProfileGraphError, TraverseError};
+use profile_graph::{traverse_with_max_depth, ProfileGraphError, TraverseError};
 use std::fs;
 use std::path::Path;
+
+const MAX_PROFILE_COLLECTION_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PROFILE_INHERITANCE_DEPTH: usize = 64;
 
 /// In-memory registry and loader for image, admin, and explicitly supplied
 /// overlay profiles.
@@ -25,6 +28,39 @@ impl ProfileLoader {
 
     /// Add a profile, indexing it by the id declared in its document.
     pub fn add_profile(&mut self, profile: ProfileSource) -> Result<(), LoaderError> {
+        if profile.contents.len() > 8 * 1024 * 1024 {
+            return Err(LoaderError::Invalid {
+                location: profile
+                    .location
+                    .clone()
+                    .unwrap_or_else(|| format!("profile {}", profile.id)),
+                message: "profile file exceeds the 8388608 byte limit".to_owned(),
+            });
+        }
+        let existing_bytes = self
+            .profiles
+            .values()
+            .try_fold(0_usize, |total, entry| {
+                total.checked_add(entry.contents.len())
+            })
+            .ok_or_else(|| LoaderError::Invalid {
+                location: "profiles".to_owned(),
+                message: "profile collection byte count overflowed".to_owned(),
+            })?;
+        let collection_bytes = existing_bytes
+            .checked_add(profile.contents.len())
+            .ok_or_else(|| LoaderError::Invalid {
+                location: "profiles".to_owned(),
+                message: "profile collection byte count overflowed".to_owned(),
+            })?;
+        if collection_bytes > MAX_PROFILE_COLLECTION_BYTES {
+            return Err(LoaderError::Invalid {
+                location: "profiles".to_owned(),
+                message: format!(
+                    "profile collection is {collection_bytes} bytes; maximum is {MAX_PROFILE_COLLECTION_BYTES} bytes"
+                ),
+            });
+        }
         validate_profile_id(&profile.id)?;
         let parsed = parse_profile(
             &profile.contents,
@@ -109,8 +145,9 @@ impl ProfileLoader {
         let mut chain = Vec::new();
         let mut merged = MergedBootstrap::default();
         let profiles = &self.profiles;
-        traverse(
+        traverse_with_max_depth(
             profile_id,
+            MAX_PROFILE_INHERITANCE_DEPTH,
             |id| {
                 let Some(profile) = profiles.get(id) else {
                     return Ok(None);
@@ -174,6 +211,12 @@ fn map_graph_error(error: TraverseError<LoaderError>) -> LoaderError {
             LoaderError::Invalid {
                 location: format!("profile {profile}.extends"),
                 message: format!("parent profile {parent:?} is listed more than once"),
+            }
+        }
+        TraverseError::Graph(ProfileGraphError::InheritanceDepthExceeded { limit }) => {
+            LoaderError::Invalid {
+                location: "profile inheritance".to_owned(),
+                message: format!("inheritance exceeds the maximum depth of {limit}"),
             }
         }
     }

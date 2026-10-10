@@ -3,7 +3,7 @@ use crate::raw::{OverrideCatalog, RawBootstrap, RawProfile};
 use crate::source::{LoadedProfile, ProfileSource};
 use container_init_bootstrap_model::{
     Action, BootstrapConfig, BootstrapMode, BootstrapPolicy, HandoffConfig, IdentityConfig,
-    NonInteractivePolicy, Origin, SourceKind,
+    ModelError, NonInteractivePolicy, Origin, SourceKind, MAX_BOOTSTRAP_ACTIONS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -314,6 +314,14 @@ impl MergedBootstrap {
             action.origin =
                 profile_origin(profile_info, source, &format!("bootstrap.actions[{index}]"));
             let Some(existing_index) = self.action_indexes.get(&action.id).copied() else {
+                if self.actions.len() >= MAX_BOOTSTRAP_ACTIONS {
+                    return Err(LoaderError::Model(ModelError::Invalid {
+                        location: "bootstrap.actions".to_owned(),
+                        message: format!(
+                            "merged profile graph exceeds the {MAX_BOOTSTRAP_ACTIONS} action limit"
+                        ),
+                    }));
+                }
                 self.action_indexes
                     .insert(action.id.clone(), self.actions.len());
                 self.actions.push(action);

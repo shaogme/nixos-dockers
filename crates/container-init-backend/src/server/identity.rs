@@ -361,6 +361,12 @@ fn peer_groups(pid: u32, effective_gid: u32) -> io::Result<Vec<u32>> {
         groups.insert(value.parse::<u32>().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "peer Groups field is malformed")
         })?);
+        if groups.len() > container_init_protocol::max_supplementary_groups() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer supplementary groups exceed the platform limit",
+            ));
+        }
     }
     Ok(groups.into_iter().collect())
 }
@@ -368,7 +374,13 @@ fn peer_groups(pid: u32, effective_gid: u32) -> io::Result<Vec<u32>> {
 fn supplementary_groups(identity: &ResolvedIdentity) -> io::Result<Vec<gid_t>> {
     let username = CString::new(identity.user.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "user name contains NUL"))?;
-    let mut count = 16_i32;
+    let group_limit = container_init_protocol::max_supplementary_groups();
+    let mut count = i32::try_from(group_limit.min(16)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "platform group limit is invalid",
+        )
+    })?;
     loop {
         let mut groups = vec![identity.gid as gid_t; count as usize];
         let result = unsafe {
@@ -387,9 +399,15 @@ fn supplementary_groups(identity: &ResolvedIdentity) -> io::Result<Vec<gid_t>> {
                 groups.push(identity.gid as gid_t);
             }
             groups.sort_unstable();
+            if groups.len() > group_limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "supplementary group list exceeds the platform limit",
+                ));
+            }
             return Ok(groups);
         }
-        if count <= 0 || count > 4096 {
+        if count <= 0 || count as usize > group_limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "supplementary group list is invalid or too large",

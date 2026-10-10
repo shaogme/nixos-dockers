@@ -21,7 +21,8 @@ pub use action::{Action, ActionKind, FailurePolicy, Idempotency, RunAs, Sensitiv
 pub use condition::{Condition, ConditionValue};
 pub use config::{
     BootstrapConfig, BootstrapMode, BootstrapPolicy, HandoffConfig, IdentityConfig,
-    NonInteractivePolicy,
+    NonInteractivePolicy, MAX_BOOTSTRAP_ACTIONS, MAX_HANDOFF_PREFIX_ITEMS,
+    MAX_HANDOFF_PREFIX_ITEM_BYTES, MAX_HANDOFF_PREFIX_TOTAL_BYTES,
 };
 pub use error::ModelError;
 pub use input::{BootstrapInput, InputNamespace, InputType, InputValue, ParsedInput};

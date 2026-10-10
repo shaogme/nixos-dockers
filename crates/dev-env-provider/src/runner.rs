@@ -113,6 +113,16 @@ pub struct ProviderRunner {
     max_stderr_bytes: usize,
 }
 
+struct CommandExecution<'a> {
+    provider: &'a str,
+    operation: &'a str,
+    executable: &'a std::path::Path,
+    args: Vec<String>,
+    context: &'a ProviderContext,
+    timeout_ms: Option<u64>,
+    identity: Option<&'a dev_env_model::EffectiveIdentity>,
+}
+
 impl Default for ProviderRunner {
     fn default() -> Self {
         Self {
@@ -244,15 +254,15 @@ impl ProviderRunner {
         for (index, step) in runnable_steps {
             let operation = format!("prepare[{index}]");
             let args = self.expand_args(provider_id, &operation, &step.argv, &provider_context)?;
-            let result = self.execute(
-                provider_id,
-                &operation,
+            let result = self.execute(CommandExecution {
+                provider: provider_id,
+                operation: &operation,
                 executable,
                 args,
-                &provider_context,
-                step.timeout_ms,
+                context: &provider_context,
+                timeout_ms: step.timeout_ms,
                 identity,
-            );
+            });
             match result {
                 Ok(output) if output.succeeded() => prepared_steps += 1,
                 Ok(output) => {
@@ -280,15 +290,15 @@ impl ProviderRunner {
             let operation = "shellenv".to_owned();
             let args =
                 self.expand_args(provider_id, &operation, &shellenv.argv, &provider_context)?;
-            let result = self.execute(
-                provider_id,
-                &operation,
+            let result = self.execute(CommandExecution {
+                provider: provider_id,
+                operation: &operation,
                 executable,
                 args,
-                &provider_context,
-                shellenv.timeout_ms,
+                context: &provider_context,
+                timeout_ms: shellenv.timeout_ms,
                 identity,
-            );
+            });
             match result {
                 Ok(output) if output.succeeded() => {
                     let text = String::from_utf8(output.stdout).map_err(|source| {
@@ -394,18 +404,15 @@ impl ProviderRunner {
 
     fn execute(
         &self,
-        provider: &str,
-        operation: &str,
-        executable: &std::path::Path,
-        args: Vec<String>,
-        context: &ProviderContext,
-        timeout_ms: Option<u64>,
-        identity: Option<&dev_env_model::EffectiveIdentity>,
+        execution: CommandExecution<'_>,
     ) -> Result<CommandOutput, ProviderRuntimeError> {
-        let mut request = CommandRequest::new(executable.display().to_string(), &context.cwd);
-        request.args = args;
-        request.environment = context.environment.clone();
-        if let Some(identity) = identity {
+        let mut request = CommandRequest::new(
+            execution.executable.display().to_string(),
+            &execution.context.cwd,
+        );
+        request.args = execution.args;
+        request.environment = execution.context.environment.clone();
+        if let Some(identity) = execution.identity {
             request.environment.insert(
                 "HOME".to_owned(),
                 identity.home.to_string_lossy().into_owned(),
@@ -418,17 +425,18 @@ impl ProviderRunner {
                 .insert("LOGNAME".to_owned(), identity.user.clone());
         }
         request.timeout = Some(
-            timeout_ms
+            execution
+                .timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(self.command_timeout),
         );
         request.max_stdout_bytes = self.max_stdout_bytes;
         request.max_stderr_bytes = self.max_stderr_bytes;
         self.executor
-            .execute_with_identity(&request, identity)
+            .execute_with_identity(&request, execution.identity)
             .map_err(|source| ProviderRuntimeError::Command {
-                provider: provider.to_owned(),
-                operation: operation.to_owned(),
+                provider: execution.provider.to_owned(),
+                operation: execution.operation.to_owned(),
                 source,
             })
     }

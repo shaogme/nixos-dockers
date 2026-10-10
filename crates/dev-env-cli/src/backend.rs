@@ -549,7 +549,7 @@ fn handle_prepare(
     };
     BackendResponseMessage::new(
         &request.request_id,
-        BackendResponse::Prepared(PreparedResponse {
+        BackendResponse::Prepared(Box::new(PreparedResponse {
             generation: snapshot.generation,
             config_fingerprint: snapshot.config_fingerprint,
             cwd,
@@ -560,7 +560,7 @@ fn handle_prepare(
             diagnostics,
             cache_hit: materialization.cache_hit,
             receipt_summary,
-        }),
+        })),
     )
 }
 
@@ -701,7 +701,7 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         true,
     );
     let prepared = match response.response {
-        BackendResponse::Prepared(prepared) => prepared,
+        BackendResponse::Prepared(prepared) => *prepared,
         BackendResponse::Error(error) => {
             runtime.fail(format!(
                 "initial runtime preparation failed: {}: {}",
@@ -861,7 +861,7 @@ pub(crate) fn prepare(
                 .materialized_environment
                 .validate()
                 .map_err(|error| CliError::Backend(error.to_string()))?;
-            Ok(prepared)
+            Ok(*prepared)
         }
         BackendResponse::Error(error) => Err(CliError::Backend(format!(
             "{}: {}",

@@ -17,6 +17,7 @@ use std::{
         Arc, Mutex, MutexGuard, PoisonError, RwLock,
     },
 };
+use unix_frame::FrameBudget;
 
 pub(super) struct BackendRuntimeOptions {
     pub(super) profile: String,
@@ -44,6 +45,7 @@ pub(super) struct BackendRuntime {
     execution_options: ExecutionOptions,
     status: RwLock<BackendStatus>,
     active_connections: Arc<AtomicUsize>,
+    frame_budget: FrameBudget,
 }
 
 pub(super) struct AllowedClientValues {
@@ -66,6 +68,7 @@ impl BackendRuntime {
             execution_options: options.execution_options,
             status: RwLock::new(options.status),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            frame_budget: FrameBudget::new(container_init_protocol::MAX_IN_FLIGHT_FRAME_BYTES),
         }
     }
 
@@ -129,6 +132,10 @@ impl BackendRuntime {
 
     pub(super) fn active_connections(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.active_connections)
+    }
+
+    pub(super) fn frame_budget(&self) -> &FrameBudget {
+        &self.frame_budget
     }
 
     pub(super) fn transactions(&self) -> MutexGuard<'_, HashMap<String, ExecTransaction>> {

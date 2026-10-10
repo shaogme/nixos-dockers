@@ -23,7 +23,8 @@ use std::{
     time::Duration,
 };
 
-const DEFAULT_BACKEND_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_BACKEND_TIMEOUT: Duration =
+    Duration::from_millis(container_init_protocol::FRAME_TIMEOUT_MS);
 
 pub fn run<I>(arguments: I) -> Result<i32, CliError>
 where

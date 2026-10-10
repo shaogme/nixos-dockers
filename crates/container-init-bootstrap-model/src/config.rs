@@ -10,6 +10,11 @@ use crate::validation::{
     validate_user_name,
 };
 
+pub const MAX_HANDOFF_PREFIX_ITEMS: usize = 64;
+pub const MAX_HANDOFF_PREFIX_ITEM_BYTES: usize = 64 * 1024;
+pub const MAX_HANDOFF_PREFIX_TOTAL_BYTES: usize = 256 * 1024;
+pub const MAX_BOOTSTRAP_ACTIONS: usize = 8_192;
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapMode {
@@ -42,6 +47,15 @@ pub struct BootstrapConfig {
 impl BootstrapConfig {
     /// Validate the model without performing any side effects.
     pub fn validate(&self) -> Result<(), ModelError> {
+        if self.actions.len() > MAX_BOOTSTRAP_ACTIONS {
+            return Err(ModelError::Invalid {
+                location: "bootstrap.actions".to_owned(),
+                message: format!(
+                    "contains {} actions; maximum is {MAX_BOOTSTRAP_ACTIONS}",
+                    self.actions.len()
+                ),
+            });
+        }
         if self.schema != crate::BOOTSTRAP_SCHEMA_V1 {
             return Err(ModelError::Invalid {
                 location: "bootstrap.schema".to_owned(),
@@ -353,15 +367,9 @@ pub struct HandoffConfig {
 impl HandoffConfig {
     fn validate(&self) -> Result<(), ModelError> {
         validate_executable("bootstrap.handoff.runtime", &self.runtime)?;
-        for (index, arg) in self
-            .exec_prefix
-            .iter()
-            .chain(self.initial_exec_prefix.iter())
-            .chain(self.shell_prefix.iter())
-            .enumerate()
-        {
-            validate_argv_value(&format!("bootstrap.handoff.argv[{index}]"), arg)?;
-        }
+        validate_handoff_prefix("exec_prefix", &self.exec_prefix)?;
+        validate_handoff_prefix("initial_exec_prefix", &self.initial_exec_prefix)?;
+        validate_handoff_prefix("shell_prefix", &self.shell_prefix)?;
         if let Some(path) = &self.ssh_daemon {
             validate_executable("bootstrap.handoff.ssh_daemon", path)?;
         }
@@ -370,6 +378,50 @@ impl HandoffConfig {
         }
         Ok(())
     }
+}
+
+fn validate_handoff_prefix(field: &str, prefix: &[String]) -> Result<(), ModelError> {
+    let location = format!("bootstrap.handoff.{field}");
+    if prefix.len() > MAX_HANDOFF_PREFIX_ITEMS {
+        return Err(ModelError::Invalid {
+            location,
+            message: format!(
+                "contains {} arguments; maximum is {MAX_HANDOFF_PREFIX_ITEMS}",
+                prefix.len()
+            ),
+        });
+    }
+    let mut total_bytes = 0_usize;
+    for (index, argument) in prefix.iter().enumerate() {
+        validate_argv_value(&format!("bootstrap.handoff.{field}[{index}]"), argument)?;
+        if argument.len() > MAX_HANDOFF_PREFIX_ITEM_BYTES {
+            return Err(ModelError::Invalid {
+                location: format!("bootstrap.handoff.{field}[{index}]"),
+                message: format!(
+                    "is {} bytes; maximum is {MAX_HANDOFF_PREFIX_ITEM_BYTES} bytes",
+                    argument.len()
+                ),
+            });
+        }
+        total_bytes =
+            total_bytes
+                .checked_add(argument.len())
+                .ok_or_else(|| ModelError::Invalid {
+                    location: location.clone(),
+                    message: format!(
+                        "total argument bytes exceed {MAX_HANDOFF_PREFIX_TOTAL_BYTES}"
+                    ),
+                })?;
+    }
+    if total_bytes > MAX_HANDOFF_PREFIX_TOTAL_BYTES {
+        return Err(ModelError::Invalid {
+            location,
+            message: format!(
+                "contains {total_bytes} argument bytes; maximum is {MAX_HANDOFF_PREFIX_TOTAL_BYTES} bytes"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]

@@ -476,3 +476,44 @@ run_as = "root"
         Some(&["io".to_string()][..])
     );
 }
+
+#[test]
+fn inherited_profile_depth_is_capped_at_64() {
+    let mut loader = base_loader();
+    let mut parent = "base".to_owned();
+    for index in 1..=64 {
+        let id = format!("level-{index}");
+        loader
+            .add_str(
+                id.clone(),
+                SourceKind::ImageProfile,
+                format!("schema = 1\nid = \"{id}\"\nextends = [\"{parent}\"]\n"),
+            )
+            .unwrap();
+        parent = id;
+    }
+    assert!(matches!(
+        loader.load(&parent),
+        Err(LoaderError::Invalid { message, .. }) if message.contains("maximum depth of 64")
+    ));
+}
+
+#[test]
+fn profile_file_reader_rejects_more_than_8_mib_before_parsing() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "container-init-bootstrap-loader-size-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("oversized.toml");
+    fs::write(&path, "x".repeat(8 * 1024 * 1024 + 1)).unwrap();
+    assert!(matches!(
+        ProfileSource::from_file(&path, SourceKind::ImageProfile),
+        Err(LoaderError::Invalid { message, .. }) if message.contains("8388608 byte limit")
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}

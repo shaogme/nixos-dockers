@@ -70,7 +70,7 @@ pub type BackendResponseEnvelope = BackendResponseMessage;
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackendResponse {
     Hello(HelloInfo),
-    Prepared(PreparedResponse),
+    Prepared(Box<PreparedResponse>),
     Status(BackendStatus),
     Plan(serde_json::Value),
     Explain(serde_json::Value),

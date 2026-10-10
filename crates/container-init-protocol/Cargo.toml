@@ -3,10 +3,11 @@ name = "container-init-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Wire DTOs and client operations for the container-init v2 protocol"
+description = "Wire DTOs and client operations for the container-init v4 protocol"
 license.workspace = true
 
 [dependencies]
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 unix-frame = { workspace = true }

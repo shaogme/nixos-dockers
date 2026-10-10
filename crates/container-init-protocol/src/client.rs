@@ -209,6 +209,7 @@ mod tests {
                         snapshot_id: "snapshot".to_owned(),
                         runtime_inputs: vec!["HOST_UID".to_owned()],
                         environment_names: vec!["HOME".to_owned()],
+                        limits: crate::ProtocolLimits::current(),
                     }),
                 },
             )

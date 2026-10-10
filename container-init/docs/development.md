@@ -116,7 +116,7 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 
 ### Backend
 
-- v3 长度前缀消息、无 request id、帧大小/版本/截断校验，Prepare/Commit/Abort/结果查询状态机，以及一个绝对 deadline 下的连接、读写、退避和 Preflight 等待；
+- v4 长度前缀消息、无 request id、能力摘要、统一字节上限、frame in-flight 预算与截断校验，Prepare/Commit/Abort/结果查询状态机，以及一个绝对 deadline 下的连接、读写、退避和 Preflight 等待；
 - Prepare 无 reconcile 副作用、事务 UID/GID/snapshot 绑定、重复 Commit 幂等、Abort/TTL 和提交结果不确定时的原 token 查询；
 - Linux 容器 fixture 覆盖目标凭据下的 ACL `chdir`、具名补充组授权、非 root 完整凭据匹配，以及 Preflight 失败不 Commit；单元测试覆盖 cwd 设备号/inode 替换比较和 handoff 子进程信号转发；
 - plan 分页游标与 snapshot 一致性校验；执行帧可能已发送时不重试，并报告结果未知；

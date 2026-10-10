@@ -1,7 +1,7 @@
 use super::runtime::{BackendRuntime, RuntimeErrors};
 use container_init_protocol::{
-    BackendError, PlanPage, ServerMessage, ServerResponse, MAX_RESPONSE_FRAME_BYTES,
-    PROTOCOL_VERSION,
+    BackendError, PlanPage, ServerMessage, ServerResponse, MAX_PLAN_PAGE_ACTIONS,
+    MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::{json, to_value, to_vec, Value};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
@@ -41,7 +41,7 @@ fn plan_page_response(
         ));
     }
     let remaining = total_actions - offset;
-    let max_count = remaining.min(64);
+    let max_count = remaining.min(MAX_PLAN_PAGE_ACTIONS);
     if max_count == 0 {
         return Ok(ServerResponse::PlanPage(PlanPage {
             online: true,
@@ -83,10 +83,15 @@ fn plan_page_response(
             return Ok(response);
         }
     }
+    let action = &actions[offset];
+    let action_bytes = to_vec(action).map_or(0, |bytes| bytes.len());
     Err(RuntimeErrors::backend(
         "response_too_large",
         false,
-        "a single plan action exceeds the response frame limit",
+        &format!(
+            "plan action {:?} serializes to {action_bytes} bytes and exceeds the {MAX_RESPONSE_FRAME_BYTES} byte response frame limit",
+            action.id
+        ),
     ))
 }
 

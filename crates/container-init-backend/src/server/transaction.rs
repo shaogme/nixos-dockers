@@ -7,7 +7,7 @@ use container_init_core::{PlanExecutor, ResolvedIdentity, RuntimeContext};
 use container_init_protocol::{
     BackendError, BackendState, CommitResult as WireCommitResult, ExecTransactionState,
     HandoffCommand as WireHandoffCommand, PeerCredentials, PreparedHandoff as WirePreparedHandoff,
-    ReceiptSummary, ServerResponse,
+    ProtocolError, ReceiptSummary, ServerResponse,
 };
 use libc::geteuid;
 use std::{
@@ -111,13 +111,6 @@ fn prepare_exec(
             "backend is not ready to prepare commands",
         ));
     }
-    if argv.len() > 256 {
-        return Err(RuntimeErrors::backend(
-            "invalid_request",
-            false,
-            "too many argv fields",
-        ));
-    }
     if inputs
         .keys()
         .any(|name| !runtime.allows_runtime_input(name))
@@ -219,6 +212,12 @@ fn prepare_exec(
     let command = executor
         .build_handoff_command(&argv)
         .map_err(|error| RuntimeErrors::core(&error))?;
+    let mut complete_argv = Vec::with_capacity(command.args.len() + 1);
+    complete_argv.push(command.program.to_string_lossy().into_owned());
+    complete_argv.extend(command.args.iter().cloned());
+    if let Err(error) = container_init_protocol::validate_argv(&complete_argv) {
+        return Err(handoff_argv_error(error));
+    }
     if !command.program.is_absolute() || command.args.iter().any(|argument| argument.contains('\0'))
     {
         return Err(RuntimeErrors::backend(
@@ -317,6 +316,22 @@ fn prepare_exec(
         supplemental_groups,
         root_service,
     })
+}
+
+fn handoff_argv_error(error: ProtocolError) -> BackendError {
+    match error {
+        ProtocolError::LimitExceeded {
+            class,
+            field,
+            observed,
+            limit,
+        } => RuntimeErrors::backend(
+            class,
+            false,
+            &format!("final handoff {field} is {observed}; maximum is {limit}"),
+        ),
+        other => RuntimeErrors::backend("invalid_snapshot", false, &other.to_string()),
+    }
 }
 
 fn transaction_is_active(transaction: &ExecTransaction) -> bool {

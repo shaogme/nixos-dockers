@@ -271,7 +271,11 @@ fn supervise(
                         } else if pending.len() < MAX_PENDING_CONNECTIONS {
                             pending.push_back(connection);
                         } else {
-                            reject_busy(connection, "backend connection queue is full");
+                            reject_busy(
+                                connection,
+                                "backend connection queue is full",
+                                runtime.frame_budget(),
+                            );
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -357,16 +361,18 @@ fn spawn_reserved_connection_worker(
                         true,
                         "backend could not create a request worker; request was not dispatched",
                     )),
+                    runtime.frame_budget(),
                 );
             }
         }
     }
 }
 
-fn reject_busy(mut connection: PendingConnection, message: &str) {
+fn reject_busy(mut connection: PendingConnection, message: &str, budget: &unix_frame::FrameBudget) {
     let _ = ConnectionService::write_response(
         &mut connection.stream,
         ServerResponse::Error(RuntimeErrors::backend("capacity", true, message)),
+        budget,
     );
 }
 

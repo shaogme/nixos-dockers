@@ -11,6 +11,7 @@ use std::fmt;
 pub enum ProfileGraphError {
     InvalidId(String),
     DuplicateParent { profile: String, parent: String },
+    InheritanceDepthExceeded { limit: usize },
     MissingProfile(String),
     MissingParent { profile: String, parent: String },
     Cycle(Vec<String>),
@@ -23,6 +24,10 @@ impl fmt::Display for ProfileGraphError {
             Self::DuplicateParent { profile, parent } => write!(
                 formatter,
                 "parent profile {parent:?} is listed more than once in profile {profile:?}"
+            ),
+            Self::InheritanceDepthExceeded { limit } => write!(
+                formatter,
+                "profile inheritance exceeds the maximum depth of {limit}"
             ),
             Self::MissingProfile(id) => write!(formatter, "missing parent profile {id:?}"),
             Self::MissingParent { profile, parent } => {
@@ -116,6 +121,15 @@ impl<E> From<TraverseError<E>> for ResolveError<E> {
 /// loader merge and diagnostic order.
 pub fn traverse<T, E>(
     root: &str,
+    load: impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, E>,
+    apply: impl FnMut(&str, T) -> Result<(), E>,
+) -> Result<(), TraverseError<E>> {
+    traverse_with_max_depth(root, usize::MAX, load, apply)
+}
+
+pub fn traverse_with_max_depth<T, E>(
+    root: &str,
+    max_depth: usize,
     mut load: impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, E>,
     mut apply: impl FnMut(&str, T) -> Result<(), E>,
 ) -> Result<(), TraverseError<E>> {
@@ -125,6 +139,7 @@ pub fn traverse<T, E>(
         root,
         &mut load,
         &mut apply,
+        max_depth,
         None,
         &mut visiting,
         &mut visited,
@@ -141,17 +156,23 @@ fn visit<T, E>(
     id: &str,
     load: &mut impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, E>,
     apply: &mut impl FnMut(&str, T) -> Result<(), E>,
+    max_depth: usize,
     parent: Option<&str>,
     visiting: &mut Vec<String>,
     visited: &mut BTreeSet<String>,
 ) -> Result<(), TraverseError<E>> {
-    if visited.contains(id) {
-        return Ok(());
-    }
     if let Some(index) = visiting.iter().position(|current| current == id) {
         let mut cycle = visiting[index..].to_vec();
         cycle.push(id.to_owned());
         return Err(TraverseError::Graph(ProfileGraphError::Cycle(cycle)));
+    }
+    if visiting.len() >= max_depth {
+        return Err(TraverseError::Graph(
+            ProfileGraphError::InheritanceDepthExceeded { limit: max_depth },
+        ));
+    }
+    if visited.contains(id) {
+        return Ok(());
     }
 
     let node = load(id).map_err(TraverseError::Source)?;
@@ -169,7 +190,7 @@ fn visit<T, E>(
 
     visiting.push(id.to_owned());
     for parent in &parents {
-        visit(parent, load, apply, Some(id), visiting, visited)?;
+        visit(parent, load, apply, max_depth, Some(id), visiting, visited)?;
     }
     visiting.pop();
     visited.insert(id.to_owned());
@@ -180,7 +201,8 @@ fn visit<T, E>(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_order, validate_extends, validate_profile_id, ProfileGraphError, ResolveError,
+        resolve_order, traverse_with_max_depth, validate_extends, validate_profile_id,
+        ProfileGraphError, ResolveError, TraverseError,
     };
     use std::collections::BTreeMap;
 
@@ -224,6 +246,27 @@ mod tests {
         assert!(matches!(
             resolve_order("a", |id| Ok::<_, ()>(cycle.get(id).cloned())),
             Err(ResolveError::Graph(ProfileGraphError::Cycle(path))) if path == ["a", "b", "a"]
+        ));
+    }
+
+    #[test]
+    fn bounded_traversal_rejects_an_inheritance_chain_past_its_limit() {
+        let graph = BTreeMap::from([
+            ("root", vec!["middle".to_owned()]),
+            ("middle", vec!["base".to_owned()]),
+            ("base", vec![]),
+        ]);
+        let result = traverse_with_max_depth(
+            "root",
+            2,
+            |id| Ok::<_, ()>(graph.get(id).map(|parents| ((), parents.clone()))),
+            |_, ()| Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(TraverseError::Graph(
+                ProfileGraphError::InheritanceDepthExceeded { limit: 2 }
+            ))
         ));
     }
 }

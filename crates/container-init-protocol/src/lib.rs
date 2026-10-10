@@ -4,14 +4,75 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Instant;
+use unix_frame::FrameBudget;
+
+pub use unix_frame::FramePermit;
 
 mod client;
 
 pub use client::{IdentityBrokerClient, IdentityBrokerError};
 
-pub const PROTOCOL_VERSION: u16 = 3;
-pub const MAX_REQUEST_FRAME_BYTES: usize = 1024 * 1024;
-pub const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
+pub const PROTOCOL_VERSION: u16 = 4;
+pub const MAX_REQUEST_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RESPONSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ARGV_ITEMS: usize = 512;
+pub const MAX_ARGV_ITEM_BYTES: usize = 64 * 1024;
+pub const MAX_ARGV_TOTAL_BYTES: usize = 1024 * 1024;
+pub const MAX_RUNTIME_INPUTS: usize = 128;
+pub const MAX_ENVIRONMENT_NAMES: usize = 512;
+pub const MAX_RUNTIME_VALUE_BYTES: usize = 64 * 1024;
+pub const MAX_RUNTIME_VALUES_TOTAL_BYTES: usize = 512 * 1024;
+pub const MAX_CWD_BYTES: usize = 4 * 1024;
+pub const MAX_PLAN_PAGE_ACTIONS: usize = 256;
+pub const FRAME_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_IN_FLIGHT_FRAME_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolLimits {
+    pub request_frame_bytes: usize,
+    pub response_frame_bytes: usize,
+    pub argv_items: usize,
+    pub argv_item_bytes: usize,
+    pub argv_total_bytes: usize,
+    pub runtime_inputs: usize,
+    pub environment_names: usize,
+    pub runtime_value_bytes: usize,
+    pub runtime_values_total_bytes: usize,
+    pub cwd_bytes: usize,
+    pub plan_page_actions: usize,
+    pub supplementary_groups: usize,
+    pub frame_timeout_ms: u64,
+}
+
+impl ProtocolLimits {
+    pub fn current() -> Self {
+        Self {
+            request_frame_bytes: MAX_REQUEST_FRAME_BYTES,
+            response_frame_bytes: MAX_RESPONSE_FRAME_BYTES,
+            argv_items: MAX_ARGV_ITEMS,
+            argv_item_bytes: MAX_ARGV_ITEM_BYTES,
+            argv_total_bytes: MAX_ARGV_TOTAL_BYTES,
+            runtime_inputs: MAX_RUNTIME_INPUTS,
+            environment_names: MAX_ENVIRONMENT_NAMES,
+            runtime_value_bytes: MAX_RUNTIME_VALUE_BYTES,
+            runtime_values_total_bytes: MAX_RUNTIME_VALUES_TOTAL_BYTES,
+            cwd_bytes: MAX_CWD_BYTES,
+            plan_page_actions: MAX_PLAN_PAGE_ACTIONS,
+            supplementary_groups: max_supplementary_groups(),
+            frame_timeout_ms: FRAME_TIMEOUT_MS,
+        }
+    }
+}
+
+pub fn max_supplementary_groups() -> usize {
+    let platform_limit = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+    if platform_limit > 0 {
+        (platform_limit as usize).min(65_536)
+    } else {
+        65_536
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,17 +131,6 @@ pub struct ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientRequest {
     Hello,
-    /// Parsed only so a v3 server can return an explicit unsupported-version
-    /// error for the retired v2 operation. This request is never accepted.
-    #[serde(rename = "exec")]
-    UnsupportedV2Exec {
-        argv: Vec<String>,
-        cwd: PathBuf,
-        #[serde(default)]
-        inputs: BTreeMap<String, String>,
-        #[serde(default)]
-        environment: BTreeMap<String, String>,
-    },
     PrepareExec {
         argv: Vec<String>,
         cwd: PathBuf,
@@ -181,6 +231,7 @@ pub struct HelloInfo {
     pub snapshot_id: String,
     pub runtime_inputs: Vec<String>,
     pub environment_names: Vec<String>,
+    pub limits: ProtocolLimits,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -269,7 +320,17 @@ pub enum ProtocolError {
     Io(io::Error),
     InvalidFrame(String),
     UnsupportedVersion(u16),
-    FrameTooLarge { length: usize, limit: usize },
+    FrameTooLarge {
+        length: usize,
+        limit: usize,
+    },
+    LimitExceeded {
+        class: &'static str,
+        field: String,
+        observed: usize,
+        limit: usize,
+    },
+    IncompatibleLimits,
 }
 
 impl ProtocolError {
@@ -291,6 +352,19 @@ impl ProtocolError {
                 io::ErrorKind::InvalidData,
                 format!("frame length {length} exceeds the {limit} byte limit"),
             ),
+            Self::LimitExceeded {
+                class,
+                field,
+                observed,
+                limit,
+            } => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{class}: {field} is {observed}; maximum is {limit}"),
+            ),
+            Self::IncompatibleLimits => io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backend protocol limits are incompatible with this client build",
+            ),
         }
     }
 }
@@ -309,6 +383,17 @@ impl std::fmt::Display for ProtocolError {
                     "frame length {length} exceeds the {limit} byte limit"
                 )
             }
+            Self::LimitExceeded {
+                class,
+                field,
+                observed,
+                limit,
+            } => write!(
+                formatter,
+                "{class}: {field} is {observed}; maximum is {limit}"
+            ),
+            Self::IncompatibleLimits => formatter
+                .write_str("backend protocol limits are incompatible with this client build"),
         }
     }
 }
@@ -355,6 +440,16 @@ pub fn read_message_until<T: for<'de> Deserialize<'de>>(
     unix_frame::read_json_frame_until(stream, deadline, limit).map_err(map_frame_error)
 }
 
+pub fn read_message_until_with_budget<T: for<'de> Deserialize<'de>>(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    limit: usize,
+    budget: &FrameBudget,
+) -> Result<(T, FramePermit), ProtocolError> {
+    unix_frame::read_json_frame_until_with_budget(stream, deadline, limit, budget)
+        .map_err(map_frame_error)
+}
+
 pub fn write_message<T: Serialize>(
     writer: &mut impl Write,
     message: &T,
@@ -374,6 +469,20 @@ pub fn write_message_until<T: Serialize>(
             bytes_written: error.bytes_written,
         }
     })
+}
+
+pub fn write_message_until_with_budget<T: Serialize>(
+    stream: &mut UnixStream,
+    message: &T,
+    deadline: Instant,
+    limit: usize,
+    budget: &FrameBudget,
+) -> Result<usize, FrameWriteError> {
+    unix_frame::write_json_frame_until_with_budget(stream, message, deadline, limit, budget)
+        .map_err(|error| FrameWriteError {
+            error: map_frame_error(error.error),
+            bytes_written: error.bytes_written,
+        })
 }
 
 fn map_frame_error(error: unix_frame::FrameError) -> ProtocolError {
@@ -445,9 +554,13 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
         _ => (None, None, &BTreeMap::new(), &BTreeMap::new()),
     };
     if let Some(cwd) = cwd {
-        if cwd.as_os_str().as_encoded_bytes().len() > 4096 {
-            return Err(ProtocolError::invalid_frame(
-                "cwd exceeds the 4096 byte limit",
+        let cwd_bytes = cwd.as_os_str().as_encoded_bytes().len();
+        if cwd_bytes > MAX_CWD_BYTES {
+            return Err(limit_error(
+                "argument_too_large",
+                "cwd",
+                cwd_bytes,
+                MAX_CWD_BYTES,
             ));
         }
     }
@@ -467,58 +580,134 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
         ));
     }
     if let Some(argv) = argv {
-        if argv.len() > 256 {
+        validate_argv(argv)?;
+    }
+    validate_runtime_values(inputs, environment)?;
+    Ok(())
+}
+
+pub fn validate_argv(argv: &[String]) -> Result<(), ProtocolError> {
+    if argv.len() > MAX_ARGV_ITEMS {
+        return Err(limit_error(
+            "argv_too_large",
+            "argv.items",
+            argv.len(),
+            MAX_ARGV_ITEMS,
+        ));
+    }
+    let mut total = 0_usize;
+    for (index, argument) in argv.iter().enumerate() {
+        if argument.contains('\0') {
             return Err(ProtocolError::invalid_frame(format!(
-                "argv contains {} arguments; maximum is 256",
-                argv.len()
+                "argv[{index}] contains NUL"
             )));
         }
-        for (index, argument) in argv.iter().enumerate() {
-            if argument.contains('\0') {
-                return Err(ProtocolError::invalid_frame(format!(
-                    "argv[{index}] contains NUL"
-                )));
-            }
-            if argument.len() > 16 * 1024 {
-                return Err(ProtocolError::invalid_frame(format!(
-                    "argv[{index}] is {} bytes; maximum is 16384 bytes",
-                    argument.len()
-                )));
-            }
+        if argument.len() > MAX_ARGV_ITEM_BYTES {
+            return Err(limit_error(
+                "argument_too_large",
+                &format!("argv[{index}]"),
+                argument.len(),
+                MAX_ARGV_ITEM_BYTES,
+            ));
         }
+        total = total.checked_add(argument.len()).ok_or_else(|| {
+            limit_error(
+                "argv_too_large",
+                "argv.total_bytes",
+                usize::MAX,
+                MAX_ARGV_TOTAL_BYTES,
+            )
+        })?;
     }
-    if inputs.len() > 64 || environment.len() > 128 {
-        return Err(ProtocolError::invalid_frame("too many runtime values"));
-    }
-    let value_bytes = inputs
-        .iter()
-        .chain(environment.iter())
-        .try_fold(0_usize, |size, (name, value)| {
-            if name.is_empty()
-                || name.len() > 256
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
-                || value.len() > 16 * 1024
-            {
-                return None;
-            }
-            size.checked_add(name.len())?.checked_add(value.len())
-        })
-        .ok_or_else(|| ProtocolError::invalid_frame("invalid or oversized runtime values"))?;
-    if value_bytes > 64 * 1024 {
-        return Err(ProtocolError::invalid_frame(
-            "runtime values exceed the 64 KiB limit",
+    if total > MAX_ARGV_TOTAL_BYTES {
+        return Err(limit_error(
+            "argv_too_large",
+            "argv.total_bytes",
+            total,
+            MAX_ARGV_TOTAL_BYTES,
         ));
     }
     Ok(())
+}
+
+fn validate_runtime_values(
+    inputs: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), ProtocolError> {
+    if inputs.len() > MAX_RUNTIME_INPUTS {
+        return Err(limit_error(
+            "request_too_large",
+            "inputs.items",
+            inputs.len(),
+            MAX_RUNTIME_INPUTS,
+        ));
+    }
+    if environment.len() > MAX_ENVIRONMENT_NAMES {
+        return Err(limit_error(
+            "request_too_large",
+            "environment.items",
+            environment.len(),
+            MAX_ENVIRONMENT_NAMES,
+        ));
+    }
+    let mut value_bytes = 0_usize;
+    for (name, value) in inputs.iter().chain(environment.iter()) {
+        if name.is_empty()
+            || name.len() > 256
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+        {
+            return Err(ProtocolError::invalid_frame(format!(
+                "runtime value name {name:?} is invalid"
+            )));
+        }
+        if value.len() > MAX_RUNTIME_VALUE_BYTES {
+            return Err(limit_error(
+                "argument_too_large",
+                &format!("runtime_values.{name}"),
+                value.len(),
+                MAX_RUNTIME_VALUE_BYTES,
+            ));
+        }
+        value_bytes = value_bytes
+            .checked_add(name.len())
+            .and_then(|size| size.checked_add(value.len()))
+            .ok_or_else(|| {
+                limit_error(
+                    "request_too_large",
+                    "runtime_values.total_bytes",
+                    usize::MAX,
+                    MAX_RUNTIME_VALUES_TOTAL_BYTES,
+                )
+            })?;
+    }
+    if value_bytes > MAX_RUNTIME_VALUES_TOTAL_BYTES {
+        return Err(limit_error(
+            "request_too_large",
+            "runtime_values.total_bytes",
+            value_bytes,
+            MAX_RUNTIME_VALUES_TOTAL_BYTES,
+        ));
+    }
+    Ok(())
+}
+
+fn limit_error(class: &'static str, field: &str, observed: usize, limit: usize) -> ProtocolError {
+    ProtocolError::LimitExceeded {
+        class,
+        field: field.to_owned(),
+        observed,
+        limit,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         read_message, validate_message, write_message, ClientMessage, ClientRequest,
-        IdentityRequest, ProtocolError, ServerMessage, ServerResponse, PROTOCOL_VERSION,
+        IdentityRequest, ProtocolError, ProtocolLimits, ServerMessage, ServerResponse,
+        PROTOCOL_VERSION,
     };
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -532,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_framed_prepare_messages_round_trip_without_request_ids() {
+    fn v4_framed_prepare_messages_round_trip_without_request_ids() {
         let original = message(ClientRequest::PrepareExec {
             argv: vec!["echo".to_owned(), "hello".to_owned()],
             cwd: PathBuf::from("/workspace"),
@@ -552,24 +741,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_exec_is_parsed_only_to_return_an_unsupported_version_error() {
-        let legacy: ClientMessage = serde_json::from_slice(
-            br#"{"version":2,"request":{"type":"exec","argv":["true"],"cwd":"/tmp","inputs":{},"environment":{}}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            validate_message(&legacy),
-            Err(ProtocolError::UnsupportedVersion(2))
-        ));
-    }
-
-    #[test]
-    fn v3_identity_handshake_keeps_hello_and_prepare_wire_shapes() {
+    fn v4_identity_handshake_includes_negotiated_limits() {
+        let limits = serde_json::to_value(ProtocolLimits::current()).unwrap();
         let hello = serde_json::to_value(message(ClientRequest::Hello)).unwrap();
         assert_eq!(
             hello,
             serde_json::json!({
-                "version": 3,
+                "version": 4,
                 "request": { "type": "hello" }
             })
         );
@@ -586,7 +764,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(prepare).unwrap(),
             serde_json::json!({
-                "version": 3,
+                "version": 4,
                 "request": {
                     "type": "prepare_identity",
                     "cwd": "/workspace",
@@ -598,21 +776,22 @@ mod tests {
         );
 
         let hello: ServerMessage = serde_json::from_value(serde_json::json!({
-            "version": 3,
+            "version": 4,
             "response": {
                 "type": "hello",
                 "state": "ready",
                 "profile": "nixos-docker",
                 "snapshot_id": "snapshot",
                 "runtime_inputs": ["HOST_UID"],
-                "environment_names": ["HOME"]
+                "environment_names": ["HOME"],
+                "limits": limits
             }
         }))
         .unwrap();
         assert!(matches!(hello.response, ServerResponse::Hello(_)));
 
         let identity: ServerMessage = serde_json::from_value(serde_json::json!({
-            "version": 3,
+            "version": 4,
             "response": {
                 "type": "identity",
                 "uid": 1000,
@@ -676,5 +855,64 @@ mod tests {
             },
         });
         assert!(validate_message(&invalid_user).is_err());
+    }
+
+    #[test]
+    fn argv_limits_count_utf8_bytes_and_accept_the_reported_regression_case() {
+        let regression_argument = "x".repeat(37_543);
+        assert!(super::validate_argv(&[regression_argument]).is_ok());
+
+        let oversized_argument = "x".repeat(super::MAX_ARGV_ITEM_BYTES + 1);
+        assert!(matches!(
+            super::validate_argv(&[oversized_argument]),
+            Err(ProtocolError::LimitExceeded {
+                class: "argument_too_large",
+                ..
+            })
+        ));
+
+        let oversized_total = vec!["x".repeat(super::MAX_ARGV_ITEM_BYTES); 17];
+        assert!(matches!(
+            super::validate_argv(&oversized_total),
+            Err(ProtocolError::LimitExceeded {
+                class: "argv_too_large",
+                ..
+            })
+        ));
+
+        let oversized_count = vec![String::new(); super::MAX_ARGV_ITEMS + 1];
+        assert!(matches!(
+            super::validate_argv(&oversized_count),
+            Err(ProtocolError::LimitExceeded {
+                class: "argv_too_large",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn runtime_value_limits_measure_utf8_bytes() {
+        let mut request = ClientRequest::PrepareIdentity {
+            cwd: PathBuf::from("/workspace"),
+            inputs: BTreeMap::from([(
+                "INPUT".to_owned(),
+                "é".repeat(super::MAX_RUNTIME_VALUE_BYTES / 2 + 1),
+            )]),
+            environment: BTreeMap::new(),
+            requested: IdentityRequest::Root,
+        };
+        let mut message = message(request.clone());
+        assert!(matches!(
+            validate_message(&message),
+            Err(ProtocolError::LimitExceeded {
+                class: "argument_too_large",
+                ..
+            })
+        ));
+        if let ClientRequest::PrepareIdentity { inputs, .. } = &mut request {
+            inputs.insert("INPUT".to_owned(), "é".repeat(100));
+        }
+        message.request = request;
+        assert!(validate_message(&message).is_ok());
     }
 }

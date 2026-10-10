@@ -20,6 +20,7 @@
       libxml2
       libuv
       curl
+      acl
     ];
 
     environment.systemPackages = with pkgs; [

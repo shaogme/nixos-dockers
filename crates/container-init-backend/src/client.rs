@@ -5,8 +5,8 @@ use container_init_protocol::{
     ClientMessage, ClientRequest, CommitResult as WireCommitResult, CwdObject,
     ExecTransactionState, IdentitySource as WireIdentitySource, PlanPage,
     PreparedHandoff as WirePreparedHandoff, ProtocolError, ReceiptSummary, ServerMessage,
-    ServerResponse, WorkspaceStatus as WireWorkspaceStatus, MAX_REQUEST_FRAME_BYTES,
-    MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
+    ServerResponse, WorkspaceStatus as WireWorkspaceStatus, MAX_PLAN_PAGE_ACTIONS,
+    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use libc::{
     c_char, c_int, connect, getegid, geteuid, getgroups, getsockopt, gid_t, poll, pollfd,
@@ -192,6 +192,7 @@ impl BackendClient {
         ambient_environment: &BTreeMap<String, String>,
         deadline: Instant,
     ) -> Result<PreparedHandoff, BackendClientError> {
+        container_init_protocol::validate_argv(&argv).map_err(BackendClientError::Protocol)?;
         let caller = caller_credentials()?;
         let mut delay = Duration::from_millis(10);
         loop {
@@ -249,6 +250,11 @@ impl BackendClient {
                 path: None,
             }));
         }
+        if info.limits != container_init_protocol::ProtocolLimits::current() {
+            return Err(BackendClientError::Protocol(
+                ProtocolError::IncompatibleLimits,
+            ));
+        }
 
         let expected_snapshot = info.snapshot_id.clone();
         let allowed_inputs = info.runtime_inputs.into_iter().collect::<BTreeSet<_>>();
@@ -280,6 +286,7 @@ impl BackendClient {
                     .clamp(1, 300_000) as u64,
             },
         };
+        container_init_protocol::validate_message(&exec).map_err(BackendClientError::Protocol)?;
         write_message_until(&mut stream, &exec, deadline, MAX_REQUEST_FRAME_BYTES)
             .map_err(|failure| protocol_client_error(failure.error))?;
         match read_server_response(&mut stream, deadline) {
@@ -601,7 +608,8 @@ fn validate_plan_page(
     offset: usize,
 ) -> Result<(), BackendClientError> {
     let end = offset.saturating_add(page.actions.len());
-    if !page.online
+    if page.actions.len() > MAX_PLAN_PAGE_ACTIONS
+        || !page.online
         || page.offset != offset
         || page.snapshot_id.is_empty()
         || page.snapshot_id.len() > 128
@@ -720,7 +728,7 @@ fn validate_prepared(
                     .is_some_and(|value| value == "root")))
         || !prepared.identity.home.is_absolute()
         || prepared.identity.user.contains('\0')
-        || prepared.supplemental_groups.len() > 4096
+        || prepared.supplemental_groups.len() > container_init_protocol::max_supplementary_groups()
         || (!prepared.root_service
             && !prepared
                 .supplemental_groups
@@ -778,6 +786,11 @@ fn current_groups() -> Result<Vec<u32>, BackendClientError> {
     let count = unsafe { getgroups(0, ptr::null_mut()) };
     if count < 0 {
         return Err(BackendClientError::Io(io::Error::last_os_error()));
+    }
+    if count as usize > container_init_protocol::max_supplementary_groups() {
+        return Err(BackendClientError::Protocol(ProtocolError::invalid_frame(
+            "caller supplementary groups exceed the platform limit",
+        )));
     }
     let mut groups = vec![0 as gid_t; count as usize];
     let result = unsafe { getgroups(count, groups.as_mut_ptr()) };
@@ -887,6 +900,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
+                        limits: container_init_protocol::ProtocolLimits::current(),
                     }),
                 },
             )
@@ -1015,6 +1029,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
+                        limits: container_init_protocol::ProtocolLimits::current(),
                     }),
                 },
             )
@@ -1065,6 +1080,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
+                        limits: container_init_protocol::ProtocolLimits::current(),
                     }),
                 },
             )
@@ -1096,6 +1112,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
+                        limits: container_init_protocol::ProtocolLimits::current(),
                     }),
                 },
             )

@@ -364,5 +364,10 @@ fn map_graph_error(error: TraverseError<LoaderError>) -> LoaderError {
                 },
             }
         }
+        TraverseError::Graph(ProfileGraphError::InheritanceDepthExceeded { limit }) => {
+            LoaderError::InvalidSourceId {
+                id: format!("inheritance exceeds maximum depth {limit}"),
+            }
+        }
     }
 }

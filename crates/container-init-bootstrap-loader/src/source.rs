@@ -1,8 +1,11 @@
 use crate::error::LoaderError;
 use crate::raw::parse_profile;
 use container_init_bootstrap_model::{BootstrapConfig, Plan, SourceKind};
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+
+const MAX_PROFILE_FILE_BYTES: usize = 8 * 1024 * 1024;
 
 /// A profile's source determines which bootstrap declarations are trusted.
 /// Image and admin profiles are trusted; workspace and user profiles are not.
@@ -45,10 +48,26 @@ impl ProfileSource {
     /// document, rather than inferred from the filename.
     pub fn from_file(path: impl AsRef<Path>, source: SourceKind) -> Result<Self, LoaderError> {
         let path = path.as_ref().to_path_buf();
-        let contents = fs::read_to_string(&path).map_err(|source_error| LoaderError::Io {
-            path: path.clone(),
-            source: source_error,
-        })?;
+        let mut contents = String::new();
+        File::open(&path)
+            .map_err(|source| LoaderError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .take((MAX_PROFILE_FILE_BYTES + 1) as u64)
+            .read_to_string(&mut contents)
+            .map_err(|source| LoaderError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if contents.len() > MAX_PROFILE_FILE_BYTES {
+            return Err(LoaderError::Invalid {
+                location: path.display().to_string(),
+                message: format!(
+                    "profile file is larger than the {MAX_PROFILE_FILE_BYTES} byte limit"
+                ),
+            });
+        }
         let raw = parse_profile(&contents, path.display().to_string())?;
         Ok(Self {
             id: raw.id,

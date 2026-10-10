@@ -372,6 +372,36 @@ fn exec_hands_off_through_the_running_backend() {
 }
 
 #[test]
+fn exec_accepts_the_37543_byte_argument_through_preflight_and_handoff() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let (_temp, profiles, workspace, _, _) = profile_fixture();
+    let socket = _temp.path().join("backend.sock");
+    let mut backend = start_backend(
+        &profiles,
+        &workspace,
+        &socket,
+        "trap 'exit 0' TERM; while :; do sleep 1; done",
+    );
+    wait_for_backend(&mut backend, &socket);
+    let long_argument = "x".repeat(37_543);
+    let output = Command::new(binary())
+        .args(["--backend-socket", socket.to_str().unwrap(), "exec", "--"])
+        .arg("true")
+        .arg(long_argument)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+}
+
+#[test]
 fn prepare_has_no_reconcile_effect_until_commit_and_abort_is_final() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;

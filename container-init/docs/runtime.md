@@ -124,14 +124,13 @@ container-init exec -- tool --flag 'value with spaces'
 
 `exec` 是连接运行中 backend 的并发权限转交入口（供 runtime shim 或并发 `docker exec` 使用）。它会：
 
-1. 通过 v3 `PrepareExec` 请求固定 backend snapshot、handoff、目标凭据和 cwd 对象；Prepare 不执行 request reconcile；
+1. 通过 v4 `PrepareExec` 请求固定 backend snapshot、handoff、目标凭据和 cwd 对象；Prepare 不执行 request reconcile；
 2. 启动专用 handoff 子进程。root CLI 在该子进程中应用 UID/GID/supplementary groups，非 root CLI 复核继承凭据；子进程按原始 cwd 路径执行 `chdir` 并核对设备号和 inode；
 3. Preflight 成功后发送 `CommitExec`，backend 执行 request reconcile 并返回 receipt summary；
 4. CLI 放行仍保持目标 cwd 的子进程，设置 `HOME`、`USER`、`LOGNAME` 并执行 handoff runtime。
 
 `exec` 不接收 profile、profiles-dir、workspace 或旧 bootstrap lock 参数；它不会重新读取 profile。请求只会执行受限 identity action 集合，启动 filesystem、SSH、cgroup 和 service action 只在 backend 启动时执行。
 
-Backend 使用带长度前缀的 v3 消息，单帧上限为 1 MiB。`--request-timeout-ms` 是整个操作的绝对 deadline，涵盖连接、Prepare、Preflight、Commit 和需要时的结果查询。Preflight 失败会 Abort 且不会 Commit。Commit 回包不确定时，客户端用原 `prepare_id` 查询；仍无法确认会报告 `OutcomeUnknown`，不会创建新 token 重试。backend 崩溃会丢失内存事务记录，因此跨 backend 崩溃不保证 exactly-once，request reconcile action 必须幂等。
 
 ### `status`
 

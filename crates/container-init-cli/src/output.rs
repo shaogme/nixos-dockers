@@ -1,7 +1,8 @@
 use crate::config::LoadedConfig;
 use crate::doctor::DoctorReport;
 use crate::error::CliError;
-use container_init_bootstrap_model::Plan;
+use container_init_bootstrap_model::{Plan, PlannedAction};
+use container_init_protocol::{MAX_PLAN_PAGE_ACTIONS, MAX_RESPONSE_FRAME_BYTES};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -13,8 +14,20 @@ struct JsonPlan<'a> {
     plan: &'a Plan,
 }
 
+#[derive(Serialize)]
+struct OfflinePlanPage<'a> {
+    online: bool,
+    profile: &'a str,
+    profile_chain: Vec<&'a str>,
+    offset: usize,
+    next_offset: Option<usize>,
+    total_actions: usize,
+    actions: &'a [PlannedAction],
+}
+
 pub fn print_plan(loaded: &LoadedConfig, json: bool) -> Result<(), CliError> {
     if json {
+        validate_offline_plan_pages(loaded)?;
         let value = JsonPlan {
             online: false,
             profile: loaded.profile(),
@@ -51,6 +64,46 @@ pub fn print_plan(loaded: &LoadedConfig, json: bool) -> Result<(), CliError> {
             action.origin,
             action.effect,
         );
+    }
+    Ok(())
+}
+
+fn validate_offline_plan_pages(loaded: &LoadedConfig) -> Result<(), CliError> {
+    let actions = loaded.plan().actions();
+    let profile_chain = loaded
+        .profile_chain()
+        .map(|profile| profile.id.as_str())
+        .collect::<Vec<_>>();
+    let mut offset = 0;
+    while offset < actions.len() {
+        let max_count = (actions.len() - offset).min(MAX_PLAN_PAGE_ACTIONS);
+        let mut fitted = false;
+        for count in (1..=max_count).rev() {
+            let end = offset + count;
+            let page = OfflinePlanPage {
+                online: false,
+                profile: loaded.profile(),
+                profile_chain: profile_chain.clone(),
+                offset,
+                next_offset: (end < actions.len()).then_some(end),
+                total_actions: actions.len(),
+                actions: &actions[offset..end],
+            };
+            let bytes = serde_json::to_vec(&page).map_err(CliError::Output)?;
+            if bytes.len() <= MAX_RESPONSE_FRAME_BYTES {
+                offset = end;
+                fitted = true;
+                break;
+            }
+        }
+        if !fitted {
+            let action = &actions[offset];
+            let bytes = serde_json::to_vec(action).map_or(0, |value| value.len());
+            return Err(CliError::Configuration(format!(
+                "offline plan action {:?} serializes to {bytes} bytes and exceeds the {MAX_RESPONSE_FRAME_BYTES} byte plan page limit",
+                action.id
+            )));
+        }
     }
     Ok(())
 }
