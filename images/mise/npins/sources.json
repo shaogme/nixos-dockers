@@ -9,9 +9,9 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "2ac3aced8729e5d834c2c8cef6ca9be687194131",
-      "url": "https://github.com/shaogme/mise-nixcache/archive/2ac3aced8729e5d834c2c8cef6ca9be687194131.tar.gz",
-      "hash": "sha256-YRANXCDCa/pDIXxpfbrx5IGp+ySpBnmyZZK9PMcdsyA="
+      "revision": "07c6b44506d48034e7c58e04e6023609237c0f95",
+      "url": "https://github.com/shaogme/mise-nixcache/archive/07c6b44506d48034e7c58e04e6023609237c0f95.tar.gz",
+      "hash": "sha256-hmcqvyNxr2RmWb7WikJohfaKzJrUvrkQClyXBgxeZX0="
     },
     "nixpkgs": {
       "type": "Channel",
