@@ -13,6 +13,7 @@
       glibc
       stdenv.cc.cc.lib
       zlib
+      pkg-config
       openssl
       icu
       libsecret
