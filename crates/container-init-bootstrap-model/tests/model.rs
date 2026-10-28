@@ -1,69 +1,51 @@
 use container_init_bootstrap_model::{
-    Action, ActionKind, BootstrapConfig, BootstrapInput, BootstrapMode, BootstrapPolicy,
-    HandoffConfig, IdentityConfig, InputType, ModelError, NonInteractivePolicy, Origin, RunAs,
-    BOOTSTRAP_SCHEMA_V1,
+    Action, ActionKind, BootstrapConfig, BootstrapInput, HandoffConfig, IdentityConfig,
+    InputNamespace, InputType, ModelError, Origin, RunAs,
 };
-use serde_json::Value;
+use serde_json::{to_value, Value};
 use std::collections::BTreeMap;
 
 fn minimal_config(actions: Vec<Action>) -> BootstrapConfig {
-    BootstrapConfig {
-        schema: BOOTSTRAP_SCHEMA_V1,
-        mode: BootstrapMode::Strict,
-        workspace_root: "/workspace".to_owned(),
-        allow_workspace_overlay: false,
-        non_interactive: NonInteractivePolicy::Deny,
-        identity: IdentityConfig {
-            default_user: Some("dev".to_owned()),
-            default_uid: Some(1000),
-            default_gid: Some(1000),
-            default_home: None,
-            auto_mapping: true,
-            run_as_root_input: Some("RUN_AS_ROOT".to_owned()),
-            uid_input: Some("HOST_UID".to_owned()),
-            gid_input: Some("HOST_GID".to_owned()),
-            home_input: Some("CONTAINER_HOME".to_owned()),
-        },
-        handoff: HandoffConfig {
-            runtime: "/usr/bin/runtime".to_owned(),
-            exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
-            initial_exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
-            shell_prefix: vec!["shell".to_owned()],
-            root_service: false,
-            ssh_daemon: None,
-            login_shell: None,
-        },
-        policy: BootstrapPolicy::default(),
-        inputs: declared_inputs(),
-        actions,
-    }
+    let mut identity = IdentityConfig::new();
+    identity.set_default_user(Some("dev".to_owned()));
+    identity.set_default_uid(Some(1000));
+    identity.set_default_gid(Some(1000));
+    identity.set_auto_mapping(true);
+    identity.set_run_as_root_input(Some("RUN_AS_ROOT".to_owned()));
+    identity.set_uid_input(Some("HOST_UID".to_owned()));
+    identity.set_gid_input(Some("HOST_GID".to_owned()));
+    identity.set_home_input(Some("CONTAINER_HOME".to_owned()));
+    let mut handoff = HandoffConfig::new("/usr/bin/runtime");
+    handoff.set_exec_prefix(vec!["exec".to_owned(), "--".to_owned()]);
+    handoff.set_initial_exec_prefix(vec!["exec".to_owned(), "--".to_owned()]);
+    handoff.set_shell_prefix(vec!["shell".to_owned()]);
+    BootstrapConfig::new("/workspace", identity, handoff, declared_inputs(), actions)
 }
 
 fn declared_inputs() -> BTreeMap<String, BootstrapInput> {
     [
-        ("RUN_AS_ROOT", "identity.run_as_root", InputType::Bool),
-        ("HOST_UID", "identity.uid", InputType::UidPair),
-        ("HOST_GID", "identity.gid", InputType::Gid),
-        ("CONTAINER_HOME", "identity.home", InputType::Path),
+        (
+            "RUN_AS_ROOT",
+            input("identity.run_as_root", InputType::Bool),
+        ),
+        ("HOST_UID", input("identity.uid", InputType::UidPair)),
+        ("HOST_GID", input("identity.gid", InputType::Gid)),
+        ("CONTAINER_HOME", input("identity.home", InputType::Path)),
     ]
     .into_iter()
-    .map(|(name, target, input_type)| {
-        (
-            name.to_owned(),
-            BootstrapInput {
-                target: target.to_owned(),
-                input_type,
-                aliases: Vec::new(),
-                runtime: true,
-                format: None,
-                namespace: (input_type == InputType::UidPair || input_type == InputType::Gid)
-                    .then_some(container_init_bootstrap_model::InputNamespace::Host),
-                default: None,
-                allow_outside_workspace: input_type == InputType::Path,
-            },
-        )
-    })
+    .map(|(name, input)| (name.to_owned(), input))
     .collect()
+}
+
+fn input(target: &str, input_type: InputType) -> BootstrapInput {
+    let mut input = BootstrapInput::new(target, input_type);
+    input.set_runtime(true);
+    input.set_namespace(
+        (input_type == InputType::UidPair || input_type == InputType::Gid)
+            .then_some(InputNamespace::Host),
+    );
+    input.set_allow_outside_workspace(input_type == InputType::Path);
+    input
 }
 
 #[test]
@@ -73,14 +55,14 @@ fn flat_dsl_action_model_keeps_provider_concerns_out() {
         ActionKind::IdentityResolve,
         Origin::image("base"),
     );
-    resolve.run_as = RunAs::Root;
+    resolve.set_run_as(RunAs::Root);
     let mut directory = Action::new(
         "workspace",
         ActionKind::FilesystemEnsureDir,
         Origin::image("base"),
     );
-    directory.path = Some("${bootstrap.workspace_root}/.state".to_owned());
-    directory.run_as = RunAs::Root;
+    directory.set_path(Some("${bootstrap.workspace_root}/.state".to_owned()));
+    directory.set_run_as(RunAs::Root);
 
     let config = minimal_config(vec![directory, resolve]);
     let plan = config
@@ -92,14 +74,18 @@ fn flat_dsl_action_model_keeps_provider_concerns_out() {
 #[test]
 fn handoff_prefixes_and_action_count_obey_resource_budgets() {
     let mut oversized_prefix = minimal_config(Vec::new());
-    oversized_prefix.handoff.exec_prefix = vec!["x".to_owned(); 65];
+    oversized_prefix
+        .handoff_mut()
+        .set_exec_prefix(vec!["x".to_owned(); 65]);
     assert!(matches!(
         oversized_prefix.validate(),
         Err(ModelError::Invalid { .. })
     ));
 
     let mut oversized_prefix_bytes = minimal_config(Vec::new());
-    oversized_prefix_bytes.handoff.exec_prefix = vec!["x".repeat(64 * 1024); 5];
+    oversized_prefix_bytes
+        .handoff_mut()
+        .set_exec_prefix(vec!["x".repeat(64 * 1024); 5]);
     assert!(matches!(
         oversized_prefix_bytes.validate(),
         Err(ModelError::Invalid { .. })
@@ -127,8 +113,8 @@ fn root_action_from_workspace_reports_provenance_and_remediation_context() {
         ActionKind::FilesystemEnsureDir,
         Origin::workspace("project-overlay"),
     );
-    action.path = Some("/etc/project".to_owned());
-    action.run_as = RunAs::Root;
+    action.set_path(Some("/etc/project".to_owned()));
+    action.set_run_as(RunAs::Root);
 
     let error = minimal_config(vec![action])
         .build_plan()
@@ -146,17 +132,17 @@ fn flat_action_json_omits_loader_metadata_while_plan_json_keeps_provenance() {
         ActionKind::FilesystemEnsureDir,
         Origin::image("base"),
     );
-    action.path = Some("/var/lib/app".to_owned());
-    action.parent_mode = Some("0755".to_owned());
-    action.run_as = RunAs::Root;
+    action.set_path(Some("/var/lib/app".to_owned()));
+    action.set_parent_mode(Some("0755".to_owned()));
+    action.set_run_as(RunAs::Root);
 
-    let action_json = serde_json::to_value(&action).expect("action should be JSON serializable");
+    let action_json = to_value(&action).expect("action should be JSON serializable");
     assert!(action_json.get("origin").is_none());
 
     let plan = minimal_config(vec![action])
         .build_plan()
         .expect("plan should serialize");
-    let json = serde_json::to_value(plan).expect("plan should be JSON serializable");
+    let json = to_value(plan).expect("plan should be JSON serializable");
     assert_eq!(
         json["actions"][0]["id"],
         Value::String("directory".to_owned())

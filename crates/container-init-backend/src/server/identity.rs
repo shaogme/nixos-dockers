@@ -5,9 +5,9 @@ use container_init_core::{
     WorkspaceStatus as CoreWorkspaceStatus,
 };
 use container_init_protocol::{
-    BackendError, BackendState, CwdObject, IdentityRequest, IdentitySource as WireIdentitySource,
-    PeerCredentials, PreparedIdentity, ResolvedIdentity as WireResolvedIdentity,
-    WorkspaceStatus as WireWorkspaceStatus,
+    max_supplementary_groups, BackendError, BackendState, CwdObject, IdentityRequest,
+    IdentitySource as WireIdentitySource, PeerCredentials, PreparedIdentity,
+    ResolvedIdentity as WireResolvedIdentity, WorkspaceStatus as WireWorkspaceStatus,
 };
 use libc::{
     fcntl, getgrouplist, gid_t, open, FD_CLOEXEC, F_GETFD, F_SETFD, O_CLOEXEC, O_DIRECTORY, O_PATH,
@@ -164,7 +164,12 @@ fn prepare_identity(
             }
             IdentityRequest::User { name }
                 if name != "root"
-                    && runtime.request_config().identity.default_user.as_deref() != Some(name) =>
+                    && runtime
+                        .request_config()
+                        .identity()
+                        .default_user()
+                        .as_deref()
+                        != Some(name) =>
             {
                 return Err(RuntimeErrors::backend(
                     "permission",
@@ -187,12 +192,15 @@ fn prepare_identity(
         })?;
     let mut config = runtime.request_config().as_ref().clone();
     let mut inputs = inputs;
-    let identity_inputs = [
-        config.identity.run_as_root_input.clone(),
-        config.identity.uid_input.clone(),
-        config.identity.gid_input.clone(),
-        config.identity.home_input.clone(),
-    ]
+    let identity_inputs = {
+        let identity = config.identity();
+        [
+            identity.run_as_root_input().clone(),
+            identity.uid_input().clone(),
+            identity.gid_input().clone(),
+            identity.home_input().clone(),
+        ]
+    }
     .into_iter()
     .flatten()
     .collect::<BTreeSet<_>>();
@@ -201,26 +209,29 @@ fn prepare_identity(
     environment.retain(|name, _| !identity_inputs.contains(name));
     match requested {
         IdentityRequest::Peer { uid, gid } => {
-            config.identity.default_user = None;
-            config.identity.default_uid = Some(uid);
-            config.identity.default_gid = Some(gid);
-            config.identity.auto_mapping = false;
+            let identity = config.identity_mut();
+            identity.set_default_user(None);
+            identity.set_default_uid(Some(uid));
+            identity.set_default_gid(Some(gid));
+            identity.set_auto_mapping(false);
         }
         IdentityRequest::Root => {
-            if let Some(name) = config.identity.run_as_root_input.clone() {
+            if let Some(name) = config.identity().run_as_root_input().clone() {
                 inputs.entry(name).or_insert_with(|| "1".to_owned());
             } else {
-                config.identity.default_user = Some("root".to_owned());
-                config.identity.default_uid = Some(0);
-                config.identity.default_gid = Some(0);
-                config.identity.auto_mapping = false;
+                let identity = config.identity_mut();
+                identity.set_default_user(Some("root".to_owned()));
+                identity.set_default_uid(Some(0));
+                identity.set_default_gid(Some(0));
+                identity.set_auto_mapping(false);
             }
         }
         IdentityRequest::User { name } => {
-            config.identity.default_user = Some(name);
-            config.identity.default_uid = None;
-            config.identity.default_gid = None;
-            config.identity.auto_mapping = false;
+            let identity = config.identity_mut();
+            identity.set_default_user(Some(name));
+            identity.set_default_uid(None);
+            identity.set_default_gid(None);
+            identity.set_auto_mapping(false);
         }
     }
     validate_inputs(&config, &inputs)?;
@@ -233,7 +244,7 @@ fn prepare_identity(
     let report = executor
         .execute_prevalidated(runtime.request_plan().as_ref(), &[])
         .map_err(|error| RuntimeErrors::core(&error))?;
-    let groups = supplementary_groups(&report.identity).map_err(|_| {
+    let groups = supplementary_groups(report.identity()).map_err(|_| {
         RuntimeErrors::backend("identity", false, "supplementary groups unavailable")
     })?;
     let supplemental_groups = groups
@@ -244,12 +255,12 @@ fn prepare_identity(
             RuntimeErrors::backend("identity", false, "supplementary group is out of range")
         })?;
     Ok(PreparedIdentity {
-        uid: report.identity.uid,
-        gid: report.identity.gid,
-        user: report.identity.user,
-        home: report.identity.home,
+        uid: report.identity().uid,
+        gid: report.identity().gid,
+        user: report.identity().user.clone(),
+        home: report.identity().home.clone(),
         supplemental_groups,
-        run_as_root: report.identity.run_as_root,
+        run_as_root: report.identity().run_as_root,
     })
 }
 
@@ -260,9 +271,9 @@ fn allowed_peer_identity(runtime: &BackendRuntime, uid: u32, gid: u32) -> bool {
     }
     runtime
         .request_config()
-        .identity
-        .default_uid
-        .zip(runtime.request_config().identity.default_gid)
+        .identity()
+        .default_uid()
+        .zip(runtime.request_config().identity().default_gid())
         .is_some_and(|(default_uid, default_gid)| uid == default_uid && gid == default_gid)
 }
 
@@ -283,19 +294,19 @@ fn validate_inputs(
     let mut targets = BTreeSet::new();
     for (name, value) in inputs {
         let declaration = config
-            .inputs
+            .inputs()
             .get(name)
             .or_else(|| {
                 config
-                    .inputs
+                    .inputs()
                     .values()
-                    .find(|input| input.aliases.iter().any(|alias| alias == name))
+                    .find(|input| input.aliases().iter().any(|alias| alias == name))
             })
-            .filter(|input| input.runtime)
+            .filter(|input| input.runtime())
             .ok_or_else(|| {
                 RuntimeErrors::backend("invalid_input", false, "runtime input is not declared")
             })?;
-        if !targets.insert(declaration.target.as_str()) {
+        if !targets.insert(declaration.target()) {
             return Err(RuntimeErrors::backend(
                 "invalid_input",
                 false,
@@ -361,7 +372,7 @@ fn peer_groups(pid: u32, effective_gid: u32) -> io::Result<Vec<u32>> {
         groups.insert(value.parse::<u32>().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "peer Groups field is malformed")
         })?);
-        if groups.len() > container_init_protocol::max_supplementary_groups() {
+        if groups.len() > max_supplementary_groups() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "peer supplementary groups exceed the platform limit",
@@ -374,7 +385,7 @@ fn peer_groups(pid: u32, effective_gid: u32) -> io::Result<Vec<u32>> {
 fn supplementary_groups(identity: &ResolvedIdentity) -> io::Result<Vec<gid_t>> {
     let username = CString::new(identity.user.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "user name contains NUL"))?;
-    let group_limit = container_init_protocol::max_supplementary_groups();
+    let group_limit = max_supplementary_groups();
     let mut count = i32::try_from(group_limit.min(16)).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,

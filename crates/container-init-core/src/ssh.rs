@@ -1,15 +1,27 @@
-use crate::error::CoreError;
-use crate::filesystem;
-use crate::identity::ResolvedIdentity;
+use crate::{
+    filesystem::{Filesystem, FilesystemContext},
+    CoreError, ResolvedIdentity,
+};
 use container_init_bootstrap_model::Action;
-use container_init_posix::{self as posix, ActionChange, PosixSystem};
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use container_init_posix::{set_mode, ActionChange, PosixSystem};
+use std::{
+    collections::BTreeMap,
+    fs, io,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{id, Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const DEFAULT_HOST_KEY_TYPES: &[&str] = &["rsa", "ed25519"];
+
+struct KeyPairPaths<'a> {
+    action: &'a str,
+    temporary: &'a Path,
+    temporary_public: &'a Path,
+    private: &'a Path,
+    public: &'a Path,
+}
 
 /// The deliberately small, optional OpenSSH capability used by
 /// `service.ssh.prepare`. The action still owns all filesystem paths; this
@@ -43,115 +55,109 @@ impl SshCapability {
     }
 }
 
-pub(crate) fn prepare(
-    action: &Action,
-    identity: &ResolvedIdentity,
-    values: &std::collections::BTreeMap<String, String>,
-    posix_system: &PosixSystem,
-    capability: &SshCapability,
-) -> Result<ActionChange, CoreError> {
-    let action_id = action.id.as_str();
-    let render = |field: &str, value: Option<&str>| {
-        let value = value.ok_or_else(|| CoreError::Invalid {
-            location: format!("bootstrap.actions.{action_id}.{field}"),
-            message: "field is required".to_owned(),
-        })?;
-        filesystem::render_path(action_id, field, value, values)
-    };
+impl SshCapability {
+    pub(crate) fn prepare(
+        action: &Action,
+        identity: &ResolvedIdentity,
+        values: &BTreeMap<String, String>,
+        posix_system: &PosixSystem,
+        capability: &SshCapability,
+    ) -> Result<ActionChange, CoreError> {
+        let filesystem_context = FilesystemContext::new(action.id(), identity, posix_system);
+        let action_id = action.id();
+        let render = |field: &str, value: Option<&str>| {
+            let value = value.ok_or_else(|| CoreError::Invalid {
+                location: format!("bootstrap.actions.{action_id}.{field}"),
+                message: "field is required".to_owned(),
+            })?;
+            Filesystem::render_path(action_id, field, value, values)
+        };
 
-    let host_key_dir = render("host_key_dir", action.ssh_host_key_dir())?;
-    let authorized_keys_dir = render("authorized_keys_dir", action.ssh_authorized_keys_dir())?;
-    let runtime_dir = render("runtime_dir", action.ssh_runtime_dir())?;
+        let host_key_dir = render("host_key_dir", action.ssh_host_key_dir())?;
+        let authorized_keys_dir = render("authorized_keys_dir", action.ssh_authorized_keys_dir())?;
+        let runtime_dir = render("runtime_dir", action.ssh_runtime_dir())?;
 
-    filesystem::ensure_dir(
-        action_id,
-        &host_key_dir,
-        Some("0755"),
-        Some("root"),
-        identity,
-        posix_system,
-    )?;
-    filesystem::ensure_dir(
-        action_id,
-        &authorized_keys_dir,
-        Some("0755"),
-        Some("root"),
-        identity,
-        posix_system,
-    )?;
-    filesystem::ensure_dir(
-        action_id,
-        &runtime_dir,
-        Some("0755"),
-        Some("root"),
-        identity,
-        posix_system,
-    )?;
-
-    let key_types = if action.ssh_host_key_types().is_empty() {
-        DEFAULT_HOST_KEY_TYPES
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>()
-    } else {
-        action.ssh_host_key_types().to_vec()
-    };
-    let mut generated = 0usize;
-    for key_type in &key_types {
-        if ensure_host_key(action_id, &host_key_dir, key_type, capability, posix_system)? {
-            generated += 1;
-        }
-    }
-
-    let authorized_key_path = authorized_keys_dir.join(&identity.user);
-    filesystem::validate_safe_path(&authorized_key_path, false, action_id)?;
-    let authorized_keys = if let Some(content) = action.content.as_deref() {
-        if content.contains('\0') {
-            return Err(CoreError::action(
-                action_id,
-                Some(authorized_key_path.clone()),
-                "authorized keys may not contain NUL",
-            ));
-        }
-        filesystem::ensure_file(
-            action_id,
-            &authorized_key_path,
-            Some(content),
-            Some("0644"),
+        Filesystem::ensure_dir(
+            &filesystem_context,
+            &host_key_dir,
+            Some("0755"),
             Some("root"),
-            identity,
-            posix_system,
         )?;
-        true
-    } else if let Some(source) = action.authorized_keys_source.as_deref() {
-        let source = filesystem::render_path(action_id, "authorized_keys_source", source, values)?;
-        match read_authorized_keys(action_id, &source)? {
-            Some(content) => {
-                filesystem::ensure_file(
-                    action_id,
-                    &authorized_key_path,
-                    Some(&content),
-                    Some("0644"),
-                    Some("root"),
-                    identity,
-                    posix_system,
-                )?;
-                true
-            }
-            None => false,
-        }
-    } else {
-        false
-    };
+        Filesystem::ensure_dir(
+            &filesystem_context,
+            &authorized_keys_dir,
+            Some("0755"),
+            Some("root"),
+        )?;
+        Filesystem::ensure_dir(
+            &filesystem_context,
+            &runtime_dir,
+            Some("0755"),
+            Some("root"),
+        )?;
 
-    Ok(ActionChange::new(format!(
-        "prepared SSH service ({generated} host key(s) generated, authorized keys {})",
-        if authorized_keys {
-            "reconciled"
+        let key_types = if action.ssh_host_key_types().is_empty() {
+            DEFAULT_HOST_KEY_TYPES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
         } else {
-            "not provided"
+            action.ssh_host_key_types().to_vec()
+        };
+        let mut generated = 0usize;
+        for key_type in &key_types {
+            if ensure_host_key(action_id, &host_key_dir, key_type, capability, posix_system)? {
+                generated += 1;
+            }
         }
-    )))
+
+        let authorized_key_path = authorized_keys_dir.join(&identity.user);
+        Filesystem::validate_safe_path(&authorized_key_path, false, action_id)?;
+        let authorized_keys = if let Some(content) = action.content().as_deref() {
+            if content.contains('\0') {
+                return Err(CoreError::action(
+                    action_id,
+                    Some(authorized_key_path.clone()),
+                    "authorized keys may not contain NUL",
+                ));
+            }
+            Filesystem::ensure_file(
+                &filesystem_context,
+                &authorized_key_path,
+                Some(content),
+                Some("0644"),
+                Some("root"),
+            )?;
+            true
+        } else if let Some(source) = action.authorized_keys_source().as_deref() {
+            let source =
+                Filesystem::render_path(action_id, "authorized_keys_source", source, values)?;
+            match read_authorized_keys(action_id, &source)? {
+                Some(content) => {
+                    Filesystem::ensure_file(
+                        &filesystem_context,
+                        &authorized_key_path,
+                        Some(&content),
+                        Some("0644"),
+                        Some("root"),
+                    )?;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        Ok(ActionChange::new(format!(
+            "prepared SSH service ({generated} host key(s) generated, authorized keys {})",
+            if authorized_keys {
+                "reconciled"
+            } else {
+                "not provided"
+            }
+        )))
+    }
 }
 
 fn ensure_host_key(
@@ -164,7 +170,7 @@ fn ensure_host_key(
     let key_path = host_key_dir.join(format!("ssh_host_{key_type}_key"));
     let public_path = PathBuf::from(format!("{}.pub", key_path.display()));
     for path in [&key_path, &public_path] {
-        filesystem::validate_safe_path(path, false, action)?;
+        Filesystem::validate_safe_path(path, false, action)?;
     }
 
     let private_exists = regular_file_state(action, &key_path)?;
@@ -186,7 +192,18 @@ fn ensure_host_key(
             let temporary = temporary_key_path(host_key_dir, key_type);
             let temporary_public = PathBuf::from(format!("{}.pub", temporary.display()));
             let result = generate_key(action, &temporary, key_type, capability, posix_system)
-                .and_then(|()| install_key_pair(action, &temporary, &temporary_public, &key_path, &public_path, posix_system));
+                .and_then(|()| {
+                    install_key_pair(
+                        KeyPairPaths {
+                            action,
+                            temporary: &temporary,
+                            temporary_public: &temporary_public,
+                            private: &key_path,
+                            public: &public_path,
+                        },
+                        posix_system,
+                    )
+                });
             if result.is_err() {
                 remove_if_regular(&temporary);
                 remove_if_regular(&temporary_public);
@@ -220,7 +237,7 @@ fn reconcile_key_file(
     mode: u32,
     posix_system: &PosixSystem,
 ) -> Result<(), CoreError> {
-    posix::set_mode(path, mode)
+    set_mode(path, mode)
         .map_err(|source| CoreError::io(Some(action), Some(path.to_path_buf()), source))?;
     posix_system
         .chown(path, 0, 0, true)
@@ -269,14 +286,14 @@ fn generate_key(
     Ok(())
 }
 
-fn install_key_pair(
-    action: &str,
-    temporary: &Path,
-    temporary_public: &Path,
-    private: &Path,
-    public: &Path,
-    posix_system: &PosixSystem,
-) -> Result<(), CoreError> {
+fn install_key_pair(paths: KeyPairPaths<'_>, posix_system: &PosixSystem) -> Result<(), CoreError> {
+    let KeyPairPaths {
+        action,
+        temporary,
+        temporary_public,
+        private,
+        public,
+    } = paths;
     let private_state = regular_file_state(action, private)?;
     let public_state = regular_file_state(action, public)?;
     if private_state || public_state {
@@ -316,7 +333,7 @@ fn install_key_pair(
 }
 
 fn read_authorized_keys(action: &str, path: &Path) -> Result<Option<String>, CoreError> {
-    filesystem::validate_safe_path(path, false, action)?;
+    Filesystem::validate_safe_path(path, false, action)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(CoreError::action(
             action,
@@ -350,10 +367,7 @@ fn temporary_key_path(directory: &Path, key_type: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    directory.join(format!(
-        ".container-init-ssh-{}-{stamp}-{key_type}",
-        std::process::id()
-    ))
+    directory.join(format!(".container-init-ssh-{}-{stamp}-{key_type}", id()))
 }
 
 fn remove_if_regular(path: &Path) {
@@ -371,7 +385,6 @@ fn executable_file(path: &Path) -> bool {
             metadata.is_file() && {
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
                     metadata.permissions().mode() & 0o111 != 0
                 }
                 #[cfg(not(unix))]

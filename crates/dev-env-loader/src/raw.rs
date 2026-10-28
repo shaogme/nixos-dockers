@@ -1,42 +1,88 @@
 use crate::error::LoaderError;
-use dev_env_model::ProfileDocument;
+use dev_env_model::{OverrideSpec, ProfileDocument};
+use std::collections::BTreeMap;
+use toml::{value::Table, Value};
 
-/// A typed document plus the unprojected TOML tree. The tree lets the merger
-/// distinguish an omitted field from a serde default such as `merge = strict`.
+/// A typed environment document paired with the unprojected TOML tree.
+///
+/// The tree preserves omitted fields and the independent bootstrap namespace,
+/// neither of which is represented by the environment model alone.
 #[derive(Clone, Debug)]
 pub(crate) struct RawProfile {
-    pub(crate) document: ProfileDocument,
-    pub(crate) root: toml::Value,
+    document: ProfileDocument,
+    root: Value,
 }
 
-pub(crate) fn parse_profile(contents: &str, location: String) -> Result<RawProfile, LoaderError> {
-    let root: toml::Value = toml::from_str(contents).map_err(|source| LoaderError::Parse {
-        location: location.clone(),
-        source,
-    })?;
-    // A profile may also carry the independent Bootstrap DSL. Project that
-    // namespace out before deserializing the environment document; the
-    // container-init loader performs the inverse projection for bootstrap.
-    // Keeping this at the loader boundary lets both runtimes consume the
-    // same profile file without making either model depend on the other.
-    let mut environment_root = root.clone();
-    if let Some(table) = environment_root.as_table_mut() {
-        table.remove("bootstrap");
+impl RawProfile {
+    pub(crate) fn parse(contents: &str, location: String) -> Result<Self, LoaderError> {
+        let root: Value = contents.parse().map_err(|source| LoaderError::Parse {
+            location: location.clone(),
+            source,
+        })?;
+        let document = Self::parse_environment_document(&root, location)?;
+        Ok(Self { document, root })
     }
-    let document: ProfileDocument =
-        environment_root
-            .try_into()
-            .map_err(|source| LoaderError::Parse {
-                location: location.clone(),
-                source,
-            })?;
-    document.validate().map_err(|source| LoaderError::Model {
-        location: Some(location),
-        source,
-    })?;
-    Ok(RawProfile { document, root })
-}
 
-pub(crate) fn table<'a>(value: &'a toml::Value, key: &str) -> Option<&'a toml::value::Table> {
-    value.as_table()?.get(key)?.as_table()
+    fn parse_environment_document(
+        root: &Value,
+        location: String,
+    ) -> Result<ProfileDocument, LoaderError> {
+        let environment_root = Self::environment_projection(root);
+        let document: ProfileDocument =
+            environment_root
+                .try_into()
+                .map_err(|source| LoaderError::Parse {
+                    location: location.clone(),
+                    source,
+                })?;
+        document.validate().map_err(|source| LoaderError::Model {
+            location: Some(location),
+            source,
+        })?;
+        Ok(document)
+    }
+
+    fn environment_projection(root: &Value) -> Value {
+        let mut environment_root = root.clone();
+        if let Some(table) = environment_root.as_table_mut() {
+            table.remove("bootstrap");
+        }
+        environment_root
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        self.document.id()
+    }
+
+    pub(crate) fn parents(&self) -> &[String] {
+        self.document.extends()
+    }
+
+    pub(crate) fn overrides(&self) -> &BTreeMap<String, OverrideSpec> {
+        self.document.overrides()
+    }
+
+    pub(crate) fn table(&self, key: &str) -> Option<&Table> {
+        self.root.as_table()?.get(key)?.as_table()
+    }
+
+    pub(crate) fn has_section(&self, key: &str) -> bool {
+        self.root
+            .as_table()
+            .is_some_and(|table| table.contains_key(key))
+    }
+
+    pub(crate) fn protected_override_path(&self) -> Option<&str> {
+        self.overrides()
+            .keys()
+            .find(|path| Self::is_protected_path(path))
+            .map(String::as_str)
+    }
+
+    fn is_protected_path(path: &str) -> bool {
+        path == "policy"
+            || path.starts_with("policy.")
+            || path == "inputs"
+            || path.starts_with("inputs.")
+    }
 }

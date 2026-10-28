@@ -8,11 +8,19 @@ use dev_env_provider::{
     Provider, ProviderContext, ProviderDiagnostic, ProviderRunner, ProviderRuntimeError,
     ProviderRuntimeErrorKind, SystemExecutableLocator,
 };
-use std::collections::{BTreeMap, VecDeque};
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use serde_json::{from_slice, to_vec};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    env::temp_dir,
+    fs, io,
+    path::{Path, PathBuf},
+    process::id,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 struct TempWorkspace {
     path: PathBuf,
@@ -20,20 +28,20 @@ struct TempWorkspace {
 
 impl TempWorkspace {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = temp_dir().join(format!(
             "dev-env-provider-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
         Self { path }
     }
 }
 
 impl Drop for TempWorkspace {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -105,45 +113,47 @@ fn context(workspace: &Path) -> ProviderContext {
 }
 
 fn provider(prepare: Vec<PrepareStep>, shellenv: Option<ShellEnvConfig>) -> ProviderConfig {
-    ProviderConfig {
-        executable: "fake-provider".to_owned(),
-        detect_files: vec!["project.config".to_owned()],
-        missing: MissingProviderPolicy::Error,
-        depends_on: Vec::new(),
+    let config = ProviderConfig::new(
+        "fake-provider",
+        vec!["project.config".to_owned()],
+        MissingProviderPolicy::Error,
+        Vec::new(),
         prepare,
-        shellenv,
-        sensitivity: Sensitivity::Public,
+    );
+    match shellenv {
+        Some(shellenv) => config.with_shellenv(shellenv),
+        None => config,
     }
 }
 
 fn prepare(when: Option<&str>, failure: FailurePolicy) -> PrepareStep {
-    PrepareStep {
-        argv: vec![
+    PrepareStep::new(
+        vec![
             "prepare".to_owned(),
             "{shell}".to_owned(),
             "{workspace}".to_owned(),
         ],
-        when: when.map(str::to_owned),
+        when.map(str::to_owned),
         failure,
-        timeout_ms: Some(500),
-        sensitivity: Sensitivity::Public,
-    }
+        Some(500),
+        Sensitivity::Public,
+    )
 }
 
 fn shellenv(format: ShellEnvFormat, failure: FailurePolicy) -> ShellEnvConfig {
-    ShellEnvConfig {
-        argv: vec!["env".to_owned(), "{shell}".to_owned()],
+    ShellEnvConfig::new(
+        vec!["env".to_owned(), "{shell}".to_owned()],
         format,
         failure,
-        path_mode: PathMode::Merge,
-        timeout_ms: Some(500),
-    }
+        PathMode::Merge,
+        Some(500),
+    )
 }
 
 #[test]
 fn lifecycle_detects_files_runs_prepare_and_returns_json_delta_and_receipt() {
     let workspace = TempWorkspace::new();
-    std::fs::write(workspace.path.join("project.config"), "version = 1\n").unwrap();
+    fs::write(workspace.path.join("project.config"), "version = 1\n").unwrap();
     let executor = FakeExecutor::with_outputs([
         CommandOutput::success(Vec::new()),
         CommandOutput::success(br#"{"TOOL_HOME":"/data/tool","REMOVE_ME":null}"#),
@@ -167,28 +177,28 @@ fn lifecycle_detects_files_runs_prepare_and_returns_json_delta_and_receipt() {
         .run("tool", &config, &context(&workspace.path))
         .unwrap();
 
-    assert!(result.detection.applicable);
-    assert_eq!(result.detection.matched_files.len(), 1);
-    assert_eq!(result.prepared_steps, 1);
-    assert_eq!(result.environment.set["TOOL_HOME"], "/data/tool");
-    assert!(result.environment.unset.contains("REMOVE_ME"));
-    let receipt = result.receipt.unwrap();
+    assert!(result.detection().applicable);
+    assert_eq!(result.detection().matched_files.len(), 1);
+    assert_eq!(result.prepared_steps(), 1);
+    assert_eq!(result.environment().set()["TOOL_HOME"], "/data/tool");
+    assert!(result.environment().unset().contains("REMOVE_ME"));
+    let receipt = result.receipt().unwrap();
     assert_eq!(receipt.provider, "tool");
     assert_eq!(receipt.config_fingerprint, [7; 32]);
     assert_ne!(receipt.workspace_fingerprint, [0; 32]);
 
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].program, "/fake/provider");
+    assert_eq!(calls[0].program(), "/fake/provider");
     assert_eq!(
-        calls[0].args,
+        calls[0].args(),
         vec![
             "prepare".to_owned(),
             "bash".to_owned(),
             workspace.path.display().to_string()
         ]
     );
-    assert_eq!(calls[1].args, vec!["env".to_owned(), "bash".to_owned()]);
+    assert_eq!(calls[1].args(), ["env", "bash"]);
 }
 
 #[test]
@@ -205,9 +215,9 @@ fn file_gating_is_not_a_missing_provider_error() {
         )
         .unwrap();
 
-    assert!(!result.detection.applicable);
+    assert!(!result.detection().applicable);
     assert!(matches!(
-        result.diagnostics.as_slice(),
+        result.diagnostics(),
         [ProviderDiagnostic::NotApplicable { provider }] if provider == "tool"
     ));
 }
@@ -215,9 +225,9 @@ fn file_gating_is_not_a_missing_provider_error() {
 #[test]
 fn applicable_missing_provider_follows_missing_policy() {
     let workspace = TempWorkspace::new();
-    let mut config = provider(Vec::new(), None);
-    config.detect_files.clear();
-    config.missing = MissingProviderPolicy::Warn;
+    let config = provider(Vec::new(), None)
+        .with_detect_files(Vec::new())
+        .with_missing(MissingProviderPolicy::Warn);
     let runner = ProviderRunner::with_executor_and_locator(
         FakeExecutor::default(),
         FakeLocator { executable: None },
@@ -226,11 +236,11 @@ fn applicable_missing_provider_follows_missing_policy() {
         .run("tool", &config, &context(&workspace.path))
         .unwrap();
     assert!(matches!(
-        result.diagnostics.as_slice(),
+        result.diagnostics(),
         [ProviderDiagnostic::MissingExecutable { provider, .. }] if provider == "tool"
     ));
 
-    config.missing = MissingProviderPolicy::Error;
+    let config = config.with_missing(MissingProviderPolicy::Error);
     let error = runner
         .run("tool", &config, &context(&workspace.path))
         .unwrap_err();
@@ -241,7 +251,7 @@ fn applicable_missing_provider_follows_missing_policy() {
 #[test]
 fn shellenv_parser_rejects_shell_code_as_a_typed_error() {
     let workspace = TempWorkspace::new();
-    std::fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
+    fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
     let executor = FakeExecutor::with_outputs([CommandOutput::success(
         b"export BAD=$(touch /tmp/provider-should-not-run)\n".to_vec(),
     )]);
@@ -275,14 +285,9 @@ fn shellenv_parser_rejects_shell_code_as_a_typed_error() {
 #[test]
 fn prepare_warning_preserves_exit_status_and_stderr_without_flattening_error() {
     let workspace = TempWorkspace::new();
-    std::fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
+    fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
     let executor = FakeExecutor::with_outputs([
-        CommandOutput {
-            status: Some(23),
-            timed_out: false,
-            stdout: Vec::new(),
-            stderr: b"temporary failure".to_vec(),
-        },
+        CommandOutput::new(Some(23), false, Vec::new(), b"temporary failure".to_vec()),
         CommandOutput::success(b"OK=1\n".to_vec()),
     ]);
     let runner = ProviderRunner::with_executor_and_locator(
@@ -302,10 +307,10 @@ fn prepare_warning_preserves_exit_status_and_stderr_without_flattening_error() {
         )
         .unwrap();
 
-    assert_eq!(result.prepared_steps, 0);
-    assert_eq!(result.environment.set["OK"], "1");
+    assert_eq!(result.prepared_steps(), 0);
+    assert_eq!(result.environment().set()["OK"], "1");
     assert!(matches!(
-        result.diagnostics.as_slice(),
+        result.diagnostics(),
         [ProviderDiagnostic::PrepareFailed { status: Some(23), stderr, .. }] if stderr == b"temporary failure"
     ));
 }
@@ -313,17 +318,17 @@ fn prepare_warning_preserves_exit_status_and_stderr_without_flattening_error() {
 #[test]
 fn protocol_round_trip_keeps_typed_operation_and_response_error() {
     let workspace = TempWorkspace::new();
-    let request = ProtocolRequest {
-        protocol: 1,
-        op: ProtocolOperation::Shellenv,
-        context: context(&workspace.path),
-        config: ValueTree::Map(BTreeMap::from([(
+    let request = ProtocolRequest::new(
+        1,
+        ProtocolOperation::Shellenv,
+        context(&workspace.path),
+        ValueTree::Map(BTreeMap::from([(
             "enabled".to_owned(),
             ValueTree::Bool(true),
         )])),
-        argv: vec!["env".to_owned()],
-    };
-    let encoded = serde_json::to_vec(&request).unwrap();
+        vec!["env".to_owned()],
+    );
+    let encoded = to_vec(&request).unwrap();
     let decoded = decode_request(&encoded).unwrap();
     assert_eq!(decoded, request);
 
@@ -336,7 +341,7 @@ fn protocol_round_trip_keeps_typed_operation_and_response_error() {
         ..ProtocolResponse::default()
     };
     let encoded = encode_response(&response).unwrap();
-    let decoded: ProtocolResponse = serde_json::from_slice(&encoded).unwrap();
+    let decoded: ProtocolResponse = from_slice(&encoded).unwrap();
     assert_eq!(decoded, response);
 }
 
@@ -347,26 +352,22 @@ fn real_process_executor_passes_an_argument_as_data() {
     } else {
         "/bin/printf"
     };
-    let request = CommandRequest {
-        program: program.to_owned(),
-        args: vec!["%s".to_owned(), "value; not shell code".to_owned()],
-        cwd: std::env::temp_dir(),
-        environment: BTreeMap::new(),
-        timeout: Some(Duration::from_secs(1)),
-        max_stdout_bytes: 1024,
-        max_stderr_bytes: 1024,
-    };
+    let request = CommandRequest::new(program, temp_dir())
+        .with_args(["%s".to_owned(), "value; not shell code".to_owned()])
+        .with_environment(BTreeMap::new())
+        .with_timeout(Some(Duration::from_secs(1)))
+        .with_output_limits(1024, 1024);
     let output = SystemExecutableLocator;
     assert!(output.locate(program, &BTreeMap::new()).unwrap().is_some());
     let output = dev_env_provider::ProcessExecutor.execute(&request).unwrap();
     assert!(output.succeeded());
-    assert_eq!(output.stdout, b"value; not shell code");
+    assert_eq!(output.stdout(), b"value; not shell code");
 }
 
 #[test]
 fn generic_provider_trait_uses_the_same_runner_api() {
     let workspace = TempWorkspace::new();
-    std::fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
+    fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
     let provider = GenericProvider::new(
         "tool",
         provider(Vec::new(), None),
@@ -381,7 +382,7 @@ fn generic_provider_trait_uses_the_same_runner_api() {
     assert!(
         Provider::run(&provider, &context(&workspace.path))
             .unwrap()
-            .detection
+            .detection()
             .applicable
     );
 }
@@ -389,7 +390,7 @@ fn generic_provider_trait_uses_the_same_runner_api() {
 #[test]
 fn provider_result_applies_provider_sensitivity_and_receipt_to_model_environment() {
     let workspace = TempWorkspace::new();
-    std::fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
+    fs::write(workspace.path.join("project.config"), "enabled\n").unwrap();
     let executor = FakeExecutor::with_outputs([CommandOutput::success(b"SECRET=token\n".to_vec())]);
     let runner = ProviderRunner::with_executor_and_locator(
         executor,
@@ -397,35 +398,31 @@ fn provider_result_applies_provider_sensitivity_and_receipt_to_model_environment
             executable: Some(PathBuf::from("/fake/provider")),
         },
     );
-    let mut config = provider(
+    let config = provider(
         Vec::new(),
         Some(shellenv(ShellEnvFormat::Shell, FailurePolicy::Error)),
-    );
-    config.sensitivity = Sensitivity::Secret;
+    )
+    .with_sensitivity(Sensitivity::Secret);
     let result = runner
         .run("tool", &config, &context(&workspace.path))
         .unwrap();
     let mut environment = MaterializedEnv::default();
     result.apply_to(&mut environment);
 
-    assert_eq!(environment.values["SECRET"].value, "token");
+    assert_eq!(environment.values()["SECRET"].value(), "token");
     assert_eq!(
-        environment.values["SECRET"].sensitivity,
+        environment.values()["SECRET"].sensitivity(),
         Sensitivity::Secret
     );
-    assert_eq!(
-        environment.values["SECRET"].provider.as_deref(),
-        Some("tool")
-    );
+    assert_eq!(environment.values()["SECRET"].provider(), Some("tool"));
 }
 
 #[test]
 fn glob_detection_supports_nested_files_without_following_a_shell() {
     let workspace = TempWorkspace::new();
-    std::fs::create_dir_all(workspace.path.join("nested/project")).unwrap();
-    std::fs::write(workspace.path.join("nested/project/env.json"), "{}\n").unwrap();
-    let mut config = provider(Vec::new(), None);
-    config.detect_files = vec!["**/*.json".to_owned()];
+    fs::create_dir_all(workspace.path.join("nested/project")).unwrap();
+    fs::write(workspace.path.join("nested/project/env.json"), "{}\n").unwrap();
+    let config = provider(Vec::new(), None).with_detect_files(vec!["**/*.json".to_owned()]);
     let result = dev_env_provider::detect(
         &config,
         &workspace.path,
@@ -442,14 +439,14 @@ fn glob_detection_supports_nested_files_without_following_a_shell() {
 #[test]
 fn protocol_decoder_rejects_a_wrong_version_as_a_typed_protocol_error() {
     let workspace = TempWorkspace::new();
-    let mut request = ProtocolRequest {
-        protocol: 2,
-        op: ProtocolOperation::Detect,
-        context: context(&workspace.path),
-        config: ValueTree::default(),
-        argv: Vec::new(),
-    };
-    let bytes = serde_json::to_vec(&request).unwrap();
+    let mut request = ProtocolRequest::new(
+        2,
+        ProtocolOperation::Detect,
+        context(&workspace.path),
+        ValueTree::default(),
+        Vec::new(),
+    );
+    let bytes = to_vec(&request).unwrap();
     assert!(matches!(
         decode_request(&bytes),
         Err(dev_env_provider::ProtocolCodecError::Protocol {
@@ -459,9 +456,9 @@ fn protocol_decoder_rejects_a_wrong_version_as_a_typed_protocol_error() {
             }
         })
     ));
-    request.protocol = 1;
-    request.context.shell.clear();
-    let bytes = serde_json::to_vec(&request).unwrap();
+    request = request.with_protocol(1);
+    request.context_mut().shell_mut().clear();
+    let bytes = to_vec(&request).unwrap();
     assert!(matches!(
         decode_request(&bytes),
         Err(dev_env_provider::ProtocolCodecError::Protocol {
@@ -480,16 +477,12 @@ fn process_executor_enforces_a_timeout() {
     if !Path::new(program).is_file() {
         return;
     }
-    let request = CommandRequest {
-        program: program.to_owned(),
-        args: vec!["1".to_owned()],
-        cwd: std::env::temp_dir(),
-        environment: BTreeMap::new(),
-        timeout: Some(Duration::from_millis(20)),
-        max_stdout_bytes: 1024,
-        max_stderr_bytes: 1024,
-    };
+    let request = CommandRequest::new(program, temp_dir())
+        .with_args(["1".to_owned()])
+        .with_environment(BTreeMap::new())
+        .with_timeout(Some(Duration::from_millis(20)))
+        .with_output_limits(1024, 1024);
     let output = dev_env_provider::ProcessExecutor.execute(&request).unwrap();
-    assert!(output.timed_out);
+    assert!(output.timed_out());
     assert!(!output.succeeded());
 }

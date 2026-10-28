@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{error::Error as StdError, fmt};
 
-use crate::validation::{validate_command_arg, validate_concrete_path, validate_id};
-use crate::ModelError;
+use crate::{validation::StringValidation, ModelError};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,38 +31,60 @@ impl fmt::Display for ShellArgError {
     }
 }
 
-impl std::error::Error for ShellArgError {}
+impl StdError for ShellArgError {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellConfig {
-    pub command: String,
-    pub kind: ShellKind,
+    command: String,
+    kind: ShellKind,
     #[serde(default)]
-    pub login_args: Vec<String>,
+    login_args: Vec<String>,
     #[serde(default)]
-    pub interactive_args: Vec<String>,
-    pub command_arg: Option<String>,
+    interactive_args: Vec<String>,
+    command_arg: Option<String>,
 }
 
 impl ShellConfig {
+    pub fn new(
+        command: impl Into<String>,
+        kind: ShellKind,
+        login_args: Vec<String>,
+        interactive_args: Vec<String>,
+        command_arg: Option<String>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            kind,
+            login_args,
+            interactive_args,
+            command_arg,
+        }
+    }
+
+    pub fn with_command_arg(mut self, command_arg: Option<String>) -> Self {
+        self.command_arg = command_arg;
+        self
+    }
+
     pub fn validate(&self, id: &str) -> Result<(), ModelError> {
-        validate_id(&format!("shells.{id}"), id).map_err(|_| ModelError::InvalidShell {
-            shell: id.to_owned(),
-            reason: ShellArgError::InvalidId,
-        })?;
+        id.validate_id(&format!("shells.{id}"))
+            .map_err(|_| ModelError::InvalidShell {
+                shell: id.to_owned(),
+                reason: ShellArgError::InvalidId,
+            })?;
         if self.command.is_empty() {
             return Err(ModelError::InvalidShell {
                 shell: id.to_owned(),
                 reason: ShellArgError::EmptyCommand,
             });
         }
-        validate_concrete_path(&format!("shells.{id}.command"), &self.command).map_err(|_| {
-            ModelError::InvalidShell {
+        self.command
+            .validate_concrete_path(&format!("shells.{id}.command"))
+            .map_err(|_| ModelError::InvalidShell {
                 shell: id.to_owned(),
                 reason: ShellArgError::InvalidCommand,
-            }
-        })?;
+            })?;
         for argument in self
             .login_args
             .iter()
@@ -76,12 +97,12 @@ impl ShellConfig {
                     reason: ShellArgError::EmptyArgument,
                 });
             }
-            validate_command_arg(&format!("shells.{id}.args"), argument).map_err(|_| {
-                ModelError::InvalidShell {
+            argument
+                .validate_command_arg(&format!("shells.{id}.args"))
+                .map_err(|_| ModelError::InvalidShell {
                     shell: id.to_owned(),
                     reason: ShellArgError::InvalidCommand,
-                }
-            })?;
+                })?;
         }
         Ok(())
     }
@@ -122,7 +143,7 @@ impl fmt::Display for ShellEnvParseError {
     }
 }
 
-impl std::error::Error for ShellEnvParseError {}
+impl StdError for ShellEnvParseError {}
 
 impl ShellEnvEntry {
     pub fn parse_line(line: &str) -> Result<Option<Self>, ShellEnvParseError> {
@@ -146,9 +167,7 @@ impl ShellEnvEntry {
         }
         if let Some(name) = statement.strip_prefix("unset ") {
             let name = name.strip_suffix(';').unwrap_or(name);
-            if name.is_empty()
-                || name.chars().any(char::is_whitespace)
-                || !crate::validation::is_posix_env_name(name)
+            if name.is_empty() || name.chars().any(char::is_whitespace) || !name.is_posix_env_name()
             {
                 return Err(ShellEnvParseError::InvalidName {
                     name: name.to_owned(),
@@ -165,7 +184,7 @@ impl ShellEnvEntry {
         if name.is_empty() {
             return Err(ShellEnvParseError::EmptyAssignment);
         }
-        if !crate::validation::is_posix_env_name(name) {
+        if !name.is_posix_env_name() {
             return Err(ShellEnvParseError::InvalidName {
                 name: name.to_owned(),
             });
@@ -290,4 +309,26 @@ fn parse_value(raw: &str) -> Result<String, ShellEnvParseError> {
         return Err(ShellEnvParseError::UnterminatedQuote);
     }
     Ok(output)
+}
+
+impl ShellConfig {
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn kind(&self) -> ShellKind {
+        self.kind
+    }
+
+    pub fn login_args(&self) -> &Vec<String> {
+        &self.login_args
+    }
+
+    pub fn interactive_args(&self) -> &Vec<String> {
+        &self.interactive_args
+    }
+
+    pub fn command_arg(&self) -> Option<&str> {
+        self.command_arg.as_deref()
+    }
 }

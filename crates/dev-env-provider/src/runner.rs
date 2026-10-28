@@ -1,19 +1,20 @@
-use crate::command::{
-    CommandError, CommandExecutor, CommandOutput, CommandRequest, ProcessExecutor,
+use crate::{
+    command::{CommandError, CommandExecutor, CommandOutput, CommandRequest, ProcessExecutor},
+    condition::ConditionEvaluator,
+    context::ProviderContext,
+    detect::{DetectionResult, ExecutableLocator, ProviderDetection, SystemExecutableLocator},
+    environment::EnvironmentDelta,
+    error::ProviderRuntimeError,
+    receipt::ProviderFingerprints,
+    supervisor::{ProviderJob, ProviderSupervisor},
+    template::ProviderTemplate,
 };
-use crate::condition::evaluate;
-use crate::context::ProviderContext;
-use crate::detect::{detect, DetectionResult, ExecutableLocator, SystemExecutableLocator};
-use crate::environment::{parse_output, EnvironmentDelta};
-use crate::error::ProviderRuntimeError;
-use crate::receipt::{provider_config_fingerprint, workspace_fingerprint};
-use crate::template::expand_argv;
 use dev_env_model::{
-    Condition, FailurePolicy, MaterializedEnv, MissingProviderPolicy, PrepareStep, ProviderConfig,
-    ProviderReceipt, Sensitivity,
+    Condition, EffectiveIdentity, FailurePolicy, MaterializedEnv, MissingProviderPolicy,
+    ModelError, PrepareStep, ProviderConfig, ProviderReceipt, Sensitivity,
 };
 use serde::Serialize;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 /// A warning is intentionally an event-shaped value.  It keeps command
 /// output as bytes and status as fields, rather than storing a formatted
@@ -51,6 +52,17 @@ pub enum ProviderDiagnostic {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderRunResult {
+    provider: String,
+    sensitivity: Sensitivity,
+    detection: DetectionResult,
+    prepared_steps: usize,
+    environment: EnvironmentDelta,
+    diagnostics: Vec<ProviderDiagnostic>,
+    receipt: Option<ProviderReceipt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRunResultParts {
     pub provider: String,
     pub sensitivity: Sensitivity,
     pub detection: DetectionResult,
@@ -60,19 +72,101 @@ pub struct ProviderRunResult {
     pub receipt: Option<ProviderReceipt>,
 }
 
+pub struct ProviderRunner {
+    executor: Box<dyn CommandExecutor>,
+    locator: Box<dyn ExecutableLocator>,
+    command_timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+}
+
+struct CommandExecution<'a> {
+    provider: &'a str,
+    operation: &'a str,
+    executable: &'a Path,
+    args: Vec<String>,
+    context: &'a ProviderContext,
+    timeout_ms: Option<u64>,
+    identity: Option<&'a EffectiveIdentity>,
+}
+
+struct CommandFailureInfo {
+    status: Option<i32>,
+    timed_out: bool,
+    stderr: Vec<u8>,
+}
+
 impl ProviderRunResult {
+    pub fn new(parts: ProviderRunResultParts) -> Self {
+        Self {
+            provider: parts.provider,
+            sensitivity: parts.sensitivity,
+            detection: parts.detection,
+            prepared_steps: parts.prepared_steps,
+            environment: parts.environment,
+            diagnostics: parts.diagnostics,
+            receipt: parts.receipt,
+        }
+    }
+
+    pub fn with_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
+        self.sensitivity = sensitivity;
+        self
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
+
+    pub fn detection(&self) -> &DetectionResult {
+        &self.detection
+    }
+
+    pub fn prepared_steps(&self) -> usize {
+        self.prepared_steps
+    }
+
+    pub fn environment(&self) -> &EnvironmentDelta {
+        &self.environment
+    }
+
+    pub fn diagnostics(&self) -> &[ProviderDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn receipt(&self) -> Option<&ProviderReceipt> {
+        self.receipt.as_ref()
+    }
+
     pub fn apply_to(&self, environment: &mut MaterializedEnv) {
         self.environment
             .apply_to_materialized(environment, &self.provider, self.sensitivity);
         if let Some(receipt) = &self.receipt {
-            environment.provider_receipts.push(receipt.clone());
+            environment.push_provider_receipt(receipt.clone());
         }
     }
 }
 
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
+
     fn run(&self, context: &ProviderContext) -> Result<ProviderRunResult, ProviderRuntimeError>;
+}
+
+impl Default for ProviderRunner {
+    fn default() -> Self {
+        Self {
+            executor: Box::new(ProcessExecutor),
+            locator: Box::new(SystemExecutableLocator),
+            command_timeout: Duration::from_secs(300),
+            max_stdout_bytes: 1024 * 1024,
+            max_stderr_bytes: 64 * 1024,
+        }
+    }
 }
 
 pub struct GenericProvider {
@@ -102,36 +196,6 @@ impl Provider for GenericProvider {
 
     fn run(&self, context: &ProviderContext) -> Result<ProviderRunResult, ProviderRuntimeError> {
         self.runner.run(&self.id, &self.config, context)
-    }
-}
-
-pub struct ProviderRunner {
-    executor: Box<dyn CommandExecutor>,
-    locator: Box<dyn ExecutableLocator>,
-    command_timeout: Duration,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
-}
-
-struct CommandExecution<'a> {
-    provider: &'a str,
-    operation: &'a str,
-    executable: &'a std::path::Path,
-    args: Vec<String>,
-    context: &'a ProviderContext,
-    timeout_ms: Option<u64>,
-    identity: Option<&'a dev_env_model::EffectiveIdentity>,
-}
-
-impl Default for ProviderRunner {
-    fn default() -> Self {
-        Self {
-            executor: Box::new(ProcessExecutor),
-            locator: Box::new(SystemExecutableLocator),
-            command_timeout: Duration::from_secs(300),
-            max_stdout_bytes: 1024 * 1024,
-            max_stderr_bytes: 64 * 1024,
-        }
     }
 }
 
@@ -183,15 +247,15 @@ impl ProviderRunner {
         provider_id: &str,
         config: &ProviderConfig,
         context: &ProviderContext,
-        identity: Option<&dev_env_model::EffectiveIdentity>,
+        identity: Option<&EffectiveIdentity>,
     ) -> Result<ProviderRunResult, ProviderRuntimeError> {
         config
             .validate(provider_id)
             .map_err(ProviderRuntimeError::Model)?;
-        let detection = detect(
+        let detection = ProviderDetection::detect(
             config,
-            &context.workspace,
-            &context.environment,
+            context.workspace(),
+            context.environment(),
             self.locator.as_ref(),
         )
         .map_err(|source| ProviderRuntimeError::Detection {
@@ -201,37 +265,37 @@ impl ProviderRunner {
 
         if !detection.applicable {
             let mut diagnostics = Vec::new();
-            if !config.detect_files.is_empty() && detection.matched_files.is_empty() {
+            if !config.detect_files().is_empty() && detection.matched_files.is_empty() {
                 diagnostics.push(ProviderDiagnostic::NotApplicable {
                     provider: provider_id.to_owned(),
                 });
             } else {
-                match config.missing {
+                match config.missing() {
                     MissingProviderPolicy::Error => {
                         return Err(ProviderRuntimeError::MissingExecutable {
                             provider: provider_id.to_owned(),
-                            executable: config.executable.clone(),
-                            policy: config.missing,
+                            executable: config.executable().to_owned(),
+                            policy: config.missing(),
                         });
                     }
                     MissingProviderPolicy::Warn | MissingProviderPolicy::Ignore => {
                         diagnostics.push(ProviderDiagnostic::MissingExecutable {
                             provider: provider_id.to_owned(),
-                            executable: config.executable.clone(),
-                            policy: config.missing,
+                            executable: config.executable().to_owned(),
+                            policy: config.missing(),
                         });
                     }
                 }
             }
-            return Ok(ProviderRunResult {
+            return Ok(ProviderRunResult::new(ProviderRunResultParts {
                 provider: provider_id.to_owned(),
-                sensitivity: config.sensitivity,
+                sensitivity: config.sensitivity(),
                 detection,
                 prepared_steps: 0,
                 environment: EnvironmentDelta::default(),
                 diagnostics,
                 receipt: None,
-            });
+            }));
         }
 
         let executable = detection
@@ -240,10 +304,10 @@ impl ProviderRunner {
             .expect("applicable implies executable");
         let mut provider_context = context.clone();
         provider_context.set_workspace_config_present(
-            context.workspace_config_present || !detection.matched_files.is_empty(),
+            context.workspace_config_present() || !detection.matched_files.is_empty(),
         );
         let mut runnable_steps = Vec::new();
-        for (index, step) in config.prepare.iter().enumerate() {
+        for (index, step) in config.prepare().iter().enumerate() {
             if condition_matches(step, &provider_context)? {
                 runnable_steps.push((index, step));
             }
@@ -253,14 +317,14 @@ impl ProviderRunner {
         let mut prepared_steps = 0;
         for (index, step) in runnable_steps {
             let operation = format!("prepare[{index}]");
-            let args = self.expand_args(provider_id, &operation, &step.argv, &provider_context)?;
+            let args = self.expand_args(provider_id, &operation, step.argv(), &provider_context)?;
             let result = self.execute(CommandExecution {
                 provider: provider_id,
                 operation: &operation,
                 executable,
                 args,
                 context: &provider_context,
-                timeout_ms: step.timeout_ms,
+                timeout_ms: step.timeout_ms(),
                 identity,
             });
             match result {
@@ -271,37 +335,47 @@ impl ProviderRunner {
                         operation,
                         output,
                     };
-                    if step.failure == FailurePolicy::Error {
+                    if step.failure() == FailurePolicy::Error {
                         return Err(error);
                     }
-                    diagnostics.push(prepare_diagnostic(provider_id, index, step.failure, &error));
+                    diagnostics.push(prepare_diagnostic(
+                        provider_id,
+                        index,
+                        step.failure(),
+                        &error,
+                    ));
                 }
                 Err(error) => {
-                    if step.failure == FailurePolicy::Error {
+                    if step.failure() == FailurePolicy::Error {
                         return Err(error);
                     }
-                    diagnostics.push(prepare_diagnostic(provider_id, index, step.failure, &error));
+                    diagnostics.push(prepare_diagnostic(
+                        provider_id,
+                        index,
+                        step.failure(),
+                        &error,
+                    ));
                 }
             }
         }
 
         let mut environment = EnvironmentDelta::default();
-        if let Some(shellenv) = &config.shellenv {
+        if let Some(shellenv) = &config.shellenv() {
             let operation = "shellenv".to_owned();
             let args =
-                self.expand_args(provider_id, &operation, &shellenv.argv, &provider_context)?;
+                self.expand_args(provider_id, &operation, shellenv.argv(), &provider_context)?;
             let result = self.execute(CommandExecution {
                 provider: provider_id,
                 operation: &operation,
                 executable,
                 args,
                 context: &provider_context,
-                timeout_ms: shellenv.timeout_ms,
+                timeout_ms: shellenv.timeout_ms(),
                 identity,
             });
             match result {
                 Ok(output) if output.succeeded() => {
-                    let text = String::from_utf8(output.stdout).map_err(|source| {
+                    let text = String::from_utf8(output.stdout().to_vec()).map_err(|source| {
                         ProviderRuntimeError::OutputUtf8 {
                             provider: provider_id.to_owned(),
                             operation: "shellenv".to_owned(),
@@ -309,7 +383,7 @@ impl ProviderRunner {
                         }
                     });
                     match text.and_then(|text| {
-                        parse_output(shellenv.format, &text).map_err(|source| {
+                        EnvironmentDelta::parse_output(shellenv.format(), &text).map_err(|source| {
                             ProviderRuntimeError::OutputRejected {
                                 provider: provider_id.to_owned(),
                                 operation: "shellenv".to_owned(),
@@ -319,12 +393,12 @@ impl ProviderRunner {
                     }) {
                         Ok(entries) => environment.apply_entries(entries),
                         Err(error) => {
-                            if shellenv.failure == FailurePolicy::Error {
+                            if shellenv.failure() == FailurePolicy::Error {
                                 return Err(error);
                             }
                             diagnostics.push(ProviderDiagnostic::ShellenvRejected {
                                 provider: provider_id.to_owned(),
-                                policy: shellenv.failure,
+                                policy: shellenv.failure(),
                             });
                         }
                     }
@@ -335,16 +409,16 @@ impl ProviderRunner {
                         operation: "shellenv".to_owned(),
                         output,
                     };
-                    if shellenv.failure == FailurePolicy::Error {
+                    if shellenv.failure() == FailurePolicy::Error {
                         return Err(error);
                     }
-                    diagnostics.push(shellenv_diagnostic(provider_id, shellenv.failure, &error));
+                    diagnostics.push(shellenv_diagnostic(provider_id, shellenv.failure(), &error));
                 }
                 Err(error) => {
-                    if shellenv.failure == FailurePolicy::Error {
+                    if shellenv.failure() == FailurePolicy::Error {
                         return Err(error);
                     }
-                    diagnostics.push(shellenv_diagnostic(provider_id, shellenv.failure, &error));
+                    diagnostics.push(shellenv_diagnostic(provider_id, shellenv.failure(), &error));
                 }
             }
         }
@@ -354,18 +428,18 @@ impl ProviderRunner {
         } else {
             Some(ProviderReceipt {
                 provider: provider_id.to_owned(),
-                config_fingerprint: if context.config_fingerprint == [0; 32] {
-                    provider_config_fingerprint(config).map_err(|source| {
+                config_fingerprint: if context.config_fingerprint() == [0; 32] {
+                    ProviderFingerprints::provider_config(config).map_err(|source| {
                         ProviderRuntimeError::Fingerprint {
                             provider: provider_id.to_owned(),
                             source,
                         }
                     })?
                 } else {
-                    context.config_fingerprint
+                    context.config_fingerprint()
                 },
-                workspace_fingerprint: workspace_fingerprint(
-                    &context.workspace,
+                workspace_fingerprint: ProviderFingerprints::workspace(
+                    context.workspace(),
                     &detection.matched_files,
                 )
                 .map_err(|source| ProviderRuntimeError::Fingerprint {
@@ -377,15 +451,15 @@ impl ProviderRunner {
             })
         };
 
-        Ok(ProviderRunResult {
+        Ok(ProviderRunResult::new(ProviderRunResultParts {
             provider: provider_id.to_owned(),
-            sensitivity: config.sensitivity,
+            sensitivity: config.sensitivity(),
             detection,
             prepared_steps,
             environment,
             diagnostics,
             receipt,
-        })
+        }))
     }
 
     fn expand_args(
@@ -395,10 +469,12 @@ impl ProviderRunner {
         args: &[String],
         context: &ProviderContext,
     ) -> Result<Vec<String>, ProviderRuntimeError> {
-        expand_argv(args, provider, context).map_err(|source| ProviderRuntimeError::Template {
-            provider: provider.to_owned(),
-            operation: operation.to_owned(),
-            source,
+        ProviderTemplate::expand_argv(args, provider, context).map_err(|source| {
+            ProviderRuntimeError::Template {
+                provider: provider.to_owned(),
+                operation: operation.to_owned(),
+                source,
+            }
         })
     }
 
@@ -406,32 +482,28 @@ impl ProviderRunner {
         &self,
         execution: CommandExecution<'_>,
     ) -> Result<CommandOutput, ProviderRuntimeError> {
-        let mut request = CommandRequest::new(
-            execution.executable.display().to_string(),
-            &execution.context.cwd,
-        );
-        request.args = execution.args;
-        request.environment = execution.context.environment.clone();
+        let mut environment = execution.context.environment().clone();
         if let Some(identity) = execution.identity {
-            request.environment.insert(
+            environment.insert(
                 "HOME".to_owned(),
-                identity.home.to_string_lossy().into_owned(),
+                identity.home().to_string_lossy().into_owned(),
             );
-            request
-                .environment
-                .insert("USER".to_owned(), identity.user.clone());
-            request
-                .environment
-                .insert("LOGNAME".to_owned(), identity.user.clone());
+            environment.insert("USER".to_owned(), identity.user().to_owned());
+            environment.insert("LOGNAME".to_owned(), identity.user().to_owned());
         }
-        request.timeout = Some(
+        let request = CommandRequest::new(
+            execution.executable.display().to_string(),
+            execution.context.cwd(),
+        )
+        .with_args(execution.args)
+        .with_environment(environment)
+        .with_timeout(Some(
             execution
                 .timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(self.command_timeout),
-        );
-        request.max_stdout_bytes = self.max_stdout_bytes;
-        request.max_stderr_bytes = self.max_stderr_bytes;
+        ))
+        .with_output_limits(self.max_stdout_bytes, self.max_stderr_bytes);
         self.executor
             .execute_with_identity(&request, execution.identity)
             .map_err(|source| ProviderRuntimeError::Command {
@@ -446,17 +518,15 @@ fn condition_matches(
     step: &PrepareStep,
     context: &ProviderContext,
 ) -> Result<bool, ProviderRuntimeError> {
-    let Some(condition) = step.when.as_deref() else {
+    let Some(condition) = step.when() else {
         return Ok(true);
     };
     match Condition::parse(condition) {
-        Ok(condition) => Ok(evaluate(&condition, context)),
-        Err(source) => Err(ProviderRuntimeError::Model(
-            dev_env_model::ModelError::InvalidCondition {
-                location: "provider prepare condition".to_owned(),
-                reason: source,
-            },
-        )),
+        Ok(condition) => Ok(ConditionEvaluator::evaluate(&condition, context)),
+        Err(source) => Err(ProviderRuntimeError::Model(ModelError::InvalidCondition {
+            location: "provider prepare condition".to_owned(),
+            reason: source,
+        })),
     }
 }
 
@@ -466,14 +536,14 @@ fn prepare_diagnostic(
     policy: FailurePolicy,
     error: &ProviderRuntimeError,
 ) -> ProviderDiagnostic {
-    let (status, timed_out, stderr) = command_failure_parts(error);
+    let failure = command_failure_parts(error);
     ProviderDiagnostic::PrepareFailed {
         provider: provider.to_owned(),
         step,
         policy,
-        status,
-        timed_out,
-        stderr,
+        status: failure.status,
+        timed_out: failure.timed_out,
+        stderr: failure.stderr,
     }
 }
 
@@ -482,21 +552,23 @@ fn shellenv_diagnostic(
     policy: FailurePolicy,
     error: &ProviderRuntimeError,
 ) -> ProviderDiagnostic {
-    let (status, timed_out, stderr) = command_failure_parts(error);
+    let failure = command_failure_parts(error);
     ProviderDiagnostic::ShellenvFailed {
         provider: provider.to_owned(),
         policy,
-        status,
-        timed_out,
-        stderr,
+        status: failure.status,
+        timed_out: failure.timed_out,
+        stderr: failure.stderr,
     }
 }
 
-fn command_failure_parts(error: &ProviderRuntimeError) -> (Option<i32>, bool, Vec<u8>) {
+fn command_failure_parts(error: &ProviderRuntimeError) -> CommandFailureInfo {
     match error {
-        ProviderRuntimeError::CommandFailed { output, .. } => {
-            (output.status, output.timed_out, output.stderr.clone())
-        }
+        ProviderRuntimeError::CommandFailed { output, .. } => CommandFailureInfo {
+            status: output.status(),
+            timed_out: output.timed_out(),
+            stderr: output.stderr().to_vec(),
+        },
         ProviderRuntimeError::Command { source, .. } => match source {
             CommandError::Spawn { .. }
             | CommandError::Wait { .. }
@@ -506,8 +578,27 @@ fn command_failure_parts(error: &ProviderRuntimeError) -> (Option<i32>, bool, Ve
             | CommandError::InvalidProgram
             | CommandError::InvalidArgument
             | CommandError::InvalidEnvironment
-            | CommandError::InvalidTimeout => (None, false, Vec::new()),
+            | CommandError::InvalidTimeout => CommandFailureInfo {
+                status: None,
+                timed_out: false,
+                stderr: Vec::new(),
+            },
         },
-        _ => (None, false, Vec::new()),
+        _ => CommandFailureInfo {
+            status: None,
+            timed_out: false,
+            stderr: Vec::new(),
+        },
+    }
+}
+
+impl ProviderSupervisor for ProviderRunner {
+    fn prepare(&self, job: &ProviderJob) -> Result<ProviderRunResult, ProviderRuntimeError> {
+        self.run_with_identity(
+            job.provider_id(),
+            job.config(),
+            job.context(),
+            Some(job.identity()),
+        )
     }
 }

@@ -1,12 +1,12 @@
-use crate::args::ParseError;
-use dev_env_core::{CoreError, CoreErrorKind};
-use dev_env_loader::LoaderError;
-use dev_env_model::ModelError;
-use dev_env_shell::{CommandLineError, EnvironmentFormatError, ShellInvocationError, ShimError};
-use std::error::Error;
-use std::fmt;
-use std::io;
-use std::path::PathBuf;
+use {
+    crate::ParseError,
+    dev_env_core::{CoreError, CoreErrorKind},
+    dev_env_loader::LoaderError,
+    dev_env_model::ModelError,
+    dev_env_shell::{CommandLineError, EnvironmentFormatError, ShellInvocationError, ShimError},
+    serde_json::Error as JsonError,
+    std::{error::Error, ffi::OsString, fmt, io, path::PathBuf},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IoOperation {
@@ -38,7 +38,7 @@ impl fmt::Display for IoOperation {
 #[derive(Debug)]
 pub enum OutputError {
     Io(io::Error),
-    Json(serde_json::Error),
+    Json(JsonError),
 }
 
 impl fmt::Display for OutputError {
@@ -59,6 +59,25 @@ impl Error for OutputError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DefaultProfileReason {
+    Empty,
+    Whitespace,
+    MultipleLines,
+}
+
+impl fmt::Display for DefaultProfileReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "file is empty",
+            Self::Whitespace => "profile id contains whitespace",
+            Self::MultipleLines => "file must contain exactly one profile id",
+        })
+    }
+}
+
+impl Error for DefaultProfileReason {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigurationError {
     InvalidDefaultProfile {
@@ -78,25 +97,6 @@ pub enum ConfigurationError {
         path: String,
     },
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DefaultProfileReason {
-    Empty,
-    Whitespace,
-    MultipleLines,
-}
-
-impl fmt::Display for DefaultProfileReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Empty => "file is empty",
-            Self::Whitespace => "profile id contains whitespace",
-            Self::MultipleLines => "file must contain exactly one profile id",
-        })
-    }
-}
-
-impl Error for DefaultProfileReason {}
 
 impl fmt::Display for ConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -286,7 +286,7 @@ pub enum CliError {
     BackendUnavailable(String),
     Launch {
         program: PathBuf,
-        args: Vec<std::ffi::OsString>,
+        args: Vec<OsString>,
         source: io::Error,
     },
     DoctorFailed {

@@ -4,19 +4,21 @@ use dev_env_shell::{
     validate_shim, CommandLine, ConfiguredShellAdapter, EnvironmentFormat, EnvironmentFormatError,
     RenderOptions, ShellAdapter, ShellBuildError, ShellInvocation, Shim, ShimError, ShimPathError,
 };
-use std::collections::BTreeMap;
-use std::error::Error;
-use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    ffi::{OsStr, OsString},
+    path::Path,
+};
 
 fn shell_config() -> ShellConfig {
-    ShellConfig {
-        command: "/bin/bash".to_owned(),
-        kind: ShellKind::Posix,
-        login_args: vec!["-l".to_owned()],
-        interactive_args: vec!["-i".to_owned()],
-        command_arg: Some("-c".to_owned()),
-    }
+    ShellConfig::new(
+        "/bin/bash",
+        ShellKind::Posix,
+        vec!["-l".to_owned()],
+        vec!["-i".to_owned()],
+        Some("-c".to_owned()),
+    )
 }
 
 fn environment() -> MaterializedEnv {
@@ -24,21 +26,16 @@ fn environment() -> MaterializedEnv {
         BTreeMap::from([
             (
                 "PUBLIC".to_owned(),
-                EnvValue {
-                    value: "a'b\n$(not-a-command)".to_owned(),
-                    origin: None,
-                    sensitivity: Sensitivity::Public,
-                    provider: None,
-                },
+                EnvValue::new("a'b\n$(not-a-command)", None, Sensitivity::Public, None),
             ),
             (
                 "SECRET".to_owned(),
-                EnvValue {
-                    value: "token".to_owned(),
-                    origin: None,
-                    sensitivity: Sensitivity::Secret,
-                    provider: Some("fixture".to_owned()),
-                },
+                EnvValue::new(
+                    "token",
+                    None,
+                    Sensitivity::Secret,
+                    Some("fixture".to_owned()),
+                ),
             ),
         ]),
         [4; 32],
@@ -172,12 +169,10 @@ fn output_redacts_sensitive_values_by_default_and_json_is_stable() {
 #[test]
 fn formatting_keeps_model_errors_structured() {
     let mut environment = environment();
-    environment
-        .values
-        .get_mut("PUBLIC")
-        .unwrap()
-        .value
-        .push('\0');
+    environment.insert(
+        "PUBLIC".to_owned(),
+        EnvValue::new("invalid\0value", None, Sensitivity::Public, None),
+    );
 
     let error = format_shell(&environment, RenderOptions::default()).unwrap_err();
     assert!(matches!(
@@ -213,8 +208,7 @@ fn invocation_selects_the_same_adapter_for_interactive_login_and_command() {
 #[test]
 fn missing_command_arg_is_a_typed_build_error() {
     let adapter = ConfiguredShellAdapter::new("bash");
-    let mut config = shell_config();
-    config.command_arg = None;
+    let config = shell_config().with_command_arg(None);
 
     let error = adapter
         .build_command(&config, OsStr::new("echo test"))

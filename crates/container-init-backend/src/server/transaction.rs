@@ -5,9 +5,9 @@ use super::{
 };
 use container_init_core::{PlanExecutor, ResolvedIdentity, RuntimeContext};
 use container_init_protocol::{
-    BackendError, BackendState, CommitResult as WireCommitResult, ExecTransactionState,
-    HandoffCommand as WireHandoffCommand, PeerCredentials, PreparedHandoff as WirePreparedHandoff,
-    ProtocolError, ReceiptSummary, ServerResponse,
+    validate_argv, BackendError, BackendState, CommitResult as WireCommitResult,
+    ExecTransactionState, HandoffCommand as WireHandoffCommand, PeerCredentials,
+    PreparedHandoff as WirePreparedHandoff, ProtocolError, ReceiptSummary, ServerResponse,
 };
 use libc::geteuid;
 use std::{
@@ -24,14 +24,6 @@ const PREPARE_TTL: Duration = Duration::from_secs(30);
 const MAX_TRANSACTIONS: usize = 256;
 const MAX_TRANSACTIONS_PER_PEER: usize = 8;
 
-pub(super) struct ExecTransaction {
-    owner_uid: u32,
-    owner_gid: u32,
-    snapshot_id: String,
-    deadline: Instant,
-    state: ExecTransactionStateData,
-}
-
 enum ExecTransactionStateData {
     Prepared {
         context: RuntimeContext,
@@ -41,6 +33,14 @@ enum ExecTransactionStateData {
     Committed(ReceiptSummary),
     Aborted,
     Failed(BackendError),
+}
+
+pub(super) struct ExecTransaction {
+    owner_uid: u32,
+    owner_gid: u32,
+    snapshot_id: String,
+    deadline: Instant,
+    state: ExecTransactionStateData,
 }
 
 pub(super) struct PrepareExecOptions {
@@ -212,13 +212,17 @@ fn prepare_exec(
     let command = executor
         .build_handoff_command(&argv)
         .map_err(|error| RuntimeErrors::core(&error))?;
-    let mut complete_argv = Vec::with_capacity(command.args.len() + 1);
-    complete_argv.push(command.program.to_string_lossy().into_owned());
-    complete_argv.extend(command.args.iter().cloned());
-    if let Err(error) = container_init_protocol::validate_argv(&complete_argv) {
+    let mut complete_argv = Vec::with_capacity(command.args().len() + 1);
+    complete_argv.push(command.program().to_string_lossy().into_owned());
+    complete_argv.extend(command.args().iter().cloned());
+    if let Err(error) = validate_argv(&complete_argv) {
         return Err(handoff_argv_error(error));
     }
-    if !command.program.is_absolute() || command.args.iter().any(|argument| argument.contains('\0'))
+    if !command.program().is_absolute()
+        || command
+            .args()
+            .iter()
+            .any(|argument| argument.contains('\0'))
     {
         return Err(RuntimeErrors::backend(
             "invalid_snapshot",
@@ -302,13 +306,11 @@ fn prepare_exec(
         },
     );
     drop(transactions);
+    let (program, args) = command.into_parts();
     Ok(WirePreparedHandoff {
         prepare_id,
         snapshot_id: runtime.snapshot_id().to_owned(),
-        command: WireHandoffCommand {
-            program: command.program,
-            args: command.args,
-        },
+        command: WireHandoffCommand { program, args },
         cwd: resolved_cwd.canonical_path,
         cwd_object: resolved_cwd.object,
         login_environment,
@@ -404,8 +406,8 @@ fn commit_exec(
         .execute_prevalidated_with_identity(runtime.request_plan(), &[], &identity)
         .map(|report| ReceiptSummary {
             succeeded: report.succeeded(),
-            action_count: report.outcomes.len(),
-            warning_count: report.warnings.len(),
+            action_count: report.outcomes().len(),
+            warning_count: report.warnings().len(),
         })
         .map_err(|error| RuntimeErrors::core(&error));
 

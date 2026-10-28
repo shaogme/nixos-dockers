@@ -1,12 +1,13 @@
-use std::env;
+use dev_env_cli::Application;
+use std::{env, process::exit};
 
 fn main() {
-    let exit_code = match dev_env_cli::run(env::args_os()) {
+    let exit_code = match Application::run(env::args_os()) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("dev-env: {error}");
             error.exit_code()
         }
     };
-    std::process::exit(exit_code);
+    exit(exit_code);
 }

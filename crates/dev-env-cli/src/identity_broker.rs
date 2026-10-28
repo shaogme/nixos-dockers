@@ -1,63 +1,83 @@
 //! Adapter from the shared container-init identity protocol to dev-env's
 //! effective identity model.
 
-use dev_env_model::{
-    EffectiveIdentity, IdentityPeer, IdentityRequest, IdentitySource, WorkspaceStatus,
+use {
+    container_init_protocol::{IdentityBrokerClient, IdentityRequest as BrokerIdentityRequest},
+    dev_env_model::{
+        EffectiveIdentity, IdentityPeer, IdentityRequest, IdentitySource, WorkspaceStatus,
+    },
+    std::{
+        collections::BTreeMap,
+        env::var_os,
+        error::Error,
+        fmt::{Display, Formatter, Result as FmtResult},
+        path::{Path, PathBuf},
+        time::Duration,
+    },
 };
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 const DEFAULT_SOCKET: &str = "/run/container-init/backend.sock";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
-pub struct BrokerError(pub String);
+pub struct BrokerError(String);
 
-impl std::fmt::Display for BrokerError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+pub struct IdentityBroker;
+
+impl Display for BrokerError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.write_str(&self.0)
     }
 }
 
-impl std::error::Error for BrokerError {}
+impl Error for BrokerError {}
 
-pub fn resolve(
-    request: &IdentityRequest,
-    peer: IdentityPeer,
-    cwd: &Path,
-    inputs: BTreeMap<String, String>,
-    environment: BTreeMap<String, String>,
-) -> Result<EffectiveIdentity, BrokerError> {
-    let requested = match request {
-        IdentityRequest::Peer => container_init_protocol::IdentityRequest::Peer {
-            uid: peer.uid,
-            gid: peer.gid,
-        },
-        IdentityRequest::Root => container_init_protocol::IdentityRequest::Root,
-        IdentityRequest::User { name } => {
-            container_init_protocol::IdentityRequest::User { name: name.clone() }
-        }
-    };
-    let socket = std::env::var_os("DEVENV_IDENTITY_BROKER_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
-    let identity = container_init_protocol::IdentityBrokerClient::new(socket, DEFAULT_TIMEOUT)
-        .resolve(requested, cwd, inputs, environment)
-        .map_err(|error| BrokerError(error.to_string()))?;
-    let source = if identity.uid == 0 {
-        IdentitySource::Root
-    } else {
-        IdentitySource::Broker
-    };
-    Ok(EffectiveIdentity {
-        uid: identity.uid,
-        gid: identity.gid,
-        user: identity.user,
-        home: identity.home,
-        supplementary_groups: identity.supplemental_groups,
-        run_as_root: identity.run_as_root,
-        source,
-        workspace: WorkspaceStatus::Unavailable,
-    })
+impl BrokerError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl IdentityBroker {
+    pub fn resolve(
+        request: &IdentityRequest,
+        peer: IdentityPeer,
+        cwd: &Path,
+        inputs: BTreeMap<String, String>,
+        environment: BTreeMap<String, String>,
+    ) -> Result<EffectiveIdentity, BrokerError> {
+        let requested = match request {
+            IdentityRequest::Peer => BrokerIdentityRequest::Peer {
+                uid: peer.uid,
+                gid: peer.gid,
+            },
+            IdentityRequest::Root => BrokerIdentityRequest::Root,
+            IdentityRequest::User { name } => BrokerIdentityRequest::User { name: name.clone() },
+        };
+        let socket = var_os("DEVENV_IDENTITY_BROKER_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
+        let identity = IdentityBrokerClient::new(socket, DEFAULT_TIMEOUT)
+            .resolve(requested, cwd, inputs, environment)
+            .map_err(|error| BrokerError::new(error.to_string()))?;
+        let source = if identity.uid == 0 {
+            IdentitySource::Root
+        } else {
+            IdentitySource::Broker
+        };
+        Ok(EffectiveIdentity::new(
+            identity.uid,
+            identity.gid,
+            identity.user,
+            identity.home,
+            source,
+        )
+        .with_supplementary_groups(identity.supplemental_groups)
+        .with_run_as_root(identity.run_as_root)
+        .with_workspace(WorkspaceStatus::Unavailable))
+    }
 }

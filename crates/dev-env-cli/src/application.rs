@@ -1,57 +1,79 @@
-use crate::args::{Cli, CliCommand, CliOptions};
-use crate::error::{BootstrapError, BootstrapPathError, CliError};
-use crate::{config, offline, output, process, trust};
-use dev_env_model::{
-    BackendRequest, BackendResponse, PreparedResponse, RequestContext, RequestMode,
+use {
+    crate::{
+        BackendApi, BootstrapError, BootstrapPathError, Cli, CliCommand, CliError, CliOptions,
+        ConfigApi, IoOperation, OfflineApi, OutputApi, OutputError, OutputFormat, ProcessApi,
+        TrustApi,
+    },
+    dev_env_model::{
+        BackendRequest, BackendResponse, PreparedResponse, RequestContext, RequestMode, TrustTarget,
+    },
+    dev_env_shell::{CommandLine, Shim},
+    serde_json::{to_string, to_string_pretty, Value as JsonValue},
+    std::{
+        env::{current_dir, var, var_os},
+        ffi::OsString,
+        fs,
+        io::{Error as IoError, ErrorKind},
+        path::{Component, Path, PathBuf},
+    },
 };
-use dev_env_shell::{CommandLine, Shim};
-use std::ffi::OsString;
-use std::fs;
-use std::path::{Path, PathBuf};
 
-pub fn run<I>(arguments: I) -> Result<i32, CliError>
+pub struct Application;
+
+impl Application {
+    pub fn run<I>(arguments: I) -> Result<i32, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        run_inner(arguments)
+    }
+}
+
+fn run_inner<I>(arguments: I) -> Result<i32, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
     let cli = Cli::parse(arguments)?;
-    match cli.command {
+    let (options, command) = cli.into_parts();
+    match command {
         CliCommand::Help => {
-            output::write_stdout(&crate::args::usage(""))?;
-            output::write_stdout("\n")?;
+            OutputApi::write_stdout(&Cli::usage(""))?;
+            OutputApi::write_stdout("\n")?;
             Ok(0)
         }
         CliCommand::Version => {
-            output::print_version()?;
+            OutputApi::print_version()?;
             Ok(0)
         }
-        CliCommand::Backend { command } => crate::backend::dispatch(command, cli.options),
-        CliCommand::Exec { command } => run_exec(&cli.options, command),
+        CliCommand::Backend { command } => BackendApi::dispatch(command, options),
+        CliCommand::Exec { command } => run_exec(&options, command),
         CliCommand::Shell { shell, login, args } => {
-            run_shell(&cli.options, shell.as_deref(), login, args)
+            run_shell(&options, shell.as_deref(), login, args)
         }
-        CliCommand::LoginShell { args } => run_shell(&cli.options, None, true, args),
-        CliCommand::Shim { shell, real, args } => run_shim(&cli.options, &shell, &real, args),
-        CliCommand::Print { format, shell } => run_print(&cli.options, format, shell.as_deref()),
+        CliCommand::LoginShell { args } => run_shell(&options, None, true, args),
+        CliCommand::Shim { shell, real, args } => run_shim(&options, &shell, &real, args),
+        CliCommand::Print { format, shell } => run_print(&options, format, shell.as_deref()),
         CliCommand::Explain { path, json } => {
-            run_backend_value(&cli.options, BackendRequest::Explain { path }, json)
+            run_backend_value(&options, BackendRequest::Explain { path }, json)
         }
-        CliCommand::Doctor { json } => run_doctor(&cli.options, json),
+        CliCommand::Doctor { json } => run_doctor(&options, json),
         CliCommand::Trust { target } => {
-            if cli.options.offline {
-                return offline::trust(&target);
+            if options.offline {
+                return OfflineApi::trust(&target);
             }
-            ensure_backend_options(&cli.options)?;
-            let hash = trust::digest(&target)?;
+            ensure_backend_options(&options)?;
+            let hash = TrustApi::digest(&target)?;
             let target = parse_trust_target(&target)?;
-            let response = crate::backend::request_backend(BackendRequest::Trust { target })?;
-            match response.response {
+            let response = BackendApi::request_backend(BackendRequest::Trust { target })?;
+            match response.response() {
                 BackendResponse::Trusted { .. } => {
-                    output::write_stdout(&format!("trusted: {hash}\n"))?;
+                    OutputApi::write_stdout(&format!("trusted: {hash}\n"))?;
                     Ok(0)
                 }
                 BackendResponse::Error(error) => Err(CliError::Backend(format!(
                     "{}: {}",
-                    error.class, error.message
+                    error.class(),
+                    error.message()
                 ))),
                 other => Err(CliError::Backend(format!(
                     "backend returned unexpected response: {other:?}"
@@ -63,7 +85,7 @@ where
 
 fn run_exec(options: &CliOptions, command: Vec<OsString>) -> Result<i32, CliError> {
     if options.offline {
-        return offline::exec(options, command);
+        return OfflineApi::exec(options, command);
     }
     ensure_backend_options(options)?;
     let mut arguments = command.into_iter();
@@ -72,7 +94,7 @@ fn run_exec(options: &CliOptions, command: Vec<OsString>) -> Result<i32, CliErro
         .expect("argument parser requires a command");
     let line = CommandLine::try_new(program, arguments.collect::<Vec<_>>())?;
     let prepared = prepare_client(options, RequestMode::Exec, None, Vec::new())?;
-    process::execute(line, &prepared.materialized_environment, &prepared.cwd)
+    ProcessApi::execute(line, &prepared.materialized_environment, &prepared.cwd)
 }
 
 fn run_shell(
@@ -82,7 +104,7 @@ fn run_shell(
     args: Vec<OsString>,
 ) -> Result<i32, CliError> {
     if options.offline {
-        return offline::shell(options, shell, login, args);
+        return OfflineApi::shell(options, shell, login, args);
     }
     ensure_backend_options(options)?;
     let mode = if login {
@@ -92,7 +114,7 @@ fn run_shell(
     };
     let prepared = prepare_client(options, mode, shell, args.clone())?;
     let line = prepared_command_line(&prepared)?;
-    process::execute(line, &prepared.materialized_environment, &prepared.cwd)
+    ProcessApi::execute(line, &prepared.materialized_environment, &prepared.cwd)
 }
 
 fn run_shim(
@@ -102,13 +124,13 @@ fn run_shim(
     args: Vec<OsString>,
 ) -> Result<i32, CliError> {
     if options.offline {
-        return offline::shim(options, shell, real, args);
+        return OfflineApi::shim(options, shell, real, args);
     }
     ensure_backend_options(options)?;
-    if config::effective_user_id() == 0 {
+    if ConfigApi::effective_user_id() == 0 {
         if let Some(paths) = BootstrapPaths::from_environment()? {
             let line = paths.build_command(&args)?;
-            return process::execute_inherited(line);
+            return ProcessApi::execute_inherited(line);
         }
     }
 
@@ -119,7 +141,7 @@ fn run_shim(
     // every valid invocation.  The shim path itself is owned by the image
     // layout and is not the configured real shell command.
     let line = Shim::new(real).build(&args)?;
-    process::execute(line, &prepared.materialized_environment, &prepared.cwd)
+    ProcessApi::execute(line, &prepared.materialized_environment, &prepared.cwd)
 }
 
 fn ensure_backend_options(options: &CliOptions) -> Result<(), CliError> {
@@ -148,30 +170,21 @@ fn prepare_client(
     let cwd = options
         .cwd
         .clone()
-        .or_else(|| std::env::var_os("DEVENV_CWD").map(PathBuf::from))
-        .unwrap_or(std::env::current_dir().map_err(|source| {
-            CliError::io(
-                crate::error::IoOperation::ReadCurrentDirectory,
-                None,
-                source,
-            )
-        })?);
+        .or_else(|| var_os("DEVENV_CWD").map(PathBuf::from))
+        .unwrap_or(
+            current_dir()
+                .map_err(|source| CliError::io(IoOperation::ReadCurrentDirectory, None, source))?,
+        );
     let cwd = if cwd.is_absolute() {
         cwd
     } else {
-        std::env::current_dir()
-            .map_err(|source| {
-                CliError::io(
-                    crate::error::IoOperation::ReadCurrentDirectory,
-                    None,
-                    source,
-                )
-            })?
+        current_dir()
+            .map_err(|source| CliError::io(IoOperation::ReadCurrentDirectory, None, source))?
             .join(cwd)
     };
     let shell = shell
         .map(str::to_owned)
-        .or_else(|| std::env::var("DEVENV_SHELL").ok())
+        .or_else(|| var("DEVENV_SHELL").ok())
         .unwrap_or_else(|| "default".to_owned());
     let shell_args = shell_args
         .into_iter()
@@ -185,8 +198,8 @@ fn prepare_client(
         .collect::<Result<Vec<_>, _>>()?;
     let context = RequestContext::new("client", mode, normalize_path(&cwd), shell)
         .with_shell_args(shell_args)
-        .with_ambient_environment(config::ambient_environment());
-    crate::backend::prepare(context)
+        .with_ambient_environment(ConfigApi::ambient_environment());
+    BackendApi::prepare(context)
 }
 
 fn prepared_command_line(prepared: &PreparedResponse) -> Result<CommandLine, CliError> {
@@ -205,15 +218,15 @@ fn prepared_command_line(prepared: &PreparedResponse) -> Result<CommandLine, Cli
 
 fn run_print(
     options: &CliOptions,
-    format: crate::args::OutputFormat,
+    format: OutputFormat,
     shell: Option<&str>,
 ) -> Result<i32, CliError> {
     if options.offline {
-        return offline::print(options, format, shell);
+        return OfflineApi::print(options, format, shell);
     }
     ensure_backend_options(options)?;
     let prepared = prepare_client(options, RequestMode::Print, shell, Vec::new())?;
-    output::print_materialized_environment(
+    OutputApi::print_materialized_environment(
         &prepared.materialized_environment,
         format,
         options.show_secrets,
@@ -228,17 +241,18 @@ fn run_backend_value(
 ) -> Result<i32, CliError> {
     if options.offline {
         if let BackendRequest::Explain { ref path } = request {
-            return offline::explain(options, path.as_deref(), json);
+            return OfflineApi::explain(options, path.as_deref(), json);
         }
     }
     ensure_backend_options(options)?;
-    let response = crate::backend::request_backend(request)?;
-    let value = match response.response {
+    let response = BackendApi::request_backend(request)?;
+    let value = match response.response() {
         BackendResponse::Explain(value) | BackendResponse::Plan(value) => value,
         BackendResponse::Error(error) => {
             return Err(CliError::Backend(format!(
                 "{}: {}",
-                error.class, error.message
+                error.class(),
+                error.message()
             )))
         }
         other => {
@@ -248,27 +262,28 @@ fn run_backend_value(
         }
     };
     let rendered = if json {
-        serde_json::to_string_pretty(&value)
+        to_string_pretty(&value)
     } else {
-        serde_json::to_string(&value)
+        to_string(&value)
     }
-    .map_err(crate::error::OutputError::Json)?;
-    output::write_stdout(&format!("{rendered}\n"))?;
+    .map_err(OutputError::Json)?;
+    OutputApi::write_stdout(&format!("{rendered}\n"))?;
     Ok(0)
 }
 
 fn run_doctor(options: &CliOptions, json: bool) -> Result<i32, CliError> {
     if options.offline {
-        return offline::doctor(options, json);
+        return OfflineApi::doctor(options, json);
     }
     ensure_backend_options(options)?;
-    let response = crate::backend::request_backend(BackendRequest::Doctor)?;
-    let value = match response.response {
+    let response = BackendApi::request_backend(BackendRequest::Doctor)?;
+    let value = match response.response() {
         BackendResponse::Doctor(value) => value,
         BackendResponse::Error(error) => {
             return Err(CliError::Backend(format!(
                 "{}: {}",
-                error.class, error.message
+                error.class(),
+                error.message()
             )))
         }
         other => {
@@ -278,16 +293,16 @@ fn run_doctor(options: &CliOptions, json: bool) -> Result<i32, CliError> {
         }
     };
     if json {
-        output::write_stdout(&format!(
+        OutputApi::write_stdout(&format!(
             "{}\n",
-            serde_json::to_string_pretty(&value).map_err(crate::error::OutputError::Json)?
+            to_string_pretty(&value).map_err(OutputError::Json)?
         ))?;
     } else {
-        output::write_stdout(&format!(
+        OutputApi::write_stdout(&format!(
             "status: {}\n",
             if value
                 .get("ok")
-                .and_then(serde_json::Value::as_bool)
+                .and_then(JsonValue::as_bool)
                 .unwrap_or(false)
             {
                 "ok"
@@ -296,36 +311,30 @@ fn run_doctor(options: &CliOptions, json: bool) -> Result<i32, CliError> {
             }
         ))?;
     }
-    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+    if value.get("ok").and_then(JsonValue::as_bool) == Some(true) {
         Ok(0)
     } else {
         Err(CliError::DoctorFailed { failed_checks: 1 })
     }
 }
 
-fn parse_trust_target(target: &Path) -> Result<dev_env_model::TrustTarget, CliError> {
+fn parse_trust_target(target: &Path) -> Result<TrustTarget, CliError> {
     let value = target.to_string_lossy();
     if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         let mut digest = [0_u8; 32];
         for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
             digest[index] = (hex_value(chunk[0]) << 4) | hex_value(chunk[1]);
         }
-        Ok(dev_env_model::TrustTarget::Sha256 { digest })
+        Ok(TrustTarget::Sha256 { digest })
     } else {
         let path = if target.is_absolute() {
             target.to_path_buf()
         } else {
-            std::env::current_dir()
-                .map_err(|source| {
-                    CliError::io(
-                        crate::error::IoOperation::ReadCurrentDirectory,
-                        None,
-                        source,
-                    )
-                })?
+            current_dir()
+                .map_err(|source| CliError::io(IoOperation::ReadCurrentDirectory, None, source))?
                 .join(target)
         };
-        Ok(dev_env_model::TrustTarget::Path {
+        Ok(TrustTarget::Path {
             path: normalize_path(&path),
         })
     }
@@ -344,14 +353,12 @@ fn normalize_path(path: &Path) -> PathBuf {
     let mut output = PathBuf::new();
     for component in path.components() {
         match component {
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                output.push(component.as_os_str())
-            }
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
+            Component::RootDir | Component::Prefix(_) => output.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
                 output.pop();
             }
-            std::path::Component::Normal(value) => output.push(value),
+            Component::Normal(value) => output.push(value),
         }
     }
     output
@@ -367,8 +374,8 @@ struct BootstrapPaths {
 
 impl BootstrapPaths {
     fn from_environment() -> Result<Option<Self>, CliError> {
-        let container_init = std::env::var_os(CONTAINER_INIT_ENV);
-        let real_shell = std::env::var_os(BOOTSTRAP_REAL_SHELL_ENV);
+        let container_init = var_os(CONTAINER_INIT_ENV);
+        let real_shell = var_os(BOOTSTRAP_REAL_SHELL_ENV);
         if container_init.is_none() && real_shell.is_none() {
             return Ok(None);
         }
@@ -446,8 +453,8 @@ fn validate_bootstrap_executable(variable: &'static str, path: &Path) -> Result<
         return Err(BootstrapError::NotExecutable {
             variable,
             path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            source: IoError::new(
+                ErrorKind::PermissionDenied,
                 "path is not a regular executable file",
             ),
         }

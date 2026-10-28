@@ -1,7 +1,46 @@
-use dev_env_model::MaterializedEnv;
-use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use dev_env_model::{MaterializedEnv, ModelError};
+use std::{
+    error::Error,
+    ffi::{OsStr, OsString},
+    fmt::{self, Display, Formatter},
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[derive(Debug)]
+pub enum CommandLineError {
+    EmptyProgram,
+    NulProgram,
+    NulArgument { index: usize },
+    Environment { source: ModelError },
+}
+
+impl Display for CommandLineError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyProgram => formatter.write_str("command program may not be empty"),
+            Self::NulProgram => formatter.write_str("command program may not contain NUL"),
+            Self::NulArgument { index } => {
+                write!(formatter, "command argument {index} may not contain NUL")
+            }
+            Self::Environment { source } => {
+                write!(
+                    formatter,
+                    "environment injection failed validation: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for CommandLineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Environment { source } => Some(source),
+            Self::EmptyProgram | Self::NulProgram | Self::NulArgument { .. } => None,
+        }
+    }
+}
 
 /// An executable and its argv, kept separate from process execution.
 ///
@@ -80,46 +119,11 @@ impl CommandLine {
         command.env_clear().args(&self.args);
         command.envs(
             environment
-                .values
+                .values()
                 .iter()
-                .map(|(name, value)| (name.as_str(), value.value.as_str())),
+                .map(|(name, value)| (name.as_str(), value.value())),
         );
         Ok(command)
-    }
-}
-
-#[derive(Debug)]
-pub enum CommandLineError {
-    EmptyProgram,
-    NulProgram,
-    NulArgument { index: usize },
-    Environment { source: dev_env_model::ModelError },
-}
-
-impl std::fmt::Display for CommandLineError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyProgram => formatter.write_str("command program may not be empty"),
-            Self::NulProgram => formatter.write_str("command program may not contain NUL"),
-            Self::NulArgument { index } => {
-                write!(formatter, "command argument {index} may not contain NUL")
-            }
-            Self::Environment { source } => {
-                write!(
-                    formatter,
-                    "environment injection failed validation: {source}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for CommandLineError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Environment { source } => Some(source),
-            Self::EmptyProgram | Self::NulProgram | Self::NulArgument { .. } => None,
-        }
     }
 }
 

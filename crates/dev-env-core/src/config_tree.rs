@@ -1,12 +1,22 @@
 use dev_env_model::{ResolvedConfig, ValueTree};
-use std::collections::BTreeMap;
-use std::error::Error;
-use std::fmt;
+use serde_json::{to_value, Error as JsonError, Value};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 #[derive(Debug)]
 pub enum ConfigTreeError {
-    Serialize { source: serde_json::Error },
+    Serialize { source: JsonError },
     UnsupportedNumber,
+}
+
+impl ConfigTreeError {
+    pub fn is_unsupported_number(&self) -> bool {
+        matches!(self, Self::UnsupportedNumber)
+    }
+
+    pub(crate) fn to_value_tree(config: &ResolvedConfig) -> Result<ValueTree, Self> {
+        let value = to_value(config).map_err(|source| Self::Serialize { source })?;
+        convert(value)
+    }
 }
 
 impl fmt::Display for ConfigTreeError {
@@ -32,17 +42,11 @@ impl Error for ConfigTreeError {
     }
 }
 
-pub(crate) fn to_value_tree(config: &ResolvedConfig) -> Result<ValueTree, ConfigTreeError> {
-    let value =
-        serde_json::to_value(config).map_err(|source| ConfigTreeError::Serialize { source })?;
-    convert(value)
-}
-
-fn convert(value: serde_json::Value) -> Result<ValueTree, ConfigTreeError> {
+fn convert(value: Value) -> Result<ValueTree, ConfigTreeError> {
     Ok(match value {
-        serde_json::Value::Null => ValueTree::Null,
-        serde_json::Value::Bool(value) => ValueTree::Bool(value),
-        serde_json::Value::Number(value) => {
+        Value::Null => ValueTree::Null,
+        Value::Bool(value) => ValueTree::Bool(value),
+        Value::Number(value) => {
             if let Some(value) = value.as_i64() {
                 ValueTree::Integer(value)
             } else if let Some(value) = value.as_u64() {
@@ -56,14 +60,14 @@ fn convert(value: serde_json::Value) -> Result<ValueTree, ConfigTreeError> {
                 return Err(ConfigTreeError::UnsupportedNumber);
             }
         }
-        serde_json::Value::String(value) => ValueTree::String(value),
-        serde_json::Value::Array(values) => ValueTree::Array(
+        Value::String(value) => ValueTree::String(value),
+        Value::Array(values) => ValueTree::Array(
             values
                 .into_iter()
                 .map(convert)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        serde_json::Value::Object(values) => ValueTree::Map(
+        Value::Object(values) => ValueTree::Map(
             values
                 .into_iter()
                 .map(|(key, value)| Ok((key, convert(value)?)))

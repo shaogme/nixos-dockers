@@ -1,422 +1,34 @@
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::time::Instant;
-use unix_frame::FrameBudget;
-
-pub use unix_frame::FramePermit;
-
 mod client;
+mod protocol_types;
+
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    time::Instant,
+};
+use unix_frame::{
+    read_json_frame, read_json_frame_until, read_json_frame_until_with_budget, write_json_frame,
+    write_json_frame_until, write_json_frame_until_with_budget, FrameBudget, FrameError,
+};
 
 pub use client::{IdentityBrokerClient, IdentityBrokerError};
-
-pub const PROTOCOL_VERSION: u16 = 4;
-pub const MAX_REQUEST_FRAME_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_RESPONSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_ARGV_ITEMS: usize = 512;
-pub const MAX_ARGV_ITEM_BYTES: usize = 64 * 1024;
-pub const MAX_ARGV_TOTAL_BYTES: usize = 1024 * 1024;
-pub const MAX_RUNTIME_INPUTS: usize = 128;
-pub const MAX_ENVIRONMENT_NAMES: usize = 512;
-pub const MAX_RUNTIME_VALUE_BYTES: usize = 64 * 1024;
-pub const MAX_RUNTIME_VALUES_TOTAL_BYTES: usize = 512 * 1024;
-pub const MAX_CWD_BYTES: usize = 4 * 1024;
-pub const MAX_PLAN_PAGE_ACTIONS: usize = 256;
-pub const FRAME_TIMEOUT_MS: u64 = 30_000;
-pub const MAX_IN_FLIGHT_FRAME_BYTES: usize = 128 * 1024 * 1024;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProtocolLimits {
-    pub request_frame_bytes: usize,
-    pub response_frame_bytes: usize,
-    pub argv_items: usize,
-    pub argv_item_bytes: usize,
-    pub argv_total_bytes: usize,
-    pub runtime_inputs: usize,
-    pub environment_names: usize,
-    pub runtime_value_bytes: usize,
-    pub runtime_values_total_bytes: usize,
-    pub cwd_bytes: usize,
-    pub plan_page_actions: usize,
-    pub supplementary_groups: usize,
-    pub frame_timeout_ms: u64,
-}
-
-impl ProtocolLimits {
-    pub fn current() -> Self {
-        Self {
-            request_frame_bytes: MAX_REQUEST_FRAME_BYTES,
-            response_frame_bytes: MAX_RESPONSE_FRAME_BYTES,
-            argv_items: MAX_ARGV_ITEMS,
-            argv_item_bytes: MAX_ARGV_ITEM_BYTES,
-            argv_total_bytes: MAX_ARGV_TOTAL_BYTES,
-            runtime_inputs: MAX_RUNTIME_INPUTS,
-            environment_names: MAX_ENVIRONMENT_NAMES,
-            runtime_value_bytes: MAX_RUNTIME_VALUE_BYTES,
-            runtime_values_total_bytes: MAX_RUNTIME_VALUES_TOTAL_BYTES,
-            cwd_bytes: MAX_CWD_BYTES,
-            plan_page_actions: MAX_PLAN_PAGE_ACTIONS,
-            supplementary_groups: max_supplementary_groups(),
-            frame_timeout_ms: FRAME_TIMEOUT_MS,
-        }
-    }
-}
+pub use protocol_types::{
+    BackendError, BackendState, BackendStatus, ClientMessage, ClientRequest, CommitResult,
+    CwdObject, ExecTransactionState, FrameWriteError, HandoffCommand, HelloInfo, IdentityRequest,
+    IdentitySource, PeerCredentials, PlanPage, PreparedHandoff, PreparedIdentity, ProtocolError,
+    ProtocolLimits, ReceiptSummary, ResolvedIdentity, ServerMessage, ServerResponse,
+    WorkspaceStatus, FRAME_TIMEOUT_MS, MAX_ARGV_ITEMS, MAX_ARGV_ITEM_BYTES, MAX_ARGV_TOTAL_BYTES,
+    MAX_CWD_BYTES, MAX_ENVIRONMENT_NAMES, MAX_IN_FLIGHT_FRAME_BYTES, MAX_PLAN_PAGE_ACTIONS,
+    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, MAX_RUNTIME_INPUTS,
+    MAX_RUNTIME_VALUES_TOTAL_BYTES, MAX_RUNTIME_VALUE_BYTES, PROTOCOL_VERSION,
+};
+pub use unix_frame::FramePermit;
 
 pub fn max_supplementary_groups() -> usize {
-    let platform_limit = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
-    if platform_limit > 0 {
-        (platform_limit as usize).min(65_536)
-    } else {
-        65_536
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IdentitySource {
-    RunAsRoot,
-    ExplicitHost,
-    ExplicitContainer,
-    WorkspaceMount,
-    ProfileDefault,
-    Current,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceStatus {
-    Mounted,
-    NotMounted,
-    Unavailable,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ResolvedIdentity {
-    pub uid: u32,
-    pub gid: u32,
-    pub user: String,
-    pub home: PathBuf,
-    pub run_as_root: bool,
-    pub uid_source: IdentitySource,
-    pub gid_source: IdentitySource,
-    pub workspace: WorkspaceStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HandoffCommand {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendState {
-    Starting,
-    Ready,
-    Failed,
-    Stopping,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientMessage {
-    pub version: u16,
-    pub request: ClientRequest,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ClientRequest {
-    Hello,
-    PrepareExec {
-        argv: Vec<String>,
-        cwd: PathBuf,
-        #[serde(default)]
-        inputs: BTreeMap<String, String>,
-        #[serde(default)]
-        environment: BTreeMap<String, String>,
-        request_budget_ms: u64,
-    },
-    CommitExec {
-        prepare_id: String,
-    },
-    AbortExec {
-        prepare_id: String,
-    },
-    GetExecResult {
-        prepare_id: String,
-    },
-    /// Resolve a request identity for a trusted long-lived runtime. The
-    /// caller never supplies a UID/GID pair as the identity itself; the
-    /// backend only forwards the authenticated client observation to the
-    /// container-init broker.
-    PrepareIdentity {
-        cwd: PathBuf,
-        #[serde(default)]
-        inputs: BTreeMap<String, String>,
-        #[serde(default)]
-        environment: BTreeMap<String, String>,
-        requested: IdentityRequest,
-    },
-    Status,
-    Plan {
-        snapshot_id: Option<String>,
-        offset: usize,
-    },
-    Doctor,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerMessage {
-    pub version: u16,
-    pub response: ServerResponse,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ServerResponse {
-    Hello(HelloInfo),
-    PreparedExec(PreparedHandoff),
-    CommitResult(CommitResult),
-    Identity(PreparedIdentity),
-    Status(BackendStatus),
-    PlanPage(PlanPage),
-    Doctor(serde_json::Value),
-    Error(BackendError),
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanPage {
-    pub online: bool,
-    pub profile: String,
-    pub snapshot_id: String,
-    pub offset: usize,
-    pub next_offset: Option<usize>,
-    pub total_actions: usize,
-    pub actions: Vec<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
-pub enum IdentityRequest {
-    Peer { uid: u32, gid: u32 },
-    Root,
-    User { name: String },
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedIdentity {
-    pub uid: u32,
-    pub gid: u32,
-    pub user: String,
-    pub home: PathBuf,
-    #[serde(default)]
-    pub supplemental_groups: Vec<u32>,
-    pub run_as_root: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HelloInfo {
-    pub state: BackendState,
-    pub profile: String,
-    pub snapshot_id: String,
-    pub runtime_inputs: Vec<String>,
-    pub environment_names: Vec<String>,
-    pub limits: ProtocolLimits,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedHandoff {
-    pub prepare_id: String,
-    pub snapshot_id: String,
-    pub command: HandoffCommand,
-    /// Canonical path bound to `cwd_object` by one open directory descriptor.
-    pub cwd: PathBuf,
-    pub cwd_object: CwdObject,
-    /// The complete login environment that must be applied to the handoff.
-    pub login_environment: BTreeMap<String, String>,
-    pub identity: ResolvedIdentity,
-    pub supplemental_groups: Vec<u32>,
-    pub root_service: bool,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CwdObject {
-    pub device: u64,
-    pub inode: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecTransactionState {
-    Prepared,
-    Committing,
-    Committed,
-    Aborted,
-    Failed,
-    OutcomeUnknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommitResult {
-    pub prepare_id: String,
-    pub state: ExecTransactionState,
-    pub receipt_summary: Option<ReceiptSummary>,
-    pub error: Option<BackendError>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReceiptSummary {
-    pub succeeded: bool,
-    pub action_count: usize,
-    pub warning_count: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BackendStatus {
-    pub state: BackendState,
-    pub profile: String,
-    pub snapshot_id: String,
-    pub backend_pid: u32,
-    pub initial_child_pid: Option<u32>,
-    pub started_unix_seconds: u64,
-    pub active_connections: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BackendError {
-    pub class: String,
-    /// `true` guarantees the server has not started request side effects.
-    pub retryable: bool,
-    pub message: String,
-    pub action_id: Option<String>,
-    pub path: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PeerCredentials {
-    pub pid: u32,
-    pub uid: u32,
-    pub gid: u32,
-}
-
-#[derive(Debug)]
-pub enum ProtocolError {
-    Io(io::Error),
-    InvalidFrame(String),
-    UnsupportedVersion(u16),
-    FrameTooLarge {
-        length: usize,
-        limit: usize,
-    },
-    LimitExceeded {
-        class: &'static str,
-        field: String,
-        observed: usize,
-        limit: usize,
-    },
-    IncompatibleLimits,
-}
-
-impl ProtocolError {
-    pub fn invalid_frame(message: impl Into<String>) -> Self {
-        Self::InvalidFrame(message.into())
-    }
-
-    pub fn as_io_error(&self) -> io::Error {
-        match self {
-            Self::Io(error) => io::Error::new(error.kind(), error.to_string()),
-            Self::InvalidFrame(message) => {
-                io::Error::new(io::ErrorKind::InvalidData, message.clone())
-            }
-            Self::UnsupportedVersion(version) => io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported protocol version {version}"),
-            ),
-            Self::FrameTooLarge { length, limit } => io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("frame length {length} exceeds the {limit} byte limit"),
-            ),
-            Self::LimitExceeded {
-                class,
-                field,
-                observed,
-                limit,
-            } => io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{class}: {field} is {observed}; maximum is {limit}"),
-            ),
-            Self::IncompatibleLimits => io::Error::new(
-                io::ErrorKind::InvalidData,
-                "backend protocol limits are incompatible with this client build",
-            ),
-        }
-    }
-}
-
-impl std::fmt::Display for ProtocolError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(formatter, "protocol IO failed: {error}"),
-            Self::InvalidFrame(message) => write!(formatter, "invalid protocol frame: {message}"),
-            Self::UnsupportedVersion(version) => {
-                write!(formatter, "unsupported protocol version {version}")
-            }
-            Self::FrameTooLarge { length, limit } => {
-                write!(
-                    formatter,
-                    "frame length {length} exceeds the {limit} byte limit"
-                )
-            }
-            Self::LimitExceeded {
-                class,
-                field,
-                observed,
-                limit,
-            } => write!(
-                formatter,
-                "{class}: {field} is {observed}; maximum is {limit}"
-            ),
-            Self::IncompatibleLimits => formatter
-                .write_str("backend protocol limits are incompatible with this client build"),
-        }
-    }
-}
-
-impl std::error::Error for ProtocolError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for ProtocolError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-#[derive(Debug)]
-pub struct FrameWriteError {
-    pub error: ProtocolError,
-    pub bytes_written: usize,
+    ProtocolLimits::max_supplementary_groups()
 }
 
 pub fn read_message<T: for<'de> Deserialize<'de>>(
@@ -429,7 +41,7 @@ pub fn read_message_with_limit<T: for<'de> Deserialize<'de>>(
     reader: &mut impl Read,
     limit: usize,
 ) -> Result<T, ProtocolError> {
-    unix_frame::read_json_frame(reader, limit).map_err(map_frame_error)
+    read_json_frame(reader, limit).map_err(map_frame_error)
 }
 
 pub fn read_message_until<T: for<'de> Deserialize<'de>>(
@@ -437,7 +49,7 @@ pub fn read_message_until<T: for<'de> Deserialize<'de>>(
     deadline: Instant,
     limit: usize,
 ) -> Result<T, ProtocolError> {
-    unix_frame::read_json_frame_until(stream, deadline, limit).map_err(map_frame_error)
+    read_json_frame_until(stream, deadline, limit).map_err(map_frame_error)
 }
 
 pub fn read_message_until_with_budget<T: for<'de> Deserialize<'de>>(
@@ -446,15 +58,14 @@ pub fn read_message_until_with_budget<T: for<'de> Deserialize<'de>>(
     limit: usize,
     budget: &FrameBudget,
 ) -> Result<(T, FramePermit), ProtocolError> {
-    unix_frame::read_json_frame_until_with_budget(stream, deadline, limit, budget)
-        .map_err(map_frame_error)
+    read_json_frame_until_with_budget(stream, deadline, limit, budget).map_err(map_frame_error)
 }
 
 pub fn write_message<T: Serialize>(
     writer: &mut impl Write,
     message: &T,
 ) -> Result<(), ProtocolError> {
-    unix_frame::write_json_frame(writer, message, MAX_RESPONSE_FRAME_BYTES).map_err(map_frame_error)
+    write_json_frame(writer, message, MAX_RESPONSE_FRAME_BYTES).map_err(map_frame_error)
 }
 
 pub fn write_message_until<T: Serialize>(
@@ -463,11 +74,9 @@ pub fn write_message_until<T: Serialize>(
     deadline: Instant,
     limit: usize,
 ) -> Result<usize, FrameWriteError> {
-    unix_frame::write_json_frame_until(stream, message, deadline, limit).map_err(|error| {
-        FrameWriteError {
-            error: map_frame_error(error.error),
-            bytes_written: error.bytes_written,
-        }
+    write_json_frame_until(stream, message, deadline, limit).map_err(|error| FrameWriteError {
+        error: map_frame_error(error.error),
+        bytes_written: error.bytes_written,
     })
 }
 
@@ -478,34 +87,36 @@ pub fn write_message_until_with_budget<T: Serialize>(
     limit: usize,
     budget: &FrameBudget,
 ) -> Result<usize, FrameWriteError> {
-    unix_frame::write_json_frame_until_with_budget(stream, message, deadline, limit, budget)
-        .map_err(|error| FrameWriteError {
+    write_json_frame_until_with_budget(stream, message, deadline, limit, budget).map_err(|error| {
+        FrameWriteError {
             error: map_frame_error(error.error),
             bytes_written: error.bytes_written,
-        })
+        }
+    })
 }
 
-fn map_frame_error(error: unix_frame::FrameError) -> ProtocolError {
+fn map_frame_error(error: FrameError) -> ProtocolError {
     match error {
-        unix_frame::FrameError::Io(error) => ProtocolError::Io(error),
-        unix_frame::FrameError::Json(error) => ProtocolError::invalid_frame(error.to_string()),
-        unix_frame::FrameError::Empty => {
-            ProtocolError::invalid_frame("frame length must be nonzero")
-        }
-        unix_frame::FrameError::TooLarge { length, limit } => {
-            ProtocolError::FrameTooLarge { length, limit }
-        }
-        unix_frame::FrameError::LengthOverflow(_) => {
-            ProtocolError::invalid_frame("frame length exceeds u32")
-        }
+        FrameError::Io(error) => ProtocolError::Io(error),
+        FrameError::Json(error) => ProtocolError::invalid_frame(error.to_string()),
+        FrameError::Empty => ProtocolError::invalid_frame("frame length must be nonzero"),
+        FrameError::TooLarge { length, limit } => ProtocolError::FrameTooLarge { length, limit },
+        FrameError::LengthOverflow(_) => ProtocolError::invalid_frame("frame length exceeds u32"),
     }
+}
+
+struct RequestValidation<'a> {
+    argv: Option<&'a [String]>,
+    cwd: Option<&'a PathBuf>,
+    inputs: Option<&'a BTreeMap<String, String>>,
+    environment: Option<&'a BTreeMap<String, String>>,
 }
 
 pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
     if message.version != PROTOCOL_VERSION {
         return Err(ProtocolError::UnsupportedVersion(message.version));
     }
-    let (argv, cwd, inputs, environment) = match &message.request {
+    let fields = match &message.request {
         ClientRequest::PrepareExec {
             argv,
             cwd,
@@ -518,7 +129,12 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
                     "request budget must be between 1 and 300000 milliseconds",
                 ));
             }
-            (Some(argv.as_slice()), Some(cwd), inputs, environment)
+            RequestValidation {
+                argv: Some(argv),
+                cwd: Some(cwd),
+                inputs: Some(inputs),
+                environment: Some(environment),
+            }
         }
         ClientRequest::PrepareIdentity {
             cwd,
@@ -542,7 +158,12 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
                 | IdentityRequest::Root
                 | IdentityRequest::User { .. } => {}
             }
-            (None, Some(cwd), inputs, environment)
+            RequestValidation {
+                argv: None,
+                cwd: Some(cwd),
+                inputs: Some(inputs),
+                environment: Some(environment),
+            }
         }
         ClientRequest::Plan { snapshot_id, .. }
             if snapshot_id
@@ -551,9 +172,14 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
         {
             return Err(ProtocolError::invalid_frame("plan snapshot id is invalid"));
         }
-        _ => (None, None, &BTreeMap::new(), &BTreeMap::new()),
+        _ => RequestValidation {
+            argv: None,
+            cwd: None,
+            inputs: None,
+            environment: None,
+        },
     };
-    if let Some(cwd) = cwd {
+    if let Some(cwd) = fields.cwd {
         let cwd_bytes = cwd.as_os_str().as_encoded_bytes().len();
         if cwd_bytes > MAX_CWD_BYTES {
             return Err(limit_error(
@@ -579,10 +205,12 @@ pub fn validate_message(message: &ClientMessage) -> Result<(), ProtocolError> {
             "prepare_id must be a nonempty hexadecimal token no longer than 128 bytes",
         ));
     }
-    if let Some(argv) = argv {
+    if let Some(argv) = fields.argv {
         validate_argv(argv)?;
     }
-    validate_runtime_values(inputs, environment)?;
+    if let (Some(inputs), Some(environment)) = (fields.inputs, fields.environment) {
+        validate_runtime_values(inputs, environment)?;
+    }
     Ok(())
 }
 
@@ -705,13 +333,13 @@ fn limit_error(class: &'static str, field: &str, observed: usize, limit: usize) 
 #[cfg(test)]
 mod tests {
     use super::{
-        read_message, validate_message, write_message, ClientMessage, ClientRequest,
+        read_message, validate_argv, validate_message, write_message, ClientMessage, ClientRequest,
         IdentityRequest, ProtocolError, ProtocolLimits, ServerMessage, ServerResponse,
+        MAX_ARGV_ITEMS, MAX_ARGV_ITEM_BYTES, MAX_REQUEST_FRAME_BYTES, MAX_RUNTIME_VALUE_BYTES,
         PROTOCOL_VERSION,
     };
-    use std::collections::BTreeMap;
-    use std::io::Cursor;
-    use std::path::PathBuf;
+    use serde_json::{from_value, json, to_value};
+    use std::{collections::BTreeMap, io::Cursor, path::PathBuf};
 
     fn message(request: ClientRequest) -> ClientMessage {
         ClientMessage {
@@ -742,11 +370,11 @@ mod tests {
 
     #[test]
     fn v4_identity_handshake_includes_negotiated_limits() {
-        let limits = serde_json::to_value(ProtocolLimits::current()).unwrap();
-        let hello = serde_json::to_value(message(ClientRequest::Hello)).unwrap();
+        let limits = to_value(ProtocolLimits::current()).unwrap();
+        let hello = to_value(message(ClientRequest::Hello)).unwrap();
         assert_eq!(
             hello,
-            serde_json::json!({
+            json!({
                 "version": 4,
                 "request": { "type": "hello" }
             })
@@ -762,8 +390,8 @@ mod tests {
             },
         });
         assert_eq!(
-            serde_json::to_value(prepare).unwrap(),
-            serde_json::json!({
+            to_value(prepare).unwrap(),
+            json!({
                 "version": 4,
                 "request": {
                     "type": "prepare_identity",
@@ -775,7 +403,7 @@ mod tests {
             })
         );
 
-        let hello: ServerMessage = serde_json::from_value(serde_json::json!({
+        let hello: ServerMessage = from_value(json!({
             "version": 4,
             "response": {
                 "type": "hello",
@@ -790,7 +418,7 @@ mod tests {
         .unwrap();
         assert!(matches!(hello.response, ServerResponse::Hello(_)));
 
-        let identity: ServerMessage = serde_json::from_value(serde_json::json!({
+        let identity: ServerMessage = from_value(json!({
             "version": 4,
             "response": {
                 "type": "identity",
@@ -808,7 +436,7 @@ mod tests {
 
     #[test]
     fn frame_size_utf8_truncation_version_and_request_fields_are_checked() {
-        let too_large = ((super::MAX_REQUEST_FRAME_BYTES + 1) as u32).to_be_bytes();
+        let too_large = ((MAX_REQUEST_FRAME_BYTES + 1) as u32).to_be_bytes();
         assert!(read_message::<ClientMessage>(&mut Cursor::new(too_large)).is_err());
         assert!(read_message::<ClientMessage>(&mut Cursor::new([0, 0])).is_err());
 
@@ -860,29 +488,29 @@ mod tests {
     #[test]
     fn argv_limits_count_utf8_bytes_and_accept_the_reported_regression_case() {
         let regression_argument = "x".repeat(37_543);
-        assert!(super::validate_argv(&[regression_argument]).is_ok());
+        assert!(validate_argv(&[regression_argument]).is_ok());
 
-        let oversized_argument = "x".repeat(super::MAX_ARGV_ITEM_BYTES + 1);
+        let oversized_argument = "x".repeat(MAX_ARGV_ITEM_BYTES + 1);
         assert!(matches!(
-            super::validate_argv(&[oversized_argument]),
+            validate_argv(&[oversized_argument]),
             Err(ProtocolError::LimitExceeded {
                 class: "argument_too_large",
                 ..
             })
         ));
 
-        let oversized_total = vec!["x".repeat(super::MAX_ARGV_ITEM_BYTES); 17];
+        let oversized_total = vec!["x".repeat(MAX_ARGV_ITEM_BYTES); 17];
         assert!(matches!(
-            super::validate_argv(&oversized_total),
+            validate_argv(&oversized_total),
             Err(ProtocolError::LimitExceeded {
                 class: "argv_too_large",
                 ..
             })
         ));
 
-        let oversized_count = vec![String::new(); super::MAX_ARGV_ITEMS + 1];
+        let oversized_count = vec![String::new(); MAX_ARGV_ITEMS + 1];
         assert!(matches!(
-            super::validate_argv(&oversized_count),
+            validate_argv(&oversized_count),
             Err(ProtocolError::LimitExceeded {
                 class: "argv_too_large",
                 ..
@@ -896,7 +524,7 @@ mod tests {
             cwd: PathBuf::from("/workspace"),
             inputs: BTreeMap::from([(
                 "INPUT".to_owned(),
-                "é".repeat(super::MAX_RUNTIME_VALUE_BYTES / 2 + 1),
+                "é".repeat(MAX_RUNTIME_VALUE_BYTES / 2 + 1),
             )]),
             environment: BTreeMap::new(),
             requested: IdentityRequest::Root,

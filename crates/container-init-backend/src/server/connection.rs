@@ -6,9 +6,9 @@ use super::{
 };
 use container_init_protocol::{
     read_message_until_with_budget, validate_message, write_message_until_with_budget,
-    BackendError, ClientMessage, ClientRequest, HelloInfo, PeerCredentials, ProtocolError,
-    ProtocolLimits, ServerMessage, ServerResponse, FRAME_TIMEOUT_MS, MAX_REQUEST_FRAME_BYTES,
-    MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
+    BackendError, ClientMessage, ClientRequest, FramePermit, HelloInfo, PeerCredentials,
+    ProtocolError, ProtocolLimits, ServerMessage, ServerResponse, FRAME_TIMEOUT_MS,
+    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use std::{
     io,
@@ -213,7 +213,7 @@ fn read_client_message(
     stream: &mut UnixStream,
     deadline: Instant,
     budget: &FrameBudget,
-) -> Result<Option<(ClientMessage, container_init_protocol::FramePermit)>, ProtocolError> {
+) -> Result<Option<(ClientMessage, FramePermit)>, ProtocolError> {
     let (message, permit) =
         match read_message_until_with_budget(stream, deadline, MAX_REQUEST_FRAME_BYTES, budget) {
             Ok(message) => message,

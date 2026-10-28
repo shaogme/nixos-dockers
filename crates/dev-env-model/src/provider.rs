@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeSet, error::Error as StdError, fmt};
 
-use crate::condition::Condition;
-use crate::validation::{validate_command_arg, validate_glob, validate_id, validate_nonempty_text};
-use crate::{ModelError, Sensitivity};
+use crate::{
+    condition::Condition, validation::StringValidation, ModelError, PathMode, Sensitivity,
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,21 +66,37 @@ impl fmt::Display for ProviderError {
     }
 }
 
-impl std::error::Error for ProviderError {}
+impl StdError for ProviderError {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareStep {
-    pub argv: Vec<String>,
-    pub when: Option<String>,
+    argv: Vec<String>,
+    when: Option<String>,
     #[serde(default)]
-    pub failure: FailurePolicy,
-    pub timeout_ms: Option<u64>,
+    failure: FailurePolicy,
+    timeout_ms: Option<u64>,
     #[serde(default)]
-    pub sensitivity: Sensitivity,
+    sensitivity: Sensitivity,
 }
 
 impl PrepareStep {
+    pub fn new(
+        argv: Vec<String>,
+        when: Option<String>,
+        failure: FailurePolicy,
+        timeout_ms: Option<u64>,
+        sensitivity: Sensitivity,
+    ) -> Self {
+        Self {
+            argv,
+            when,
+            failure,
+            timeout_ms,
+            sensitivity,
+        }
+    }
+
     pub fn validate(&self, provider: &str, index: usize) -> Result<(), ModelError> {
         if self.argv.is_empty() {
             return Err(ModelError::InvalidProvider {
@@ -95,14 +111,12 @@ impl PrepareStep {
                     reason: ProviderError::EmptyArg,
                 });
             }
-            validate_command_arg(
-                &format!("providers.{provider}.prepare[{index}].argv"),
-                argument,
-            )
-            .map_err(|_| ModelError::InvalidProvider {
-                provider: provider.to_owned(),
-                reason: ProviderError::InvalidArg,
-            })?;
+            argument
+                .validate_command_arg(&format!("providers.{provider}.prepare[{index}].argv"))
+                .map_err(|_| ModelError::InvalidProvider {
+                    provider: provider.to_owned(),
+                    reason: ProviderError::InvalidArg,
+                })?;
         }
         if let Some(condition) = &self.when {
             Condition::parse(condition).map_err(|_| ModelError::InvalidProvider {
@@ -123,16 +137,37 @@ impl PrepareStep {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellEnvConfig {
-    pub argv: Vec<String>,
-    pub format: ShellEnvFormat,
+    argv: Vec<String>,
+    format: ShellEnvFormat,
     #[serde(default)]
-    pub failure: FailurePolicy,
+    failure: FailurePolicy,
     #[serde(default)]
-    pub path_mode: crate::PathMode,
-    pub timeout_ms: Option<u64>,
+    path_mode: PathMode,
+    timeout_ms: Option<u64>,
 }
 
 impl ShellEnvConfig {
+    pub fn new(
+        argv: Vec<String>,
+        format: ShellEnvFormat,
+        failure: FailurePolicy,
+        path_mode: PathMode,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            argv,
+            format,
+            failure,
+            path_mode,
+            timeout_ms,
+        }
+    }
+
+    pub fn with_format(mut self, format: ShellEnvFormat) -> Self {
+        self.format = format;
+        self
+    }
+
     pub fn validate(&self, provider: &str) -> Result<(), ModelError> {
         if self.argv.is_empty() {
             return Err(ModelError::InvalidProvider {
@@ -147,7 +182,8 @@ impl ShellEnvConfig {
                     reason: ProviderError::EmptyArg,
                 });
             }
-            validate_command_arg(&format!("providers.{provider}.shellenv.argv"), argument)
+            argument
+                .validate_command_arg(&format!("providers.{provider}.shellenv.argv"))
                 .map_err(|_| ModelError::InvalidProvider {
                     provider: provider.to_owned(),
                     reason: ProviderError::InvalidArg,
@@ -166,39 +202,80 @@ impl ShellEnvConfig {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
-    pub executable: String,
+    executable: String,
     #[serde(default)]
-    pub detect_files: Vec<String>,
+    detect_files: Vec<String>,
     #[serde(default)]
-    pub missing: MissingProviderPolicy,
+    missing: MissingProviderPolicy,
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    depends_on: Vec<String>,
     #[serde(default)]
-    pub prepare: Vec<PrepareStep>,
-    pub shellenv: Option<ShellEnvConfig>,
+    prepare: Vec<PrepareStep>,
+    shellenv: Option<ShellEnvConfig>,
     #[serde(default)]
-    pub sensitivity: Sensitivity,
+    sensitivity: Sensitivity,
 }
 
 impl ProviderConfig {
+    pub fn new(
+        executable: impl Into<String>,
+        detect_files: Vec<String>,
+        missing: MissingProviderPolicy,
+        depends_on: Vec<String>,
+        prepare: Vec<PrepareStep>,
+    ) -> Self {
+        Self {
+            executable: executable.into(),
+            detect_files,
+            missing,
+            depends_on,
+            prepare,
+            shellenv: None,
+            sensitivity: Sensitivity::Public,
+        }
+    }
+
+    pub fn with_shellenv(mut self, shellenv: ShellEnvConfig) -> Self {
+        self.shellenv = Some(shellenv);
+        self
+    }
+
+    pub fn with_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
+        self.sensitivity = sensitivity;
+        self
+    }
+
+    pub fn with_depends_on(mut self, depends_on: Vec<String>) -> Self {
+        self.depends_on = depends_on;
+        self
+    }
+
+    pub fn with_detect_files(mut self, detect_files: Vec<String>) -> Self {
+        self.detect_files = detect_files;
+        self
+    }
+
+    pub fn with_missing(mut self, missing: MissingProviderPolicy) -> Self {
+        self.missing = missing;
+        self
+    }
+
     pub fn validate(&self, id: &str) -> Result<(), ModelError> {
-        validate_id(&format!("providers.{id}"), id).map_err(|_| ModelError::InvalidProvider {
-            provider: id.to_owned(),
-            reason: ProviderError::InvalidId,
-        })?;
-        validate_nonempty_text(
-            &format!("providers.{id}.executable"),
-            &self.executable,
-            false,
-        )
-        .map_err(|_| ModelError::InvalidProvider {
-            provider: id.to_owned(),
-            reason: if self.executable.is_empty() {
-                ProviderError::EmptyExecutable
-            } else {
-                ProviderError::InvalidExecutable
-            },
-        })?;
+        id.validate_id(&format!("providers.{id}"))
+            .map_err(|_| ModelError::InvalidProvider {
+                provider: id.to_owned(),
+                reason: ProviderError::InvalidId,
+            })?;
+        self.executable
+            .validate_nonempty_text(&format!("providers.{id}.executable"), false)
+            .map_err(|_| ModelError::InvalidProvider {
+                provider: id.to_owned(),
+                reason: if self.executable.is_empty() {
+                    ProviderError::EmptyExecutable
+                } else {
+                    ProviderError::InvalidExecutable
+                },
+            })?;
         if self.executable.chars().any(char::is_whitespace)
             || self.executable.contains("$(")
             || self.executable.contains('`')
@@ -214,21 +291,20 @@ impl ProviderConfig {
             });
         }
         for (index, glob) in self.detect_files.iter().enumerate() {
-            validate_glob(&format!("providers.{id}.detect_files[{index}]"), glob).map_err(
-                |_| ModelError::InvalidProvider {
+            glob.validate_glob(&format!("providers.{id}.detect_files[{index}]"))
+                .map_err(|_| ModelError::InvalidProvider {
                     provider: id.to_owned(),
                     reason: ProviderError::InvalidGlob,
-                },
-            )?;
+                })?;
         }
-        let mut dependencies = std::collections::BTreeSet::new();
+        let mut dependencies = BTreeSet::new();
         for dependency in &self.depends_on {
-            validate_id(&format!("providers.{id}.depends_on"), dependency).map_err(|_| {
-                ModelError::InvalidProvider {
+            dependency
+                .validate_id(&format!("providers.{id}.depends_on"))
+                .map_err(|_| ModelError::InvalidProvider {
                     provider: id.to_owned(),
                     reason: ProviderError::InvalidId,
-                }
-            })?;
+                })?;
             if !dependencies.insert(dependency) {
                 return Err(ModelError::InvalidProvider {
                     provider: id.to_owned(),
@@ -243,5 +319,79 @@ impl ProviderConfig {
             shellenv.validate(id)?;
         }
         Ok(())
+    }
+}
+
+impl PrepareStep {
+    pub fn argv(&self) -> &Vec<String> {
+        &self.argv
+    }
+
+    pub fn when(&self) -> Option<&str> {
+        self.when.as_deref()
+    }
+
+    pub fn failure(&self) -> FailurePolicy {
+        self.failure
+    }
+
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+    }
+
+    pub fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
+}
+
+impl ShellEnvConfig {
+    pub fn argv(&self) -> &Vec<String> {
+        &self.argv
+    }
+
+    pub fn format(&self) -> ShellEnvFormat {
+        self.format
+    }
+
+    pub fn failure(&self) -> FailurePolicy {
+        self.failure
+    }
+
+    pub fn path_mode(&self) -> PathMode {
+        self.path_mode
+    }
+
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+    }
+}
+
+impl ProviderConfig {
+    pub fn executable(&self) -> &str {
+        &self.executable
+    }
+
+    pub fn detect_files(&self) -> &Vec<String> {
+        &self.detect_files
+    }
+
+    pub fn missing(&self) -> MissingProviderPolicy {
+        self.missing
+    }
+
+    pub fn depends_on(&self) -> &Vec<String> {
+        &self.depends_on
+    }
+
+    pub fn prepare(&self) -> &Vec<PrepareStep> {
+        &self.prepare
+    }
+
+    pub fn shellenv(&self) -> &Option<ShellEnvConfig> {
+        &self.shellenv
+    }
+
+    pub fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
     }
 }

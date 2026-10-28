@@ -1,9 +1,14 @@
-use crate::config::LoadedConfig;
-use dev_env_model::MissingProviderPolicy;
-use dev_env_provider::{ExecutableLocator, SystemExecutableLocator};
-use serde::Serialize;
-use std::fs;
-use std::path::Path;
+use {
+    crate::{ConfigApi, LoadedConfig},
+    dev_env_model::MissingProviderPolicy,
+    dev_env_provider::{fingerprint_bytes, ExecutableLocator, SystemExecutableLocator},
+    serde::Serialize,
+    serde_json::to_vec,
+    std::{fs, io::ErrorKind, path::Path},
+};
+
+#[cfg(unix)]
+use libc::geteuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,16 +58,44 @@ pub struct DoctorCheck {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DoctorReport {
-    pub profile: String,
-    pub profile_chain: Vec<String>,
-    pub workspace: String,
-    pub cwd: String,
-    pub config_fingerprint: String,
-    pub checks: Vec<DoctorCheck>,
-    pub ok: bool,
+    profile: String,
+    profile_chain: Vec<String>,
+    workspace: String,
+    cwd: String,
+    config_fingerprint: String,
+    checks: Vec<DoctorCheck>,
+    ok: bool,
 }
 
 impl DoctorReport {
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub fn profile_chain(&self) -> &[String] {
+        &self.profile_chain
+    }
+
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    pub fn config_fingerprint(&self) -> &str {
+        &self.config_fingerprint
+    }
+
+    pub fn checks(&self) -> &[DoctorCheck] {
+        &self.checks
+    }
+
+    pub fn ok(&self) -> bool {
+        self.ok
+    }
+
     pub fn failed_checks(&self) -> impl Iterator<Item = &DoctorCheck> {
         self.checks
             .iter()
@@ -70,12 +103,20 @@ impl DoctorReport {
     }
 }
 
-pub fn inspect(loaded: &LoadedConfig) -> DoctorReport {
+pub struct DoctorApi;
+
+impl DoctorApi {
+    pub fn inspect(loaded: &LoadedConfig) -> DoctorReport {
+        inspect_inner(loaded)
+    }
+}
+
+fn inspect_inner(loaded: &LoadedConfig) -> DoctorReport {
     let mut checks = Vec::new();
     check_workspace(loaded.workspace(), &mut checks);
 
-    for (id, shell) in &loaded.config().shells {
-        let path = Path::new(&shell.command);
+    for (id, shell) in loaded.config().shells() {
+        let path = Path::new(shell.command());
         if executable_file(path) {
             checks.push(DoctorCheck {
                 name: format!("shell.{id}"),
@@ -90,16 +131,16 @@ pub fn inspect(loaded: &LoadedConfig) -> DoctorReport {
                 message: format!("{} is not an executable file", path.display()),
                 issue: Some(DoctorIssue::ShellNotExecutable {
                     shell: id.clone(),
-                    command: shell.command.clone(),
+                    command: shell.command().to_owned(),
                 }),
             });
         }
     }
 
     let locator = SystemExecutableLocator;
-    let environment = crate::config::ambient_environment();
-    for (id, provider) in &loaded.config().providers {
-        if !provider.detect_files.is_empty() {
+    let environment = ConfigApi::ambient_environment();
+    for (id, provider) in loaded.config().providers() {
+        if !provider.detect_files().is_empty() {
             checks.push(DoctorCheck {
                 name: format!("provider.{id}"),
                 status: DoctorStatus::Warn,
@@ -108,27 +149,27 @@ pub fn inspect(loaded: &LoadedConfig) -> DoctorReport {
             });
             continue;
         }
-        match locator.locate(&provider.executable, &environment) {
+        match locator.locate(provider.executable(), &environment) {
             Ok(Some(path)) => checks.push(DoctorCheck {
                 name: format!("provider.{id}"),
                 status: DoctorStatus::Pass,
-                message: format!("{} resolves to {}", provider.executable, path.display()),
+                message: format!("{} resolves to {}", provider.executable(), path.display()),
                 issue: None,
             }),
             Ok(None) => {
-                let (status, issue) = match provider.missing {
+                let (status, issue) = match provider.missing() {
                     MissingProviderPolicy::Error => (
                         DoctorStatus::Fail,
                         Some(DoctorIssue::ProviderNotFound {
                             provider: id.clone(),
-                            executable: provider.executable.clone(),
+                            executable: provider.executable().to_owned(),
                         }),
                     ),
                     MissingProviderPolicy::Warn => (
                         DoctorStatus::Warn,
                         Some(DoctorIssue::ProviderNotFound {
                             provider: id.clone(),
-                            executable: provider.executable.clone(),
+                            executable: provider.executable().to_owned(),
                         }),
                     ),
                     MissingProviderPolicy::Ignore => (DoctorStatus::Pass, None),
@@ -136,7 +177,10 @@ pub fn inspect(loaded: &LoadedConfig) -> DoctorReport {
                 checks.push(DoctorCheck {
                     name: format!("provider.{id}"),
                     status,
-                    message: format!("provider executable {} was not found", provider.executable),
+                    message: format!(
+                        "provider executable {} was not found",
+                        provider.executable()
+                    ),
                     issue,
                 });
             }
@@ -151,8 +195,8 @@ pub fn inspect(loaded: &LoadedConfig) -> DoctorReport {
         }
     }
 
-    let config_fingerprint = serde_json::to_vec(loaded.config())
-        .map(|value| dev_env_provider::fingerprint_bytes(&value))
+    let config_fingerprint = to_vec(loaded.config())
+        .map(|value| fingerprint_bytes(&value))
         .map(hex_digest)
         .unwrap_or_else(|_| "<unavailable>".to_owned());
     let ok = checks
@@ -225,7 +269,7 @@ fn writable(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        (unsafe { libc::geteuid() == 0 }) || metadata.permissions().mode() & 0o222 != 0
+        (unsafe { geteuid() == 0 }) || metadata.permissions().mode() & 0o222 != 0
     }
     #[cfg(not(unix))]
     {
@@ -233,11 +277,11 @@ fn writable(metadata: &fs::Metadata) -> bool {
     }
 }
 
-fn io_kind(kind: std::io::ErrorKind) -> DoctorIoKind {
+fn io_kind(kind: ErrorKind) -> DoctorIoKind {
     match kind {
-        std::io::ErrorKind::PermissionDenied => DoctorIoKind::PermissionDenied,
-        std::io::ErrorKind::NotFound => DoctorIoKind::NotFound,
-        std::io::ErrorKind::NotADirectory => DoctorIoKind::NotDirectory,
+        ErrorKind::PermissionDenied => DoctorIoKind::PermissionDenied,
+        ErrorKind::NotFound => DoctorIoKind::NotFound,
+        ErrorKind::NotADirectory => DoctorIoKind::NotDirectory,
         _ => DoctorIoKind::Other,
     }
 }

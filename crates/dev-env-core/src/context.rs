@@ -1,22 +1,83 @@
-use dev_env_model::ModelError;
-use std::collections::BTreeMap;
-use std::fmt;
-use std::path::{Path, PathBuf};
+use dev_env_model::{EffectiveIdentity, EnvValue, IdentityPeer, IdentityRequest, ModelError};
+use std::{
+    collections::BTreeMap,
+    env::{current_dir, vars},
+    error::Error,
+    fmt,
+    fs::metadata,
+    io::Error as IoError,
+    path::{Path, PathBuf},
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextPathError {
+    Empty,
+    Relative,
+    Nul,
+}
+
+#[derive(Debug)]
+pub enum ContextError {
+    CurrentDirectory(IoError),
+    InvalidPath {
+        name: &'static str,
+        path: PathBuf,
+        reason: ContextPathError,
+    },
+    CwdOutsideWorkspace {
+        cwd: PathBuf,
+        workspace: PathBuf,
+    },
+    EmptyShell,
+    UnknownShell {
+        shell: String,
+    },
+    InvalidEnvironment(ModelError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentityBrokerError {
+    Unauthorized,
+    Unavailable,
+    InvalidRequest(String),
+    Resolution(String),
+}
+
+/// Boundary between dev-env and container-init identity resolution.
+///
+/// This trait intentionally exposes only a request and authenticated peer
+/// credentials. UID/GID namespace mapping, supplementary group lookup, and
+/// policy checks belong to the container-init implementation.
+pub trait IdentityBroker: Send + Sync {
+    fn resolve(
+        &self,
+        request: &IdentityRequest,
+        peer: IdentityPeer,
+    ) -> Result<EffectiveIdentity, IdentityBrokerError>;
+
+    fn prepare_identity(
+        &self,
+        request: &IdentityRequest,
+        peer: IdentityPeer,
+    ) -> Result<EffectiveIdentity, IdentityBrokerError> {
+        self.resolve(request, peer)
+    }
+}
 
 /// Facts for one materialization session.
 ///
 /// The process environment is supplied explicitly so callers can decide which
 /// environment source is visible to the runtime and tests do not depend on
-/// the host process.  `shell = None` selects `config.shell.default`.
+/// the host process. `shell = None` selects `config.shell.default`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeContext {
-    pub workspace: PathBuf,
-    pub cwd: PathBuf,
-    pub shell: Option<String>,
-    pub process_environment: BTreeMap<String, String>,
-    pub user_id: u32,
-    pub workspace_writable: Option<bool>,
-    pub workspace_config_present: bool,
+    workspace: PathBuf,
+    cwd: PathBuf,
+    shell: Option<String>,
+    process_environment: BTreeMap<String, String>,
+    user_id: u32,
+    workspace_writable: Option<bool>,
+    workspace_config_present: bool,
 }
 
 /// Shorter name for callers that use the terminology from the design docs.
@@ -54,18 +115,58 @@ impl RuntimeContext {
         workspace: impl Into<PathBuf>,
         shell: impl Into<String>,
     ) -> Result<Self, ContextError> {
-        let cwd = std::env::current_dir().map_err(ContextError::CurrentDirectory)?;
+        let cwd = current_dir().map_err(ContextError::CurrentDirectory)?;
         // Container runtimes may inject metadata such as `container=...`.
         // The environment DSL intentionally models portable, uppercase shell
         // names, so discard host metadata that cannot be represented there.
-        let process_environment = std::env::vars()
+        let process_environment = vars()
             .filter(|(name, _)| is_environment_name(name))
             .collect();
         Ok(Self::new(workspace, cwd, shell, process_environment))
     }
 
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn shell(&self) -> Option<&str> {
+        self.shell.as_deref()
+    }
+
+    pub fn process_environment(&self) -> &BTreeMap<String, String> {
+        &self.process_environment
+    }
+
+    pub fn process_environment_mut(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.process_environment
+    }
+
+    pub fn user_id(&self) -> u32 {
+        self.user_id
+    }
+
+    pub fn workspace_writable(&self) -> Option<bool> {
+        self.workspace_writable
+    }
+
+    pub fn workspace_config_present(&self) -> bool {
+        self.workspace_config_present
+    }
+
     pub fn with_shell(mut self, shell: impl Into<String>) -> Self {
         self.shell = Some(shell.into());
+        self
+    }
+
+    pub fn with_process_environment(
+        mut self,
+        process_environment: BTreeMap<String, String>,
+    ) -> Self {
+        self.process_environment = process_environment;
         self
     }
 
@@ -94,7 +195,7 @@ impl RuntimeContext {
             });
         }
         for (name, value) in &self.process_environment {
-            let candidate = dev_env_model::EnvValue::public(value.clone());
+            let candidate = EnvValue::public(value.clone());
             candidate
                 .validate(name)
                 .map_err(ContextError::InvalidEnvironment)?;
@@ -111,21 +212,6 @@ impl RuntimeContext {
     }
 }
 
-fn is_environment_name(name: &str) -> bool {
-    let mut characters = name.chars();
-    matches!(characters.next(), Some(character) if character.is_ascii_uppercase() || character == '_')
-        && characters.all(|character| {
-            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
-        })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContextPathError {
-    Empty,
-    Relative,
-    Nul,
-}
-
 impl fmt::Display for ContextPathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -136,26 +222,7 @@ impl fmt::Display for ContextPathError {
     }
 }
 
-impl std::error::Error for ContextPathError {}
-
-#[derive(Debug)]
-pub enum ContextError {
-    CurrentDirectory(std::io::Error),
-    InvalidPath {
-        name: &'static str,
-        path: PathBuf,
-        reason: ContextPathError,
-    },
-    CwdOutsideWorkspace {
-        cwd: PathBuf,
-        workspace: PathBuf,
-    },
-    EmptyShell,
-    UnknownShell {
-        shell: String,
-    },
-    InvalidEnvironment(ModelError),
-}
+impl Error for ContextPathError {}
 
 impl fmt::Display for ContextError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -183,8 +250,8 @@ impl fmt::Display for ContextError {
     }
 }
 
-impl std::error::Error for ContextError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for ContextError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CurrentDirectory(source) => Some(source),
             Self::InvalidPath { reason, .. } => Some(reason),
@@ -192,6 +259,29 @@ impl std::error::Error for ContextError {
             Self::CwdOutsideWorkspace { .. } | Self::EmptyShell | Self::UnknownShell { .. } => None,
         }
     }
+}
+
+impl fmt::Display for IdentityBrokerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unauthorized => formatter.write_str("identity request is not authorized"),
+            Self::Unavailable => formatter.write_str("identity broker is unavailable"),
+            Self::InvalidRequest(message) => {
+                write!(formatter, "invalid identity request: {message}")
+            }
+            Self::Resolution(message) => write!(formatter, "identity resolution failed: {message}"),
+        }
+    }
+}
+
+impl Error for IdentityBrokerError {}
+
+fn is_environment_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    matches!(characters.next(), Some(character) if character.is_ascii_uppercase() || character == '_')
+        && characters.all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
 }
 
 fn validate_absolute(name: &'static str, path: &Path) -> Result<(), ContextError> {
@@ -227,7 +317,7 @@ fn contains_nul(path: &Path) -> bool {
 }
 
 fn directory_is_writable(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let Ok(metadata) = metadata(path) else {
         return false;
     };
     if metadata.permissions().readonly() {

@@ -1,8 +1,12 @@
 use container_init_bootstrap_loader::{LoaderError, ProfileLoader, ProfileSource};
 use container_init_bootstrap_model::{ActionKind, ModelError, SourceKind};
-use std::error::Error;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    env::temp_dir,
+    error::Error,
+    fs,
+    process::id,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const BASE: &str = r#"
 schema = 1
@@ -83,24 +87,24 @@ run_as = "root"
         .expect("derived profile should be accepted");
 
     let loaded = loader.load("derived").expect("profile graph should load");
-    assert_eq!(loaded.config().workspace_root, "/srv/workspace");
-    assert!(!loaded.config().actions.iter().any(|action| {
+    assert_eq!(loaded.config().workspace_root(), "/srv/workspace");
+    assert!(!loaded.config().actions().iter().any(|action| {
         action
-            .path
+            .path()
             .as_deref()
             .is_some_and(|path| path.contains("ONLY_ENVIRONMENT"))
     }));
     assert_eq!(loaded.profile_chain().len(), 2);
     assert_eq!(loaded.profile_chain()[0].id, "base");
     assert_eq!(loaded.profile_chain()[1].id, "derived");
-    assert_eq!(loaded.config().actions[2].origin.profile, "derived");
+    assert_eq!(loaded.config().actions()[2].origin().profile(), "derived");
     assert_eq!(
-        loaded.config().actions[2].origin.source,
+        *loaded.config().actions()[2].origin().source(),
         SourceKind::ImageProfile
     );
-    assert!(loaded.config().actions[2]
-        .origin
-        .location
+    assert!(loaded.config().actions()[2]
+        .origin()
+        .location()
         .as_deref()
         .is_some_and(|location| location.contains("bootstrap.actions[0]")));
 
@@ -169,11 +173,11 @@ run_as = "root"
 
     let loaded = loader.load("child").expect("reasoned override should load");
     assert_eq!(
-        loaded.config().actions[1].path.as_deref(),
+        loaded.config().actions()[1].path().as_deref(),
         Some("/srv/other")
     );
     assert_eq!(
-        loaded.config().actions[1].origin.location.as_deref(),
+        loaded.config().actions()[1].origin().location().as_deref(),
         Some("child:bootstrap.actions[0]")
     );
 }
@@ -223,7 +227,7 @@ workspace_root = "/admin/workspace"
             .load("child")
             .expect("explicit scalar override should load")
             .config()
-            .workspace_root,
+            .workspace_root(),
         "/admin/workspace"
     );
 }
@@ -254,7 +258,7 @@ run_as = "target"
         .load("workspace-overlay")
         .expect("safe workspace action should load");
     assert_eq!(
-        loaded.config().actions[2].origin.source,
+        *loaded.config().actions()[2].origin().source(),
         SourceKind::WorkspaceOverlay
     );
     assert!(loaded.build_plan().is_ok());
@@ -395,9 +399,9 @@ fn directory_loader_indexes_declared_ids_instead_of_filenames() {
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after the epoch")
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
+    let directory = temp_dir().join(format!(
         "container-init-bootstrap-loader-test-{}-{suffix}",
-        std::process::id()
+        id()
     ));
     fs::create_dir(&directory).expect("test directory should be created");
     fs::write(directory.join("arbitrary-name.toml"), BASE).expect("profile should be written");
@@ -461,18 +465,18 @@ run_as = "root"
     let loaded = loader.load("cgroup-profile").unwrap();
     let cg_action = loaded
         .config()
-        .actions
+        .actions()
         .iter()
-        .find(|a| a.id == "cgroup-init")
+        .find(|a| a.id() == "cgroup-init")
         .expect("cgroup-init action should be present");
-    assert_eq!(cg_action.kind, ActionKind::CgroupV2Init);
-    assert_eq!(cg_action.subgroup.as_deref(), Some("libpod_parent"));
+    assert_eq!(cg_action.kind(), ActionKind::CgroupV2Init);
+    assert_eq!(cg_action.subgroup().as_deref(), Some("libpod_parent"));
     assert_eq!(
-        cg_action.controllers.as_deref(),
+        cg_action.controllers().as_deref(),
         Some(&["cpu".to_string(), "memory".to_string()][..])
     );
     assert_eq!(
-        cg_action.optional_controllers.as_deref(),
+        cg_action.optional_controllers().as_deref(),
         Some(&["io".to_string()][..])
     );
 }
@@ -504,9 +508,9 @@ fn profile_file_reader_rejects_more_than_8_mib_before_parsing() {
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after the epoch")
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
+    let directory = temp_dir().join(format!(
         "container-init-bootstrap-loader-size-{}-{suffix}",
-        std::process::id()
+        id()
     ));
     fs::create_dir(&directory).unwrap();
     let path = directory.join("oversized.toml");

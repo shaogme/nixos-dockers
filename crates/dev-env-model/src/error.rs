@@ -1,12 +1,13 @@
 use serde::Serialize;
-use std::error::Error;
-use std::fmt;
+use std::{error::Error, fmt};
 
-use crate::condition::ConditionError;
-use crate::input::InputError;
-use crate::path::PathRenderError;
-use crate::provider::ProviderError;
-use crate::shell::{ShellArgError, ShellEnvParseError};
+use crate::{
+    condition::ConditionError,
+    input::InputError,
+    path::PathRenderError,
+    provider::ProviderError,
+    shell::{ShellArgError, ShellEnvParseError},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

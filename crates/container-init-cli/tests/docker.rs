@@ -1,16 +1,24 @@
-use serde_json::Value;
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::process::Command;
+use container_init_backend::BackendClient;
+use container_init_core::{PosixSystem, SshCapability};
+use libc::{kill, SIGTERM};
+use serde_json::{from_slice, Value};
+use std::{
+    env::{consts::OS, current_exe},
+    fs,
+    io::Write,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::Path,
+    process::{id, Command, Stdio},
+    thread::{scope, sleep},
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 
 #[test]
 fn cli_runs_a_real_linux_bootstrap_plan_and_handoff() {
-    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(OS, "linux");
     assert_eq!(
-        container_init_core::PosixSystem::new().current_ids().0,
+        PosixSystem::new().current_ids().0,
         0,
         "Docker fixture must run as root"
     );
@@ -75,7 +83,7 @@ depends_on = ["directory"]
     )
     .unwrap();
 
-    let binary = std::env::current_exe()
+    let binary = current_exe()
         .unwrap()
         .parent()
         .unwrap()
@@ -102,7 +110,7 @@ depends_on = ["directory"]
         "{}",
         String::from_utf8_lossy(&plan.stderr)
     );
-    let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let plan: Value = from_slice(&plan.stdout).unwrap();
     let actions = plan["actions"].as_array().unwrap();
     assert_eq!(
         actions
@@ -152,13 +160,13 @@ depends_on = ["directory"]
 
 #[test]
 fn cli_runs_a_real_ssh_bootstrap_action_before_handoff() {
-    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(OS, "linux");
     assert_eq!(
-        container_init_core::PosixSystem::new().current_ids().0,
+        PosixSystem::new().current_ids().0,
         0,
         "Docker fixture must run as root"
     );
-    if !container_init_core::SshCapability::default().available() {
+    if !SshCapability::default().available() {
         return;
     }
 
@@ -216,7 +224,7 @@ depends_on = ["resolve"]
     )
     .unwrap();
 
-    let binary = std::env::current_exe()
+    let binary = current_exe()
         .unwrap()
         .parent()
         .unwrap()
@@ -243,7 +251,7 @@ depends_on = ["resolve"]
         "{}",
         String::from_utf8_lossy(&plan.stderr)
     );
-    let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let plan: Value = from_slice(&plan.stdout).unwrap();
     assert_eq!(plan["actions"][1]["id"], "prepare-ssh");
     assert!(!host_keys.exists(), "plan must not generate host keys");
 
@@ -271,14 +279,14 @@ depends_on = ["resolve"]
 
 #[test]
 fn cli_runs_a_real_cgroup_v2_init_bootstrap_action_before_handoff() {
-    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(OS, "linux");
     assert_eq!(
-        container_init_core::PosixSystem::new().current_ids().0,
+        PosixSystem::new().current_ids().0,
         0,
         "Docker fixture must run as root"
     );
 
-    let cgroup_base = std::path::Path::new("/sys/fs/cgroup");
+    let cgroup_base = Path::new("/sys/fs/cgroup");
     if !cgroup_base.join("cgroup.controllers").exists() {
         return;
     }
@@ -339,7 +347,7 @@ depends_on = ["resolve"]
     )
     .unwrap();
 
-    let binary = std::env::current_exe()
+    let binary = current_exe()
         .unwrap()
         .parent()
         .unwrap()
@@ -369,7 +377,7 @@ depends_on = ["resolve"]
         "{}",
         String::from_utf8_lossy(&plan.stderr)
     );
-    let plan_doc: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let plan_doc: Value = from_slice(&plan.stdout).unwrap();
     assert_eq!(plan_doc["actions"][1]["id"], "cgroup-init");
 
     let script = format!("printf 'cgroup handoff\\n' > {}", handoff.display());
@@ -453,7 +461,7 @@ depends_on = ["resolve"]
     )
     .unwrap();
 
-    let binary = std::env::current_exe()
+    let binary = current_exe()
         .unwrap()
         .parent()
         .unwrap()
@@ -506,11 +514,9 @@ depends_on = ["resolve"]
 
 #[test]
 fn cli_reconciles_home_ownership_between_root_and_dev() {
-    use std::os::unix::fs::MetadataExt;
-
-    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(OS, "linux");
     assert_eq!(
-        container_init_core::PosixSystem::new().current_ids().0,
+        PosixSystem::new().current_ids().0,
         0,
         "Docker fixture must run as root"
     );
@@ -574,7 +580,7 @@ depends_on = ["resolve"]
     )
     .unwrap();
 
-    let binary = std::env::current_exe()
+    let binary = current_exe()
         .unwrap()
         .parent()
         .unwrap()
@@ -604,13 +610,12 @@ depends_on = ["resolve"]
         .unwrap();
     let mut run_dev = run_dev;
     let socket_path = lock.to_str().unwrap();
-    let client =
-        container_init_backend::BackendClient::new(&lock, std::time::Duration::from_secs(1));
+    let client = BackendClient::new(&lock, Duration::from_secs(1));
     for _ in 0..100 {
         if client.status().is_ok() {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        sleep(Duration::from_millis(20));
     }
     let meta_dev = fs::metadata(&user_home).unwrap();
     assert_eq!(
@@ -711,7 +716,7 @@ depends_on = ["resolve"]
     // 7. Concurrent slow-path exec commands (identity drift to root concurrently)
     let bin = &binary;
     let args = ["--backend-socket", socket_path];
-    std::thread::scope(|s| {
+    scope(|s| {
         for i in 0..4 {
             s.spawn(move || {
                 let output = Command::new(bin)
@@ -734,15 +739,15 @@ depends_on = ["resolve"]
         (0, 0),
         "Home must be reconciled to root (0:0) after concurrent slow path"
     );
-    assert_eq!(unsafe { libc::kill(run_dev.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { kill(run_dev.id() as i32, SIGTERM) }, 0);
     assert_eq!(run_dev.wait().unwrap().code(), Some(0));
 }
 
 #[test]
 fn exec_preflight_uses_kernel_acl_checks_and_commits_only_after_chdir() {
-    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(OS, "linux");
     assert_eq!(
-        container_init_core::PosixSystem::new().current_ids().0,
+        PosixSystem::new().current_ids().0,
         0,
         "Docker fixture must run as root"
     );
@@ -871,7 +876,7 @@ depends_on = ["resolve"]
     )
     .unwrap();
 
-    let binary = std::env::current_exe()
+    let binary = current_exe()
         .unwrap()
         .parent()
         .unwrap()
@@ -892,30 +897,26 @@ depends_on = ["resolve"]
             "--",
             "trap 'exit 0' TERM; while :; do sleep 1; done",
         ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let client =
-        container_init_backend::BackendClient::new(&socket, std::time::Duration::from_secs(2));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
+    let client = BackendClient::new(&socket, Duration::from_secs(2));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
         if client.status().is_ok() {
             break;
         }
         if let Some(status) = backend.try_wait().unwrap() {
             panic!("ACL backend exited before becoming ready: {status}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        sleep(Duration::from_millis(20));
     }
     assert!(client.status().is_ok(), "ACL backend did not become ready");
 
-    let allowed_marker = format!("/tmp/container-init-acl-{}-allowed", std::process::id());
-    let denied_marker = format!("/tmp/container-init-acl-{}-denied", std::process::id());
-    let parent_denied_marker = format!(
-        "/tmp/container-init-acl-{}-parent-denied",
-        std::process::id()
-    );
+    let allowed_marker = format!("/tmp/container-init-acl-{}-allowed", id());
+    let denied_marker = format!("/tmp/container-init-acl-{}-denied", id());
+    let parent_denied_marker = format!("/tmp/container-init-acl-{}-parent-denied", id());
     let _ = fs::remove_file(&allowed_marker);
     let _ = fs::remove_file(&denied_marker);
     let _ = fs::remove_file(&parent_denied_marker);
@@ -945,7 +946,7 @@ depends_on = ["resolve"]
         "successful Preflight must be followed by Commit"
     );
 
-    let peer_marker = format!("/tmp/container-init-acl-{}-peer", std::process::id());
+    let peer_marker = format!("/tmp/container-init-acl-{}-peer", id());
     let _ = fs::remove_file(&peer_marker);
     let peer_input = format!("CONTAINER_HOME={}", allowed_home.display());
     let peer_script = format!("printf peer > {peer_marker}");
@@ -1063,7 +1064,7 @@ depends_on = ["resolve"]
     );
     assert!(!Path::new(&parent_denied_marker).exists());
 
-    assert_eq!(unsafe { libc::kill(backend.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
     assert_eq!(backend.wait().unwrap().code(), Some(0));
     let _ = fs::remove_file(allowed_marker);
     let _ = fs::remove_file(denied_marker);

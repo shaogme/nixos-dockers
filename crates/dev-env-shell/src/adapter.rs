@@ -1,9 +1,13 @@
-use crate::command::CommandLine;
-use crate::environment::{format_environment, EnvironmentFormat, RenderOptions};
-use crate::error::{EnvironmentFormatError, ShellBuildError};
+use crate::{
+    command::CommandLine,
+    environment::{EnvironmentFormat, EnvironmentRenderer, RenderOptions},
+    error::{EnvironmentFormatError, ShellBuildError},
+};
 use dev_env_model::{MaterializedEnv, ShellConfig};
-use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::{
+    ffi::{OsStr, OsString},
+    path::Path,
+};
 
 /// Builds shell argv from profile data.  Implementations may choose a
 /// display format, but the command construction defaults are intentionally
@@ -16,7 +20,7 @@ pub trait ShellAdapter {
     }
 
     fn command<'a>(&self, config: &'a ShellConfig) -> &'a Path {
-        Path::new(&config.command)
+        Path::new(config.command())
     }
 
     fn build_interactive(
@@ -27,7 +31,7 @@ pub trait ShellAdapter {
         config
             .validate(self.id())
             .map_err(|source| ShellBuildError::Model { source })?;
-        build_with_configured_args(self.command(config), &config.interactive_args, args)
+        build_with_configured_args(self.command(config), config.interactive_args(), args)
     }
 
     fn build_login(
@@ -43,13 +47,13 @@ pub trait ShellAdapter {
         // default login + interactive flags together.
         let configured = if args.is_empty() {
             config
-                .login_args
+                .login_args()
                 .iter()
-                .chain(config.interactive_args.iter())
+                .chain(config.interactive_args().iter())
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            config.login_args.clone()
+            config.login_args().to_vec()
         };
         build_with_configured_args(self.command(config), &configured, args)
     }
@@ -62,17 +66,18 @@ pub trait ShellAdapter {
         config
             .validate(self.id())
             .map_err(|source| ShellBuildError::Model { source })?;
-        let command_arg = config.command_arg.as_deref().ok_or_else(|| {
-            ShellBuildError::MissingCommandArgument {
-                shell: self.id().to_owned(),
-            }
-        })?;
+        let command_arg =
+            config
+                .command_arg()
+                .ok_or_else(|| ShellBuildError::MissingCommandArgument {
+                    shell: self.id().to_owned(),
+                })?;
         let configured = [command_arg.to_owned()];
         build_with_configured_args(self.command(config), &configured, &[script.to_owned()])
     }
 
     fn format_env(&self, environment: &MaterializedEnv) -> Result<String, EnvironmentFormatError> {
-        format_environment(
+        EnvironmentRenderer::format_environment(
             self.environment_format(),
             environment,
             RenderOptions::default(),
@@ -84,7 +89,7 @@ pub trait ShellAdapter {
         environment: &MaterializedEnv,
         options: RenderOptions,
     ) -> Result<String, EnvironmentFormatError> {
-        format_environment(self.environment_format(), environment, options)
+        EnvironmentRenderer::format_environment(self.environment_format(), environment, options)
     }
 }
 

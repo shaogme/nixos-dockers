@@ -1,12 +1,14 @@
-use crate::error::LoaderError;
-use crate::merge::MergedConfig;
-use crate::raw::parse_profile;
-use crate::runtime;
-use crate::source::{CliPatch, LoadedConfig, LoadedProfile, ProfileSource};
-use profile_graph::{traverse, ProfileGraphError, TraverseError};
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
+mod runtime;
+
+use crate::{
+    error::LoaderError,
+    merge::MergedConfig,
+    raw::RawProfile,
+    source::{CliPatch, LoadedConfig, LoadedProfile, ProfileSource, SourceKind},
+};
+use dev_env_model::{ModelError, ModelErrorReason};
+use profile_graph::{traverse, validate_profile_id, ProfileGraphError, TraverseError};
+use std::{collections::BTreeMap, fs, iter::empty, path::Path};
 
 /// In-memory profile graph and environment loader.
 #[derive(Clone, Debug, Default)]
@@ -26,37 +28,39 @@ impl ProfileLoader {
     /// Add an indexed profile. The id is read from the source document and is
     /// checked against the id supplied by the caller.
     pub fn add_profile(&mut self, profile: ProfileSource) -> Result<(), LoaderError> {
-        let parsed = parse_profile(
-            &profile.contents,
+        let parsed = RawProfile::parse(
+            profile.contents(),
             profile
-                .location
-                .clone()
-                .unwrap_or_else(|| format!("profile {}", profile.id)),
+                .location()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("profile {}", profile.id())),
         )?;
-        if parsed.document.id != profile.id {
+        if parsed.id() != profile.id() {
             return Err(LoaderError::ProfileIdMismatch {
-                source_id: profile.id,
-                document_id: parsed.document.id,
+                source_id: profile.id().to_owned(),
+                document_id: parsed.id().to_owned(),
             });
         }
-        if profile_graph::validate_profile_id(&profile.id).is_err() {
-            return Err(LoaderError::InvalidSourceId { id: profile.id });
+        if validate_profile_id(profile.id()).is_err() {
+            return Err(LoaderError::InvalidSourceId {
+                id: profile.id().to_owned(),
+            });
         }
-        if let Some(previous) = self.profiles.get(&profile.id) {
+        if let Some(previous) = self.profiles.get(profile.id()) {
             return Err(LoaderError::DuplicateProfile {
-                id: profile.id,
-                first: previous.location.clone(),
-                second: profile.location,
+                id: profile.id().to_owned(),
+                first: previous.location().map(str::to_owned),
+                second: profile.location().map(str::to_owned),
             });
         }
-        self.profiles.insert(profile.id.clone(), profile);
+        self.profiles.insert(profile.id().to_owned(), profile);
         Ok(())
     }
 
     pub fn add_str(
         &mut self,
         id: impl Into<String>,
-        source: impl Into<crate::SourceKind>,
+        source: impl Into<SourceKind>,
         contents: impl Into<String>,
     ) -> Result<(), LoaderError> {
         self.add_profile(ProfileSource::new(id, source, contents))
@@ -65,21 +69,23 @@ impl ProfileLoader {
     /// Add a non-inherited overlay to be applied after the selected profile
     /// graph. This is useful for user, workspace, and test overlays.
     pub fn add_overlay(&mut self, overlay: ProfileSource) -> Result<(), LoaderError> {
-        let parsed = parse_profile(
-            &overlay.contents,
+        let parsed = RawProfile::parse(
+            overlay.contents(),
             overlay
-                .location
-                .clone()
-                .unwrap_or_else(|| format!("profile {}", overlay.id)),
+                .location()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("profile {}", overlay.id())),
         )?;
-        if parsed.document.id != overlay.id {
+        if parsed.id() != overlay.id() {
             return Err(LoaderError::ProfileIdMismatch {
-                source_id: overlay.id,
-                document_id: parsed.document.id,
+                source_id: overlay.id().to_owned(),
+                document_id: parsed.id().to_owned(),
             });
         }
-        if profile_graph::validate_profile_id(&overlay.id).is_err() {
-            return Err(LoaderError::InvalidSourceId { id: overlay.id });
+        if validate_profile_id(overlay.id()).is_err() {
+            return Err(LoaderError::InvalidSourceId {
+                id: overlay.id().to_owned(),
+            });
         }
         self.overlays.push(overlay);
         Ok(())
@@ -109,10 +115,7 @@ impl ProfileLoader {
         let mut loader = Self::new();
         for path in paths {
             if path.extension().and_then(|extension| extension.to_str()) == Some("toml") {
-                loader.add_profile(ProfileSource::from_file(
-                    path,
-                    crate::SourceKind::ImageProfile,
-                )?)?;
+                loader.add_profile(ProfileSource::from_file(path, SourceKind::ImageProfile)?)?;
             }
         }
         Ok(loader)
@@ -128,7 +131,7 @@ impl ProfileLoader {
 
     /// Resolve a profile graph and all registered overlays.
     pub fn load(&self, profile_id: &str) -> Result<LoadedConfig, LoaderError> {
-        self.load_internal(profile_id, self.overlays.iter(), None, std::iter::empty())
+        self.load_internal(profile_id, self.overlays.iter(), None, empty())
     }
 
     /// Resolve a graph and apply the supplied overlays after registered ones.
@@ -162,7 +165,7 @@ impl ProfileLoader {
             profile_id,
             self.overlays.iter(),
             Some(&environment),
-            std::iter::empty(),
+            empty(),
         )
     }
 
@@ -176,19 +179,16 @@ impl ProfileLoader {
         I: IntoIterator<Item = CliPatch>,
     {
         let patches = patches.into_iter().collect::<Vec<_>>();
-        self.load_internal(profile_id, self.overlays.iter(), None, std::iter::empty())
+        self.load_internal(profile_id, self.overlays.iter(), None, empty())
             .and_then(|loaded| {
                 // CLI patches are applied through a second small merger so the
                 // public LoadedConfig remains immutable and validated.
-                let mut merger = MergedConfig::from_config(loaded.config.clone())?;
+                let mut merger = MergedConfig::from_config(loaded.config().clone())?;
                 for patch in &patches {
-                    merger.apply_cli_patch(&patch.path, &patch.spec)?;
+                    merger.apply_cli_patch(patch.path(), patch.spec())?;
                 }
-                let (config, _) = merger.finish(loaded.profile_chain.clone())?;
-                Ok(LoadedConfig {
-                    config,
-                    profile_chain: loaded.profile_chain,
-                })
+                let (config, profile_chain) = merger.finish(loaded.profile_chain().to_vec())?;
+                Ok(LoadedConfig::new(config, profile_chain))
             })
     }
 
@@ -234,15 +234,12 @@ impl ProfileLoader {
     where
         P: IntoIterator<Item = CliPatch>,
     {
-        let mut merger = MergedConfig::from_config(loaded.config.clone())?;
+        let mut merger = MergedConfig::from_config(loaded.config().clone())?;
         for patch in patches {
-            merger.apply_cli_patch(&patch.path, &patch.spec)?;
+            merger.apply_cli_patch(patch.path(), patch.spec())?;
         }
-        let (config, _) = merger.finish(loaded.profile_chain.clone())?;
-        Ok(LoadedConfig {
-            config,
-            profile_chain: loaded.profile_chain,
-        })
+        let (config, profile_chain) = merger.finish(loaded.profile_chain().to_vec())?;
+        Ok(LoadedConfig::new(config, profile_chain))
     }
 
     fn load_internal<'a, 'b, I, J>(
@@ -265,28 +262,28 @@ impl ProfileLoader {
                 let Some(profile) = profiles.get(id) else {
                     return Ok(None);
                 };
-                let parsed = parse_profile(
-                    &profile.contents,
+                let parsed = RawProfile::parse(
+                    profile.contents(),
                     profile
-                        .location
-                        .clone()
+                        .location()
+                        .map(str::to_owned)
                         .unwrap_or_else(|| format!("profile {id}")),
                 )?;
-                if parsed.document.id != profile.id {
+                if parsed.id() != profile.id() {
                     return Err(LoaderError::ProfileIdMismatch {
-                        source_id: profile.id.clone(),
-                        document_id: parsed.document.id,
+                        source_id: profile.id().to_owned(),
+                        document_id: parsed.id().to_owned(),
                     });
                 }
-                let parents = parsed.document.extends.clone();
+                let parents = parsed.parents().to_vec();
                 Ok(Some((parsed, parents)))
             },
             |id, parsed| {
                 let profile = profiles.get(id).expect("traversed profile was loaded");
                 let info = LoadedProfile {
-                    id: parsed.document.id.clone(),
-                    source: profile.source,
-                    location: profile.location.clone(),
+                    id: parsed.id().to_owned(),
+                    source: profile.source(),
+                    location: profile.location().map(str::to_owned),
                 };
                 merged.merge_profile(&parsed, profile)?;
                 chain.push(info);
@@ -302,13 +299,10 @@ impl ProfileLoader {
             self.apply_source(overlay, &mut merged, &mut chain)?;
         }
         if let Some(environment) = runtime_environment {
-            runtime::apply(environment, &mut merged)?;
+            runtime::RuntimeInputApplier::apply(environment, &mut merged)?;
         }
         let (config, chain) = merged.finish(chain)?;
-        Ok(LoadedConfig {
-            config,
-            profile_chain: chain,
-        })
+        Ok(LoadedConfig::new(config, chain))
     }
 
     fn apply_source(
@@ -317,24 +311,24 @@ impl ProfileLoader {
         merged: &mut MergedConfig,
         chain: &mut Vec<LoadedProfile>,
     ) -> Result<(), LoaderError> {
-        let parsed = parse_profile(
-            &source.contents,
+        let parsed = RawProfile::parse(
+            source.contents(),
             source
-                .location
-                .clone()
-                .unwrap_or_else(|| format!("profile {}", source.id)),
+                .location()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("profile {}", source.id())),
         )?;
-        if parsed.document.id != source.id {
+        if parsed.id() != source.id() {
             return Err(LoaderError::ProfileIdMismatch {
-                source_id: source.id.clone(),
-                document_id: parsed.document.id,
+                source_id: source.id().to_owned(),
+                document_id: parsed.id().to_owned(),
             });
         }
         merged.merge_profile(&parsed, source)?;
         chain.push(LoadedProfile {
-            id: source.id.clone(),
-            source: source.source,
-            location: source.location.clone(),
+            id: source.id().to_owned(),
+            source: source.source(),
+            location: source.location().map(str::to_owned),
         });
         Ok(())
     }
@@ -358,9 +352,9 @@ fn map_graph_error(error: TraverseError<LoaderError>) -> LoaderError {
         TraverseError::Graph(ProfileGraphError::DuplicateParent { profile, parent: _ }) => {
             LoaderError::Model {
                 location: Some(format!("profile {profile}.extends")),
-                source: dev_env_model::ModelError::InvalidValue {
+                source: ModelError::InvalidValue {
                     location: format!("profile {profile}.extends"),
-                    reason: dev_env_model::ModelErrorReason::Duplicate,
+                    reason: ModelErrorReason::Duplicate,
                 },
             }
         }

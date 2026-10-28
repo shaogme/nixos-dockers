@@ -1,12 +1,11 @@
-use std::error::Error;
-use std::fmt;
-use std::io;
-use std::path::PathBuf;
-
 use container_init_bootstrap_model::{ModelError, Origin};
 use container_init_posix::PosixError;
-use serde::ser::{SerializeStruct, Serializer};
-use serde::Serialize;
+use serde::{
+    ser::{SerializeStruct, Serializer},
+    Serialize,
+};
+use serde_json::Error as JsonError;
+use std::{error::Error, fmt, io, path::PathBuf};
 
 /// Stable error families for the container-init CLI layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -58,7 +57,7 @@ pub enum CoreError {
     },
     Serialization {
         operation: String,
-        source: serde_json::Error,
+        source: JsonError,
     },
     Handoff {
         program: PathBuf,
@@ -180,7 +179,8 @@ impl fmt::Display for CoreError {
             } => write!(
                 formatter,
                 "bootstrap action {action:?} from profile {:?} ({:?}) failed: {source}",
-                origin.profile, origin.source
+                origin.profile(),
+                origin.source()
             ),
         }
     }

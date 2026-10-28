@@ -1,10 +1,17 @@
-use crate::context::RuntimeContext;
-use crate::error::CoreError;
-use crate::identity::{ResolvedIdentity, ResolvedInputs};
+use crate::{CoreError, ResolvedIdentity, ResolvedInputs, RuntimeContext};
 use container_init_bootstrap_model::{Condition, ConditionValue, PathTemplate};
 use container_init_posix::is_writable;
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::{
+    collections::BTreeMap,
+    env::consts::{ARCH, OS},
+    path::{Path, PathBuf},
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ComparableValue {
+    String(String),
+    Bool(bool),
+}
 
 /// Evaluation context for the deliberately small Bootstrap condition language.
 pub struct ConditionContext<'a> {
@@ -61,7 +68,7 @@ impl<'a> ConditionContext<'a> {
         }
     }
 
-    fn render(&self, template: &PathTemplate) -> Result<std::path::PathBuf, CoreError> {
+    fn render(&self, template: &PathTemplate) -> Result<PathBuf, CoreError> {
         let mut values = BTreeMap::new();
         values.insert(
             "bootstrap.workspace_root".to_owned(),
@@ -79,8 +86,8 @@ impl<'a> ConditionContext<'a> {
             "context.cwd".to_owned(),
             self.runtime.cwd().to_string_lossy().into_owned(),
         );
-        values.insert("context.os".to_owned(), std::env::consts::OS.to_owned());
-        values.insert("context.arch".to_owned(), std::env::consts::ARCH.to_owned());
+        values.insert("context.os".to_owned(), OS.to_owned());
+        values.insert("context.arch".to_owned(), ARCH.to_owned());
         for (name, input) in self.inputs.iter() {
             values.insert(format!("input.{name}"), input.raw.clone());
         }
@@ -89,7 +96,7 @@ impl<'a> ConditionContext<'a> {
         }
         template
             .render(&values)
-            .map(std::path::PathBuf::from)
+            .map(PathBuf::from)
             .map_err(|message| CoreError::Invalid {
                 location: "bootstrap condition".to_owned(),
                 message,
@@ -111,8 +118,8 @@ impl<'a> ConditionContext<'a> {
                 "context.cwd" => Ok(ComparableValue::String(
                     self.runtime.cwd().to_string_lossy().into_owned(),
                 )),
-                "context.os" => Ok(ComparableValue::String(std::env::consts::OS.to_owned())),
-                "context.arch" => Ok(ComparableValue::String(std::env::consts::ARCH.to_owned())),
+                "context.os" => Ok(ComparableValue::String(OS.to_owned())),
+                "context.arch" => Ok(ComparableValue::String(ARCH.to_owned())),
                 reference if reference.starts_with("input.") => self
                     .inputs
                     .value(&reference["input.".len()..])
@@ -138,10 +145,4 @@ impl<'a> ConditionContext<'a> {
             },
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ComparableValue {
-    String(String),
-    Bool(bool),
 }

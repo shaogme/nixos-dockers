@@ -1,10 +1,18 @@
-use serde_json::Value;
-use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use {
+    serde_json::{from_slice, Value},
+    std::{
+        collections::BTreeMap,
+        env::{temp_dir, var_os},
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+        sync::atomic::{AtomicUsize, Ordering},
+    },
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 struct Fixture {
     root: PathBuf,
@@ -18,7 +26,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
+        let root = temp_dir().join(format!(
             "dev-env-cli-docker-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -36,11 +44,11 @@ impl Fixture {
         fs::write(workspace.join("project.config"), "enabled\n").unwrap();
         fs::write(&default_profile, "docker\n").unwrap();
         write_provider(&provider);
-        let real_bash = std::env::var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
+        let real_bash = var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/bin/bash"));
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_bash, &configured_bash).unwrap();
+        symlink(&real_bash, &configured_bash).unwrap();
         fs::write(
             profiles.join("00-docker.toml"),
             profile_contents(&workspace, &provider, &configured_bash, &root),
@@ -220,7 +228,7 @@ fn assert_success(output: &Output) {
 
 fn json_environment(output: &Output) -> BTreeMap<String, String> {
     assert_success(output);
-    serde_json::from_slice::<BTreeMap<String, String>>(&output.stdout).unwrap()
+    from_slice::<BTreeMap<String, String>>(&output.stdout).unwrap()
 }
 
 fn nul_environment(output: &Output) -> BTreeMap<String, String> {
@@ -262,7 +270,7 @@ fn assert_materialized_projection(environment: &BTreeMap<String, String>, shell:
 #[test]
 fn docker_cli_materializes_one_environment_across_real_entrypoints() {
     assert_eq!(std::env::consts::OS, "linux");
-    let real_bash = std::env::var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
+    let real_bash = var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/bash"));
     let fixture = Fixture::new();
@@ -371,7 +379,7 @@ fn docker_cli_explain_doctor_and_trust_are_real_process_commands() {
     let explained = fixture.run(&["explain", "--json", "environment.variables.BASE_VALUE"]);
     let explained: Value = {
         assert_success(&explained);
-        serde_json::from_slice(&explained.stdout).unwrap()
+        from_slice(&explained.stdout).unwrap()
     };
     assert_eq!(explained["profile"], "docker");
     assert_eq!(explained["value"], "from-cli-docker");
@@ -380,7 +388,7 @@ fn docker_cli_explain_doctor_and_trust_are_real_process_commands() {
     let doctor = fixture.run(&["doctor", "--json"]);
     let doctor: Value = {
         assert_success(&doctor);
-        serde_json::from_slice(&doctor.stdout).unwrap()
+        from_slice(&doctor.stdout).unwrap()
     };
     assert_eq!(doctor["ok"], true);
     assert!(doctor["checks"]

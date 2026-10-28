@@ -1,12 +1,16 @@
-use crate::command::{CommandError, CommandOutput};
-use crate::detect::DetectionError;
-use crate::environment::EnvironmentParseError;
-use crate::receipt::FingerprintError;
-use crate::template::TemplateError;
-use dev_env_model::ModelError;
-use std::error::Error;
-use std::fmt;
-use std::string::FromUtf8Error;
+use crate::{
+    command::{CommandError, CommandOutput},
+    detect::DetectionError,
+    environment::EnvironmentParseError,
+    receipt::FingerprintError,
+    template::TemplateError,
+};
+use dev_env_model::{MissingProviderPolicy, ModelError};
+use std::{
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+    string::FromUtf8Error,
+};
 
 /// A lifecycle error remains typed so CLI and JSON adapters can make their
 /// own diagnostic decisions without parsing a rendered message.
@@ -20,7 +24,7 @@ pub enum ProviderRuntimeError {
     MissingExecutable {
         provider: String,
         executable: String,
-        policy: dev_env_model::MissingProviderPolicy,
+        policy: MissingProviderPolicy,
     },
     Template {
         provider: String,
@@ -101,8 +105,8 @@ impl ProviderRuntimeErrorKind {
     }
 }
 
-impl fmt::Display for ProviderRuntimeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for ProviderRuntimeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Model(source) => write!(formatter, "provider model validation failed: {source}"),
             Self::Detection { provider, source } => {
@@ -130,9 +134,9 @@ impl fmt::Display for ProviderRuntimeError {
             } => write!(
                 formatter,
                 "provider {provider:?} {operation} exited unsuccessfully (status {:?}, timed_out: {}, stderr: {:?})",
-                output.status,
-                output.timed_out,
-                String::from_utf8_lossy(&output.stderr)
+                output.status(),
+                output.timed_out(),
+                String::from_utf8_lossy(output.stderr())
             ),
             Self::OutputUtf8 {
                 provider,

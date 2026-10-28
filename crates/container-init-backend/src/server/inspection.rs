@@ -96,7 +96,8 @@ fn plan_page_response(
 }
 
 fn doctor_response(runtime: &BackendRuntime) -> Value {
-    let executable = Path::new(&runtime.config().handoff.runtime);
+    let runtime_path = runtime.config().handoff().runtime();
+    let executable = Path::new(runtime_path);
     let exists = executable.is_file();
     let executable_ok = is_executable(executable);
     json!({
@@ -107,7 +108,7 @@ fn doctor_response(runtime: &BackendRuntime) -> Value {
         "backend": runtime.status(),
         "identity": runtime.startup_identity(),
         "handoff": {
-            "runtime": runtime.config().handoff.runtime,
+            "runtime": runtime.config().handoff().runtime(),
             "exists": exists,
             "executable": executable_ok,
         },

@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{error::Error as StdError, fmt, path::PathBuf};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum IdentityRequestError {
+    InvalidUser,
+}
 
 /// The identity a backend client is asking the container-init identity broker
 /// to resolve.  A client never supplies an arbitrary uid/gid pair; the broker
@@ -37,20 +42,15 @@ impl IdentityRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum IdentityRequestError {
-    InvalidUser,
-}
-
-impl std::fmt::Display for IdentityRequestError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for IdentityRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUser => formatter.write_str("identity user name is invalid"),
         }
     }
 }
 
-impl std::error::Error for IdentityRequestError {}
+impl StdError for IdentityRequestError {}
 
 /// Credentials supplied by the Unix socket layer to the identity broker.
 /// These values are observations, not client-controlled request fields.
@@ -64,29 +64,93 @@ pub struct IdentityPeer {
 
 pub type PeerCredentials = IdentityPeer;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum IdentityError {
+    InvalidUser,
+    InvalidHome,
+    RootGroupMismatch,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentitySource {
+    Root,
+    Peer,
+    NamedUser,
+    #[default]
+    Broker,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStatus {
+    Mounted,
+    NotMounted,
+    #[default]
+    Unavailable,
+}
+
 /// The broker's result for one request.  This is intentionally a data
 /// contract shared by dev-env and container-init; resolution and namespace
 /// mapping stay in container-init.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveIdentity {
-    pub uid: u32,
-    pub gid: u32,
-    pub user: String,
-    pub home: PathBuf,
+    uid: u32,
+    gid: u32,
+    user: String,
+    home: PathBuf,
     #[serde(default)]
-    pub supplementary_groups: Vec<u32>,
+    supplementary_groups: Vec<u32>,
     #[serde(default)]
-    pub run_as_root: bool,
+    run_as_root: bool,
     #[serde(default)]
-    pub source: IdentitySource,
+    source: IdentitySource,
     #[serde(default)]
-    pub workspace: WorkspaceStatus,
+    workspace: WorkspaceStatus,
 }
 
 pub type IdentitySnapshot = EffectiveIdentity;
 
 impl EffectiveIdentity {
+    pub fn new(
+        uid: u32,
+        gid: u32,
+        user: impl Into<String>,
+        home: impl Into<PathBuf>,
+        source: IdentitySource,
+    ) -> Self {
+        Self {
+            uid,
+            gid,
+            user: user.into(),
+            home: home.into(),
+            supplementary_groups: Vec::new(),
+            run_as_root: false,
+            source,
+            workspace: WorkspaceStatus::Unavailable,
+        }
+    }
+
+    pub fn with_supplementary_groups(mut self, groups: Vec<u32>) -> Self {
+        self.supplementary_groups = groups;
+        self
+    }
+
+    pub fn with_run_as_root(mut self, run_as_root: bool) -> Self {
+        self.run_as_root = run_as_root;
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: WorkspaceStatus) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     pub fn root() -> Self {
         Self {
             uid: 0,
@@ -114,15 +178,8 @@ impl EffectiveIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum IdentityError {
-    InvalidUser,
-    InvalidHome,
-    RootGroupMismatch,
-}
-
-impl std::fmt::Display for IdentityError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for IdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidUser => "resolved identity user is invalid",
             Self::InvalidHome => "resolved identity HOME must be an absolute path",
@@ -131,27 +188,38 @@ impl std::fmt::Display for IdentityError {
     }
 }
 
-impl std::error::Error for IdentityError {}
+impl StdError for IdentityError {}
 
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum IdentitySource {
-    Root,
-    Peer,
-    NamedUser,
-    #[default]
-    Broker,
-}
+impl EffectiveIdentity {
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
 
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceStatus {
-    Mounted,
-    NotMounted,
-    #[default]
-    Unavailable,
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn home(&self) -> &PathBuf {
+        &self.home
+    }
+
+    pub fn supplementary_groups(&self) -> &Vec<u32> {
+        &self.supplementary_groups
+    }
+
+    pub fn run_as_root(&self) -> bool {
+        self.run_as_root
+    }
+
+    pub fn source(&self) -> IdentitySource {
+        self.source
+    }
+
+    pub fn workspace(&self) -> WorkspaceStatus {
+        self.workspace
+    }
 }

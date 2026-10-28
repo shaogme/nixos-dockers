@@ -1,10 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fmt;
-use std::str::FromStr;
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use std::{collections::BTreeMap, error::Error as StdError, fmt, str::FromStr};
 
-use crate::validation::validate_path;
-use crate::ModelError;
+use crate::{validation::StringValidation, ModelError, ModelErrorReason};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum PathRenderError {
@@ -29,7 +26,7 @@ impl fmt::Display for PathRenderError {
     }
 }
 
-impl std::error::Error for PathRenderError {}
+impl StdError for PathRenderError {}
 
 /// A concrete absolute path with optional structured references.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -38,16 +35,16 @@ pub struct PathTemplate(String);
 impl<'de> Deserialize<'de> for PathTemplate {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::new(&value).map_err(serde::de::Error::custom)
+        Self::new(&value).map_err(DeError::custom)
     }
 }
 
 impl PathTemplate {
     pub fn new(input: &str) -> Result<Self, ModelError> {
-        validate_path("path", input)?;
+        input.validate_path("path")?;
         validate_interpolations(input)?;
         Ok(Self(input.to_owned()))
     }
@@ -111,7 +108,7 @@ fn validate_interpolations(input: &str) -> Result<(), ModelError> {
             if !input[cursor..].starts_with("${") {
                 return Err(ModelError::InvalidPath {
                     location: "path".to_owned(),
-                    reason: crate::ModelErrorReason::InvalidPath,
+                    reason: ModelErrorReason::InvalidPath,
                 });
             }
             let after_start = &input[cursor + 2..];
@@ -119,20 +116,20 @@ fn validate_interpolations(input: &str) -> Result<(), ModelError> {
                 .find('}')
                 .ok_or_else(|| ModelError::InvalidPath {
                     location: "path".to_owned(),
-                    reason: crate::ModelErrorReason::InvalidPath,
+                    reason: ModelErrorReason::InvalidPath,
                 })?;
             let reference = &after_start[..end];
-            if !crate::validation::is_reference(reference) {
+            if !reference.is_reference() {
                 return Err(ModelError::InvalidPath {
                     location: "path".to_owned(),
-                    reason: crate::ModelErrorReason::Unsupported,
+                    reason: ModelErrorReason::Unsupported,
                 });
             }
             cursor += end + 3;
         } else if character == '}' {
             return Err(ModelError::InvalidPath {
                 location: "path".to_owned(),
-                reason: crate::ModelErrorReason::InvalidPath,
+                reason: ModelErrorReason::InvalidPath,
             });
         } else {
             cursor += character.len_utf8();

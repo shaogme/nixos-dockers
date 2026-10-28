@@ -18,27 +18,87 @@ mod runner;
 mod supervisor;
 mod template;
 
+use dev_env_model::{Condition, ProviderConfig, ShellEnvEntry, ShellEnvFormat};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
 pub use command::{
     CommandError, CommandExecutor, CommandOutput, CommandRequest, OutputStream, ProcessExecutor,
 };
-pub use condition::evaluate as evaluate_condition;
+pub use condition::ConditionEvaluator;
 pub use context::ProviderContext;
 pub use detect::{
-    detect, DetectionError, DetectionResult, ExecutableLocator, SystemExecutableLocator,
+    DetectionError, DetectionResult, ExecutableLocator, ProviderDetection, SystemExecutableLocator,
 };
 pub use environment::{
-    parse_output, DotenvParseError, EnvironmentDelta, EnvironmentParseError, JsonEnvironmentError,
+    DotenvParseError, EnvironmentDelta, EnvironmentParseError, JsonEnvironmentError,
 };
 pub use error::{ProviderRuntimeError, ProviderRuntimeErrorKind};
 pub use protocol::{
-    decode_request, encode_response, protocol_error, ProtocolCodecError, ProtocolDiagnostic,
-    ProtocolError, ProtocolOperation, ProtocolRequest, ProtocolResponse, PROTOCOL_VERSION,
+    ProtocolCodec, ProtocolCodecError, ProtocolDiagnostic, ProtocolError, ProtocolOperation,
+    ProtocolRequest, ProtocolResponse, PROTOCOL_VERSION,
 };
-pub use receipt::{
-    fingerprint_bytes, provider_config_fingerprint, workspace_fingerprint, FingerprintError,
-};
+pub use receipt::{FingerprintError, ProviderFingerprints};
 pub use runner::{
-    GenericProvider, Provider, ProviderDiagnostic, ProviderRunResult, ProviderRunner,
+    GenericProvider, Provider, ProviderDiagnostic, ProviderRunResult, ProviderRunResultParts,
+    ProviderRunner,
 };
-pub use supervisor::{ProviderJob, ProviderSupervisor};
-pub use template::{expand_argv, TemplateError};
+pub use supervisor::{ProviderJob, ProviderJobParts, ProviderSupervisor};
+pub use template::{ProviderTemplate, TemplateError};
+
+pub fn evaluate_condition(condition: &Condition, context: &ProviderContext) -> bool {
+    ConditionEvaluator::evaluate(condition, context)
+}
+
+pub fn detect(
+    config: &ProviderConfig,
+    workspace: &Path,
+    environment: &BTreeMap<String, String>,
+    locator: &dyn ExecutableLocator,
+) -> Result<DetectionResult, DetectionError> {
+    ProviderDetection::detect(config, workspace, environment, locator)
+}
+
+pub fn parse_output(
+    format: ShellEnvFormat,
+    output: &str,
+) -> Result<Vec<ShellEnvEntry>, EnvironmentParseError> {
+    EnvironmentDelta::parse_output(format, output)
+}
+
+pub fn decode_request(input: &[u8]) -> Result<ProtocolRequest, ProtocolCodecError> {
+    ProtocolCodec::decode_request(input)
+}
+
+pub fn encode_response(response: &ProtocolResponse) -> Result<Vec<u8>, ProtocolCodecError> {
+    ProtocolCodec::encode_response(response)
+}
+
+pub fn protocol_error(error: &ProviderRuntimeError) -> ProtocolError {
+    ProtocolCodec::protocol_error(error)
+}
+
+pub fn fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
+    ProviderFingerprints::fingerprint_bytes(bytes)
+}
+
+pub fn provider_config_fingerprint(config: &ProviderConfig) -> Result<[u8; 32], FingerprintError> {
+    ProviderFingerprints::provider_config(config)
+}
+
+pub fn workspace_fingerprint(
+    workspace: &Path,
+    matched_files: &[PathBuf],
+) -> Result<[u8; 32], FingerprintError> {
+    ProviderFingerprints::workspace(workspace, matched_files)
+}
+
+pub fn expand_argv(
+    arguments: &[String],
+    provider: &str,
+    context: &ProviderContext,
+) -> Result<Vec<String>, TemplateError> {
+    ProviderTemplate::expand_argv(arguments, provider, context)
+}

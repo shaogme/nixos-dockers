@@ -1,8 +1,9 @@
 use container_init_posix::WorkspaceObservation;
-use std::collections::{BTreeMap, BTreeSet};
-use std::env;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, io,
+    path::{Path, PathBuf},
+};
 
 /// Runtime data supplied by the CLI or the process environment.
 ///

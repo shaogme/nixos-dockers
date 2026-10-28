@@ -1,8 +1,30 @@
+use crate::SourceKind;
 use dev_env_model::{ModelError, Origin, OverrideOperation};
-use std::error::Error;
-use std::fmt;
-use std::io;
-use std::path::PathBuf;
+use std::{error::Error, fmt, io, path::PathBuf};
+use toml::{de::Error as TomlDeserializeError, ser::Error as TomlSerializeError};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConflictRemedy {
+    ExplicitOverride { path: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrustViolationReason {
+    OnlyTrustedSourcesMayChangePolicy,
+    OnlyTrustedSourcesMayDeclareInputs,
+    WorkspaceOverrideNotAllowed,
+    CliOverrideNotAllowed,
+    ProviderNotDeclared,
+    UntrustedSourceMayNotOverride,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueKind {
+    Missing,
+    Scalar,
+    Array,
+    Table,
+}
 
 /// Errors which can occur while reading, graph-resolving, or merging sources.
 ///
@@ -17,11 +39,11 @@ pub enum LoaderError {
     },
     Parse {
         location: String,
-        source: toml::de::Error,
+        source: TomlDeserializeError,
     },
     Serialize {
         location: String,
-        source: toml::ser::Error,
+        source: TomlSerializeError,
     },
     Model {
         location: Option<String>,
@@ -53,7 +75,7 @@ pub enum LoaderError {
     },
     TrustViolation {
         profile: String,
-        source: crate::SourceKind,
+        source: SourceKind,
         path: String,
         reason: TrustViolationReason,
     },
@@ -82,29 +104,6 @@ pub enum LoaderError {
         first_name: String,
         second_name: String,
     },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConflictRemedy {
-    ExplicitOverride { path: String },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TrustViolationReason {
-    OnlyTrustedSourcesMayChangePolicy,
-    OnlyTrustedSourcesMayDeclareInputs,
-    WorkspaceOverrideNotAllowed,
-    CliOverrideNotAllowed,
-    ProviderNotDeclared,
-    UntrustedSourceMayNotOverride,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ValueKind {
-    Missing,
-    Scalar,
-    Array,
-    Table,
 }
 
 impl fmt::Display for ValueKind {

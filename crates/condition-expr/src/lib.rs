@@ -3,8 +3,7 @@
 //! Product models interpret leaf expressions and comparison values so they
 //! can retain their own reference namespaces and evaluation rules.
 
-use std::error::Error;
-use std::fmt;
+use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
@@ -46,6 +45,12 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
+struct Comparison<'a> {
+    left: &'a str,
+    operator: &'a str,
+    right: &'a str,
+}
+
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
     let input = input.trim();
     if input.is_empty() {
@@ -73,10 +78,10 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
     if let Some(rest) = input.strip_prefix('!') {
         return Ok(Expr::Not(Box::new(parse(rest)?)));
     }
-    if let Some((left, operator, right)) = split_comparison(input)? {
-        return Ok(match operator {
-            "==" => Expr::Equal(left.to_owned(), right.to_owned()),
-            "!=" => Expr::NotEqual(left.to_owned(), right.to_owned()),
+    if let Some(comparison) = split_comparison(input)? {
+        return Ok(match comparison.operator {
+            "==" => Expr::Equal(comparison.left.to_owned(), comparison.right.to_owned()),
+            "!=" => Expr::NotEqual(comparison.left.to_owned(), comparison.right.to_owned()),
             _ => unreachable!("only supported comparison operators are returned"),
         });
     }
@@ -136,7 +141,7 @@ fn split_top_level<'a>(input: &'a str, operator: &str) -> Result<Vec<&'a str>, P
     Ok(parts)
 }
 
-fn split_comparison(input: &str) -> Result<Option<(&str, &str, &str)>, ParseError> {
+fn split_comparison(input: &str) -> Result<Option<Comparison<'_>>, ParseError> {
     // Keep the product parsers' historical operator preference: `!=` is
     // searched before `==`, even if both appear in the same leaf.
     for operator in ["!=", "=="] {
@@ -152,7 +157,11 @@ fn split_comparison(input: &str) -> Result<Option<(&str, &str, &str)>, ParseErro
             if left.is_empty() || right.is_empty() {
                 return Err(ParseError::InvalidComparison(input.to_owned()));
             }
-            return Ok(Some((left, operator, right)));
+            return Ok(Some(Comparison {
+                left,
+                operator,
+                right,
+            }));
         }
     }
     Ok(None)

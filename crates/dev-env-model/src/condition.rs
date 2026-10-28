@@ -1,8 +1,8 @@
 use serde::Serialize;
-use std::fmt;
+use std::{error::Error, fmt};
 
-use crate::validation::{is_config_path, is_env_name};
-use condition_expr::{Expr as SharedExpr, ParseError as SharedParseError};
+use crate::validation::StringValidation;
+use condition_expr::{parse, Expr as SharedExpr, ParseError as SharedParseError};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum ConditionError {
@@ -37,7 +37,14 @@ impl fmt::Display for ConditionError {
     }
 }
 
-impl std::error::Error for ConditionError {}
+impl Error for ConditionError {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum ConditionValue {
+    Reference(String),
+    Literal(String),
+    Boolean(bool),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Condition {
@@ -49,13 +56,6 @@ pub enum Condition {
     And(Vec<Condition>),
     Or(Vec<Condition>),
     Not(Box<Condition>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub enum ConditionValue {
-    Reference(String),
-    Literal(String),
-    Boolean(bool),
 }
 
 impl Condition {
@@ -73,7 +73,7 @@ impl Condition {
         {
             return Err(ConditionError::ShellSyntax);
         }
-        let expression = condition_expr::parse(input).map_err(map_shared_error)?;
+        let expression = parse(input).map_err(map_shared_error)?;
         from_shared(expression)
     }
 }
@@ -154,10 +154,10 @@ impl ConditionValue {
 fn validate_reference(input: &str) -> Result<(), ConditionError> {
     let valid = match input.split_once('.') {
         Some((namespace, rest)) => match namespace {
-            "provider" => rest == "enabled" || is_config_path(rest),
+            "provider" => rest == "enabled" || rest.is_config_path(),
             "workspace" => matches!(rest, "config-present" | "writable" | "root"),
-            "features" | "config" => is_config_path(rest),
-            "input" | "env" => is_env_name(rest),
+            "features" | "config" => rest.is_config_path(),
+            "input" | "env" => rest.is_env_name(),
             "context" => matches!(rest, "cwd" | "os" | "arch"),
             _ => false,
         },

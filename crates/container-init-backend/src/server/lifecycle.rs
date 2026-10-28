@@ -28,10 +28,13 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use unix_frame::FrameBudget;
 
 const MAX_WORKERS: usize = 32;
 const MAX_PENDING_CONNECTIONS: usize = 16;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 pub(super) struct BackendSupervisor;
 
@@ -76,10 +79,10 @@ fn is_root_service(
 ) -> bool {
     owner_uid == 0
         && initial_handoff
-        && (config.handoff.root_service
+        && (config.handoff().root_service()
             || config
-                .handoff
-                .ssh_daemon
+                .handoff()
+                .ssh_daemon()
                 .as_deref()
                 .is_some_and(|daemon| command.first().is_some_and(|candidate| candidate == daemon)))
 }
@@ -90,9 +93,9 @@ fn spawn_handoff(
     root_service: bool,
     cwd: &Path,
 ) -> io::Result<Child> {
-    let mut command = Command::new(&handoff.program);
+    let mut command = Command::new(handoff.program());
     command
-        .args(&handoff.args)
+        .args(handoff.args())
         .current_dir(cwd)
         .process_group(0);
     if identity.uid != 0 {
@@ -368,7 +371,7 @@ fn spawn_reserved_connection_worker(
     }
 }
 
-fn reject_busy(mut connection: PendingConnection, message: &str, budget: &unix_frame::FrameBudget) {
+fn reject_busy(mut connection: PendingConnection, message: &str, budget: &FrameBudget) {
     let _ = ConnectionService::write_response(
         &mut connection.stream,
         ServerResponse::Error(RuntimeErrors::backend("capacity", true, message)),
@@ -416,8 +419,6 @@ fn reap_adopted_children() -> io::Result<bool> {
         }
     }
 }
-
-static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn signal_handler(signal: c_int) {
     PENDING_SIGNAL.store(signal, Ordering::Relaxed);

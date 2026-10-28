@@ -1,17 +1,20 @@
 use dev_env_core::{CoreError, Materializer, RuntimeContext};
 use dev_env_model::{
-    ConfiguredValuePrecedence, EnvironmentConfig, EnvironmentPath, FailurePolicy,
-    MissingProviderPolicy, PathMode, PolicyConfig, PrepareStep, ProviderConfig, ResolvedConfig,
-    Sensitivity, ShellConfig, ShellEnvConfig, ShellEnvFormat, ShellKind, ShellSelection, ValueTree,
-    WorkspaceConfig, WorkspaceSearch,
+    ConfiguredValuePrecedence, EnvironmentConfig, EnvironmentPath, FailurePolicy, MaterializedEnv,
+    MissingProviderPolicy, PathMode, PrepareStep, ProviderConfig, ResolvedConfig, Sensitivity,
+    ShellConfig, ShellEnvConfig, ShellEnvFormat, ShellKind, ShellSelection, ValueTree,
+    WorkspaceConfig,
 };
 use dev_env_provider::{ProviderRunner, ProviderRuntimeError, ProviderRuntimeErrorKind};
 use dev_env_shell::CommandLine;
-use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::BTreeMap,
+    env::{temp_dir, var},
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 struct TempWorkspace {
     path: PathBuf,
@@ -20,7 +23,7 @@ struct TempWorkspace {
 impl TempWorkspace {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = temp_dir().join(format!(
             "dev-env-core-docker-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -75,91 +78,82 @@ esac
 }
 
 fn provider_config(executable: &Path) -> ProviderConfig {
-    ProviderConfig {
-        executable: executable.display().to_string(),
-        detect_files: vec!["project.config".to_owned()],
-        missing: MissingProviderPolicy::Error,
-        depends_on: Vec::new(),
-        prepare: vec![PrepareStep {
-            argv: vec![
+    ProviderConfig::new(
+        executable.display().to_string(),
+        vec!["project.config".to_owned()],
+        MissingProviderPolicy::Error,
+        Vec::new(),
+        vec![PrepareStep::new(
+            vec![
                 "prepare".to_owned(),
                 "{shell}".to_owned(),
                 "{workspace}".to_owned(),
                 "literal;$(not-a-command)".to_owned(),
             ],
-            when: Some("workspace.config-present && features.tool.mode == 'enabled'".to_owned()),
-            failure: FailurePolicy::Error,
-            timeout_ms: Some(1_000),
-            sensitivity: Sensitivity::Public,
-        }],
-        shellenv: Some(ShellEnvConfig {
-            argv: vec!["env".to_owned(), "{shell}".to_owned()],
-            format: ShellEnvFormat::Json,
-            failure: FailurePolicy::Error,
-            path_mode: PathMode::Merge,
-            timeout_ms: Some(1_000),
-        }),
-        sensitivity: Sensitivity::Public,
-    }
+            Some("workspace.config-present && features.tool.mode == 'enabled'".to_owned()),
+            FailurePolicy::Error,
+            Some(1_000),
+            Sensitivity::Public,
+        )],
+    )
+    .with_shellenv(ShellEnvConfig::new(
+        vec!["env".to_owned(), "{shell}".to_owned()],
+        ShellEnvFormat::Json,
+        FailurePolicy::Error,
+        PathMode::Merge,
+        Some(1_000),
+    ))
 }
 
 fn config(workspace: &Path, executable: &Path, provider_mode: &str) -> ResolvedConfig {
     let mut shells = BTreeMap::new();
     shells.insert(
         "sh".to_owned(),
-        ShellConfig {
-            command: "/bin/sh".to_owned(),
-            kind: ShellKind::Posix,
-            login_args: vec!["-l".to_owned()],
-            interactive_args: vec!["-i".to_owned()],
-            command_arg: Some("-c".to_owned()),
-        },
+        ShellConfig::new(
+            "/bin/sh",
+            ShellKind::Posix,
+            vec!["-l".to_owned()],
+            vec!["-i".to_owned()],
+            Some("-c".to_owned()),
+        ),
     );
     let mut providers = BTreeMap::new();
     providers.insert("tool".to_owned(), provider_config(executable));
-    ResolvedConfig {
-        workspace: WorkspaceConfig {
-            root: workspace.display().to_string(),
-            search: WorkspaceSearch::Upward,
-        },
-        shell: ShellSelection {
-            default: "sh".to_owned(),
-        },
-        shells,
-        environment: EnvironmentConfig {
-            // The Docker image deliberately contains DEV_ENV_HOST_LEAK.  The
-            // session below supplies it as ambient input, but locked config
-            // inheritance is disabled so it cannot reach the provider or shell.
-            inherit_process: false,
-            configured_value_precedence: ConfiguredValuePrecedence::Locked,
-            variables: BTreeMap::from([
-                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-                ("BASE_VALUE".to_owned(), "from-core".to_owned()),
-                (
-                    "PROVIDER_LOG".to_owned(),
-                    workspace.join("provider.log").display().to_string(),
-                ),
-                ("PROVIDER_MODE".to_owned(), provider_mode.to_owned()),
-            ]),
-            conditional_variables: BTreeMap::new(),
-            path: EnvironmentPath {
-                prepend: vec!["/opt/base/bin".to_owned()],
-                append: vec!["/usr/local/bin".to_owned()],
-                remove: vec![],
-            },
-        },
-        features: ValueTree::Map(BTreeMap::from([(
-            "tool".to_owned(),
-            ValueTree::Map(BTreeMap::from([(
-                "mode".to_owned(),
-                ValueTree::String("enabled".to_owned()),
-            )])),
+    // The Docker image deliberately contains DEV_ENV_HOST_LEAK.  The session
+    // supplies it as ambient input, but locked config inheritance is disabled.
+    let environment = EnvironmentConfig::new(
+        false,
+        ConfiguredValuePrecedence::Locked,
+        BTreeMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("BASE_VALUE".to_owned(), "from-core".to_owned()),
+            (
+                "PROVIDER_LOG".to_owned(),
+                workspace.join("provider.log").display().to_string(),
+            ),
+            ("PROVIDER_MODE".to_owned(), provider_mode.to_owned()),
+        ]),
+        BTreeMap::new(),
+        EnvironmentPath::new(
+            vec!["/opt/base/bin".to_owned()],
+            vec!["/usr/local/bin".to_owned()],
+            Vec::new(),
+        ),
+    );
+    ResolvedConfig::new(
+        WorkspaceConfig::new(workspace.display().to_string()),
+        ShellSelection::new("sh"),
+        environment,
+    )
+    .with_shells(shells)
+    .with_providers(providers)
+    .with_features(ValueTree::Map(BTreeMap::from([(
+        "tool".to_owned(),
+        ValueTree::Map(BTreeMap::from([(
+            "mode".to_owned(),
+            ValueTree::String("enabled".to_owned()),
         )])),
-        providers,
-        inputs: BTreeMap::new(),
-        policy: PolicyConfig::default(),
-        provenance: Default::default(),
-    }
+    )])))
 }
 
 fn context(workspace: &Path) -> RuntimeContext {
@@ -174,7 +168,7 @@ fn context(workspace: &Path) -> RuntimeContext {
             ),
             (
                 "DEV_ENV_HOST_LEAK".to_owned(),
-                std::env::var("DEV_ENV_HOST_LEAK").unwrap_or_else(|_| "missing".to_owned()),
+                var("DEV_ENV_HOST_LEAK").unwrap_or_else(|_| "missing".to_owned()),
             ),
         ]),
     )
@@ -186,7 +180,7 @@ fn runner(_temp: &TempWorkspace) -> ProviderRunner {
     ProviderRunner::default()
 }
 
-fn run_shell(environment: &dev_env_model::MaterializedEnv, workspace: &Path) -> String {
+fn run_shell(environment: &MaterializedEnv, workspace: &Path) -> String {
     let command = CommandLine::new(
         "/bin/sh",
         [
@@ -225,31 +219,31 @@ fn docker_materializes_a_real_provider_and_real_shell_without_host_leaks() {
             .unwrap();
 
     assert_eq!(
-        materialization.environment.values["BASE_VALUE"].value,
+        materialization.environment().values()["BASE_VALUE"].value(),
         "from-core"
     );
     assert_eq!(
-        materialization.environment.values["FROM_PROVIDER"].value,
+        materialization.environment().values()["FROM_PROVIDER"].value(),
         "real-provider"
     );
     assert_eq!(
-        materialization.environment.values["LEAK_CHECK"].value,
+        materialization.environment().values()["LEAK_CHECK"].value(),
         "absent"
     );
     assert_eq!(
-        materialization.environment.values["PATH"].value,
+        materialization.environment().values()["PATH"].value(),
         "/opt/provider/bin:/usr/bin:/bin:/opt/base/bin:/usr/local/bin"
     );
-    assert_eq!(materialization.environment.provider_receipts.len(), 1);
-    assert_ne!(materialization.environment.config_fingerprint, [0; 32]);
-    assert_eq!(materialization.diagnostics.len(), 0);
+    assert_eq!(materialization.environment().provider_receipts().len(), 1);
+    assert_ne!(materialization.environment().config_fingerprint(), [0; 32]);
+    assert_eq!(materialization.diagnostics().len(), 0);
 
     assert_eq!(
         fs::read_to_string(workspace.join("provider.log")).unwrap(),
         format!("4\nsh\n{}\nliteral;$(not-a-command)\n", workspace.display())
     );
     assert_eq!(
-        run_shell(&materialization.environment, &workspace),
+        run_shell(materialization.environment(), &workspace),
         "from-core\nreal-provider\nabsent\nabsent\n"
     );
 }
@@ -283,7 +277,8 @@ fn docker_preserves_a_real_provider_failure_as_a_structured_error() {
         assert!(matches!(
             source.as_ref(),
             ProviderRuntimeError::CommandFailed { output, .. }
-                if output.status == Some(23) && output.stderr == b"real provider shellenv failed\n"
+                if output.status() == Some(23)
+                    && output.stderr() == b"real provider shellenv failed\n"
         ));
     }
 }
@@ -298,19 +293,25 @@ fn docker_rejects_shellenv_code_before_a_real_shell_can_execute_it() {
     let executable = temp.path.join("provider");
     write_provider(&executable);
 
-    let mut reject_config = config(&workspace, &executable, "reject");
-    reject_config
-        .providers
-        .get_mut("tool")
+    let reject_config = config(&workspace, &executable, "reject");
+    let mut providers = reject_config.providers().clone();
+    let provider = providers.get("tool").unwrap().clone();
+    let shellenv = provider
+        .shellenv()
+        .as_ref()
         .unwrap()
-        .shellenv
-        .as_mut()
-        .unwrap()
-        .format = ShellEnvFormat::Shell;
-    reject_config
-        .environment
-        .variables
-        .insert("REJECT_MARKER".to_owned(), marker.display().to_string());
+        .clone()
+        .with_format(ShellEnvFormat::Shell);
+    providers.insert("tool".to_owned(), provider.with_shellenv(shellenv));
+    let mut variables = reject_config.environment().variables().clone();
+    variables.insert("REJECT_MARKER".to_owned(), marker.display().to_string());
+    let environment = reject_config
+        .environment()
+        .clone()
+        .with_variables(variables);
+    let reject_config = reject_config
+        .with_providers(providers)
+        .with_environment(environment);
     let error = Materializer::with_provider_runner(reject_config, runner(&temp))
         .materialize(&context(&workspace))
         .unwrap_err();

@@ -1,9 +1,20 @@
-use crate::config::LoadedConfig;
-use crate::error::{CliError, OutputError};
-use dev_env_model::{MergePolicy, Origin, Sensitivity};
-use serde::Serialize;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use {
+    crate::{
+        error::{CliError, ConfigurationError, OutputError},
+        LoadedConfig, OutputApi,
+    },
+    dev_env_model::{MergePolicy, Origin, Sensitivity},
+    dev_env_provider::fingerprint_bytes,
+    serde::Serialize,
+    serde_json::{to_string, to_string_pretty, to_value, to_vec, Value},
+    std::collections::BTreeMap,
+};
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExplainProvenance {
+    pub sensitivity: Sensitivity,
+    pub origins: Vec<Origin>,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ExplainReport {
@@ -18,25 +29,37 @@ pub struct ExplainReport {
     pub provenance: BTreeMap<String, ExplainProvenance>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct ExplainProvenance {
-    pub sensitivity: Sensitivity,
-    pub origins: Vec<Origin>,
+pub struct ExplainApi;
+
+impl ExplainApi {
+    pub fn build_report(
+        loaded: &LoadedConfig,
+        path: Option<&str>,
+    ) -> Result<ExplainReport, CliError> {
+        build_report_inner(loaded, path)
+    }
+
+    pub fn print_report(report: &ExplainReport, json: bool) -> Result<(), CliError> {
+        print_report_inner(report, json)
+    }
 }
 
-pub fn build_report(loaded: &LoadedConfig, path: Option<&str>) -> Result<ExplainReport, CliError> {
-    let encoded = serde_json::to_vec(loaded.config()).map_err(OutputError::Json)?;
-    let config = serde_json::to_value(loaded.config()).map_err(OutputError::Json)?;
+fn build_report_inner(
+    loaded: &LoadedConfig,
+    path: Option<&str>,
+) -> Result<ExplainReport, CliError> {
+    let encoded = to_vec(loaded.config()).map_err(OutputError::Json)?;
+    let config = to_value(loaded.config()).map_err(OutputError::Json)?;
     let value = path
         .map(|path| {
             let value = value_at(&config, path).ok_or_else(|| {
-                CliError::Configuration(crate::error::ConfigurationError::MissingConfigPath {
+                CliError::Configuration(ConfigurationError::MissingConfigPath {
                     path: path.to_owned(),
                 })
             })?;
             let sensitivity = loaded
                 .config()
-                .provenance
+                .provenance()
                 .get(path)
                 .map(|entry| entry.sensitivity)
                 .unwrap_or_default();
@@ -49,7 +72,7 @@ pub fn build_report(loaded: &LoadedConfig, path: Option<&str>) -> Result<Explain
         .transpose()?;
     let provenance = loaded
         .config()
-        .provenance
+        .provenance()
         .iter()
         .map(|(path, entry)| {
             (
@@ -70,18 +93,18 @@ pub fn build_report(loaded: &LoadedConfig, path: Option<&str>) -> Result<Explain
             .collect(),
         workspace: loaded.workspace().display().to_string(),
         cwd: loaded.cwd().display().to_string(),
-        merge_policy: loaded.config().policy.merge,
-        config_fingerprint: hex_digest(dev_env_provider::fingerprint_bytes(&encoded)),
+        merge_policy: loaded.config().policy().merge(),
+        config_fingerprint: hex_digest(fingerprint_bytes(&encoded)),
         path: path.map(str::to_owned),
         value,
         provenance,
     })
 }
 
-pub fn print_report(report: &ExplainReport, json: bool) -> Result<(), CliError> {
+fn print_report_inner(report: &ExplainReport, json: bool) -> Result<(), CliError> {
     if json {
-        let rendered = serde_json::to_string_pretty(report).map_err(OutputError::Json)?;
-        crate::output::write_stdout(&format!("{rendered}\n"))
+        let rendered = to_string_pretty(report).map_err(OutputError::Json)?;
+        OutputApi::write_stdout(&format!("{rendered}\n"))
     } else {
         let mut rendered = String::new();
         rendered.push_str(&format!("profile: {}\n", report.profile));
@@ -99,7 +122,7 @@ pub fn print_report(report: &ExplainReport, json: bool) -> Result<(), CliError> 
         if let Some(path) = &report.path {
             rendered.push_str(&format!("{path}: "));
             if let Some(value) = &report.value {
-                rendered.push_str(&serde_json::to_string(value).map_err(OutputError::Json)?);
+                rendered.push_str(&to_string(value).map_err(OutputError::Json)?);
             } else {
                 rendered.push_str("<missing>");
             }
@@ -112,7 +135,7 @@ pub fn print_report(report: &ExplainReport, json: bool) -> Result<(), CliError> 
                 rendered.push_str(&format!("    - {origin:?}\n"));
             }
         }
-        crate::output::write_stdout(&rendered)
+        OutputApi::write_stdout(&rendered)
     }
 }
 

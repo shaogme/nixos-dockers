@@ -2,46 +2,12 @@ use crate::error::LoaderError;
 use container_init_bootstrap_model::{
     Action, ActionKind, BootstrapInput, BootstrapMode, NonInteractivePolicy, SourceKind,
 };
+use profile_graph::validate_profile_id as graph_validate_profile_id;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct RawProfile {
-    pub(crate) schema: Option<u32>,
-    pub(crate) id: String,
-    #[serde(default)]
-    pub(crate) extends: Vec<String>,
-    #[serde(default)]
-    pub(crate) bootstrap: Option<RawBootstrap>,
-    /// The environment DSL also uses this table. The loader validates only
-    /// entries under the bootstrap namespace and leaves the rest untouched.
-    #[serde(default, rename = "override")]
-    pub(crate) overrides: BTreeMap<String, toml::Value>,
-}
+use toml::{from_str, Value};
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RawBootstrap {
-    pub(crate) schema: Option<u32>,
-    pub(crate) mode: Option<BootstrapMode>,
-    pub(crate) workspace_root: Option<String>,
-    pub(crate) allow_workspace_overlay: Option<bool>,
-    pub(crate) non_interactive: Option<NonInteractivePolicy>,
-    pub(crate) identity: Option<RawIdentity>,
-    pub(crate) handoff: Option<RawHandoff>,
-    pub(crate) policy: Option<RawPolicy>,
-    #[serde(default)]
-    pub(crate) inputs: BTreeMap<String, BootstrapInput>,
-    #[serde(default)]
-    pub(crate) actions: Vec<Action>,
-    /// Accepted as a convenience for bootstrap-only profiles. The canonical
-    /// spelling remains the top-level override table.
-    #[serde(default, rename = "override")]
-    pub(crate) overrides: BTreeMap<String, toml::Value>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RawIdentity {
     pub(crate) default_user: Option<String>,
     pub(crate) default_uid: Option<u32>,
@@ -76,51 +42,93 @@ pub(crate) struct RawPolicy {
     pub(crate) admin_only_action_kinds: BTreeSet<ActionKind>,
 }
 
-pub(crate) fn parse_profile(contents: &str, location: String) -> Result<RawProfile, LoaderError> {
-    let mut document: toml::Value =
-        toml::from_str(contents).map_err(|source| LoaderError::Parse {
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawBootstrap {
+    pub(crate) schema: Option<u32>,
+    pub(crate) mode: Option<BootstrapMode>,
+    pub(crate) workspace_root: Option<String>,
+    pub(crate) allow_workspace_overlay: Option<bool>,
+    pub(crate) non_interactive: Option<NonInteractivePolicy>,
+    pub(crate) identity: Option<RawIdentity>,
+    pub(crate) handoff: Option<RawHandoff>,
+    pub(crate) policy: Option<RawPolicy>,
+    #[serde(default)]
+    pub(crate) inputs: BTreeMap<String, BootstrapInput>,
+    #[serde(default)]
+    pub(crate) actions: Vec<Action>,
+    /// Accepted as a convenience for bootstrap-only profiles. The canonical
+    /// spelling remains the top-level override table.
+    #[serde(default, rename = "override")]
+    pub(crate) overrides: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct RawProfile {
+    pub(crate) schema: Option<u32>,
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) extends: Vec<String>,
+    #[serde(default)]
+    pub(crate) bootstrap: Option<RawBootstrap>,
+    /// The environment DSL also uses this table. The loader validates only
+    /// entries under the bootstrap namespace and leaves the rest untouched.
+    #[serde(default, rename = "override")]
+    pub(crate) overrides: BTreeMap<String, Value>,
+}
+
+pub(crate) struct RawProfileParser;
+
+impl RawProfileParser {
+    pub(crate) fn parse_profile(
+        contents: &str,
+        location: String,
+    ) -> Result<RawProfile, LoaderError> {
+        let mut document: Value = from_str(contents).map_err(|source| LoaderError::Parse {
             location: location.clone(),
             source,
         })?;
-    normalize_dsl_action_kinds(&mut document);
-    let profile: RawProfile = document.try_into().map_err(|source| LoaderError::Parse {
-        location: location.clone(),
-        source,
-    })?;
-    validate_profile_id(&profile.id).map_err(|error| match error {
-        LoaderError::Invalid { message, .. } => LoaderError::Invalid {
+        normalize_dsl_action_kinds(&mut document);
+        let profile: RawProfile = document.try_into().map_err(|source| LoaderError::Parse {
             location: location.clone(),
-            message,
-        },
-        other => other,
-    })?;
-    if profile.schema == Some(0) {
-        return Err(LoaderError::Invalid {
-            location,
-            message: "profile schema must be a positive integer".to_owned(),
-        });
+            source,
+        })?;
+        Self::validate_profile_id(&profile.id).map_err(|error| match error {
+            LoaderError::Invalid { message, .. } => LoaderError::Invalid {
+                location: location.clone(),
+                message,
+            },
+            other => other,
+        })?;
+        if profile.schema == Some(0) {
+            return Err(LoaderError::Invalid {
+                location,
+                message: "profile schema must be a positive integer".to_owned(),
+            });
+        }
+        Ok(profile)
     }
-    Ok(profile)
+
+    pub(crate) fn validate_profile_id(id: &str) -> Result<(), LoaderError> {
+        graph_validate_profile_id(id).map_err(|error| LoaderError::Invalid {
+            location: "id".to_owned(),
+            message: error.to_string(),
+        })
+    }
 }
 
 /// The DSL spells action kinds with dots (`filesystem.ensure_dir`), while
 /// `container-init-bootstrap-model` deliberately serializes Rust enum names as snake case.
 /// Normalize only the bootstrap action-kind fields at this boundary; values
 /// in the environment namespace are never interpreted or rewritten.
-fn normalize_dsl_action_kinds(document: &mut toml::Value) {
+fn normalize_dsl_action_kinds(document: &mut Value) {
     let Some(root) = document.as_table_mut() else {
         return;
     };
-    let Some(bootstrap) = root
-        .get_mut("bootstrap")
-        .and_then(toml::Value::as_table_mut)
-    else {
+    let Some(bootstrap) = root.get_mut("bootstrap").and_then(Value::as_table_mut) else {
         return;
     };
-    if let Some(actions) = bootstrap
-        .get_mut("actions")
-        .and_then(toml::Value::as_array_mut)
-    {
+    if let Some(actions) = bootstrap.get_mut("actions").and_then(Value::as_array_mut) {
         for action in actions {
             if let Some(kind) = action
                 .as_table_mut()
@@ -132,32 +140,22 @@ fn normalize_dsl_action_kinds(document: &mut toml::Value) {
                     .as_table_mut()
                     .and_then(|action| action.get_mut("kind"))
                 {
-                    *kind_value = toml::Value::String(normalized);
+                    *kind_value = Value::String(normalized);
                 }
             }
         }
     }
-    if let Some(policy) = bootstrap
-        .get_mut("policy")
-        .and_then(toml::Value::as_table_mut)
-    {
+    if let Some(policy) = bootstrap.get_mut("policy").and_then(Value::as_table_mut) {
         for field in ["workspace_safe_action_kinds", "admin_only_action_kinds"] {
-            if let Some(kinds) = policy.get_mut(field).and_then(toml::Value::as_array_mut) {
+            if let Some(kinds) = policy.get_mut(field).and_then(Value::as_array_mut) {
                 for kind in kinds {
                     if let Some(kind_name) = kind.as_str() {
-                        *kind = toml::Value::String(kind_name.replace('.', "_"));
+                        *kind = Value::String(kind_name.replace('.', "_"));
                     }
                 }
             }
         }
     }
-}
-
-pub(crate) fn validate_profile_id(id: &str) -> Result<(), LoaderError> {
-    profile_graph::validate_profile_id(id).map_err(|error| LoaderError::Invalid {
-        location: "id".to_owned(),
-        message: error.to_string(),
-    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -206,7 +204,7 @@ impl OverrideCatalog {
                 location: format!("profile {}.override", profile.id),
                 message: "bootstrap override must be a table".to_owned(),
             })?;
-            if let Some(op) = table.get("op").and_then(toml::Value::as_str) {
+            if let Some(op) = table.get("op").and_then(Value::as_str) {
                 if op != "set" {
                     return Err(LoaderError::Invalid {
                         location: format!("profile {}.override.{path}", profile.id),
@@ -216,7 +214,7 @@ impl OverrideCatalog {
             }
             let reason = table
                 .get("reason")
-                .and_then(toml::Value::as_str)
+                .and_then(Value::as_str)
                 .filter(|reason| !reason.trim().is_empty())
                 .ok_or_else(|| LoaderError::Invalid {
                     location: format!("profile {}.override.{path}", profile.id),

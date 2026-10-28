@@ -3,76 +3,111 @@
 //! The backend owns configuration loading and the provider execution boundary.
 //! Clients only exchange the versioned model protocol over a Unix socket.
 
-use crate::args::{BackendCommand, BackendInitial, CliOptions};
-use crate::config::{self, LoadedConfig};
-use crate::error::CliError;
-use crate::identity_broker;
-use dev_env_core::{
-    MaterializationDiagnostic, MaterializationMetadata, MaterializationService, Materializer,
-    RuntimeContext,
+use {
+    crate::{
+        BackendCommand, BackendInitial, BackendSupport, BackendTransport, CliError, CliOptions,
+        ConfigApi, ConnectionRequestError, IdentityBroker, TrustApi, CONNECTION_TIMEOUT,
+        ENDPOINT_DISPLAY, MAX_ACTIVE_CONNECTIONS, MAX_ACTIVE_REQUESTS,
+    },
+    dev_env_core::{
+        MaterializationDiagnostic, MaterializationMetadata, MaterializationService, Materializer,
+        RuntimeContext,
+    },
+    dev_env_model::{
+        BackendError, BackendProtocolError, BackendRequest, BackendRequestMessage, BackendResponse,
+        BackendResponseMessage, BackendState, BackendStatus, ConfigSnapshot, Generation, HelloInfo,
+        IdentityPeer, IdentityRequest, MaterializationKeyBuilder, PreparedResponse,
+        ProviderDiagnosticSummary, ReceiptSummary, RequestContext, RequestMode, TrustTarget,
+    },
+    dev_env_shell::{build_invocation, CommandLine, ConfiguredShellAdapter, ShellInvocation},
+    fs2::FileExt,
+    libc::{geteuid, gid_t, kill, pid_t, setgid, setgroups, setpgid, setuid, SIGKILL, SIGTERM},
+    std::{
+        collections::BTreeMap,
+        env,
+        io::{self, Error as IoError},
+        os::unix::net::UnixStream,
+        path::{Path, PathBuf},
+        process::{id, ExitStatus},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex, RwLock,
+        },
+        thread,
+        time::{Duration, Instant},
+    },
 };
-use dev_env_model::{
-    read_backend_request, read_backend_response, write_backend_request, write_backend_response,
-    BackendError, BackendRequest, BackendRequestMessage, BackendResponse, BackendResponseMessage,
-    BackendState, BackendStatus, ConfigSnapshot, Generation, HelloInfo, IdentityRequest,
-    PreparedResponse, ProviderDiagnosticSummary, ReceiptSummary,
-    ShellInvocation as BackendShellInvocation, TrustTarget,
+
+#[cfg(test)]
+use {
+    crate::BACKEND_ABSTRACT_ENDPOINT,
+    dev_env_model::DEVENV_BACKEND_PROTOCOL_VERSION,
+    libc::sa_family_t,
+    std::{io::Read, mem::size_of, slice::from_raw_parts},
 };
-use dev_env_shell::{build_invocation, CommandLine, ConfiguredShellAdapter, ShellInvocation};
-use fs2::FileExt;
-use std::collections::BTreeMap;
-use std::env;
-use std::ffi::{CStr, CString};
-use std::fs::{self, File};
-use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
-use std::time::Duration;
 
-const BACKEND_RUNTIME_DIRECTORY: &str = "/run/dev-env";
-const BACKEND_LOCK_NAME: &[u8] = b"backend.lock\0";
-const BACKEND_ABSTRACT_ENDPOINT: &[u8] = b"\0dev-env.backend.v4";
-const ENDPOINT_DISPLAY: &str = "@dev-env.backend.v4";
-const MAX_ACTIVE_CONNECTIONS: usize = 32;
-const MAX_ACTIVE_REQUESTS: usize = 16;
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+pub struct BackendApi;
 
-pub fn dispatch(command: BackendCommand, options: CliOptions) -> Result<i32, CliError> {
+impl BackendApi {
+    pub fn dispatch(command: BackendCommand, options: CliOptions) -> Result<i32, CliError> {
+        dispatch_inner(command, options)
+    }
+
+    pub fn prepare(context: RequestContext) -> Result<PreparedResponse, CliError> {
+        BackendSupport::prepare_inner(context)
+    }
+
+    pub fn request_backend(message: BackendRequest) -> Result<BackendResponseMessage, CliError> {
+        BackendSupport::request_backend_inner(message)
+    }
+}
+
+struct BackendRuntime {
+    snapshot: RwLock<Arc<ConfigSnapshot>>,
+    options: CliOptions,
+    allowed_peer_uid: u32,
+    materialization: RwLock<Arc<MaterializationService>>,
+    state: Mutex<BackendState>,
+    active_connections: AtomicUsize,
+    active_requests: AtomicUsize,
+    stopping: AtomicBool,
+    initial_pid: Mutex<Option<u32>>,
+    initial_exit_code: Mutex<Option<i32>>,
+    failure: Mutex<Option<String>>,
+}
+
+fn dispatch_inner(command: BackendCommand, options: CliOptions) -> Result<i32, CliError> {
     match command {
         BackendCommand::Run { initial } => run(initial, options),
         BackendCommand::Status { json: _ } => {
-            let response = request(BackendRequest::Status)?;
-            print_response(response)?;
+            let response = BackendSupport::request(BackendRequest::Status)?;
+            BackendSupport::print_response(response)?;
             Ok(0)
         }
         BackendCommand::Reload { wait } => {
-            let response = request(BackendRequest::Reload { wait })?;
-            print_response(response)?;
+            let response = BackendSupport::request(BackendRequest::Reload { wait })?;
+            BackendSupport::print_response(response)?;
             Ok(0)
         }
         BackendCommand::Stop => {
-            let response = request(BackendRequest::Stop)?;
-            print_response(response)?;
+            let response = BackendSupport::request(BackendRequest::Stop)?;
+            BackendSupport::print_response(response)?;
             Ok(0)
         }
     }
 }
 
 fn run(initial: BackendInitial, options: CliOptions) -> Result<i32, CliError> {
-    let allowed_peer_uid = configured_allowed_peer_uid()?;
-    let lock = backend_lock()?;
+    let allowed_peer_uid = BackendSupport::configured_allowed_peer_uid()?;
+    let lock = BackendSupport::backend_lock()?;
     if let Err(source) = lock.try_lock_exclusive() {
         if source.kind() != io::ErrorKind::WouldBlock {
             return Err(CliError::Backend(format!(
                 "could not acquire backend instance lock: {source}"
             )));
         }
-        if let Ok(response) = request(BackendRequest::Status) {
-            print_response(response)?;
+        if let Ok(response) = BackendSupport::request(BackendRequest::Status) {
+            BackendSupport::print_response(response)?;
             return Ok(0);
         }
         return Err(CliError::Backend(format!(
@@ -83,8 +118,8 @@ fn run(initial: BackendInitial, options: CliOptions) -> Result<i32, CliError> {
     // The lock is held before reading any profile.  A second invocation never
     // reloads configuration or races the active backend; a stale lock is
     // released by the operating system when the previous owner exits.
-    let loaded = config::load(&options)?;
-    let snapshot = make_snapshot(&loaded, Generation::INITIAL)?;
+    let loaded = ConfigApi::load(&options)?;
+    let snapshot = BackendSupport::make_snapshot(&loaded, Generation::INITIAL)?;
 
     let listener = BackendTransport::bind().map_err(|source| {
         CliError::Backend(format!(
@@ -115,11 +150,11 @@ fn run(initial: BackendInitial, options: CliOptions) -> Result<i32, CliError> {
         initial_exit_code: Mutex::new(None),
         failure: Mutex::new(None),
     });
-    install_signal_handlers();
+    BackendSupport::install_signal_handlers();
     let runtime_for_initial = Arc::clone(&runtime);
     thread::spawn(move || run_initial(runtime_for_initial, initial));
 
-    while !runtime.stopping.load(Ordering::Acquire) && !signal_requested() {
+    while !runtime.stopping.load(Ordering::Acquire) && !BackendSupport::signal_requested() {
         match listener.accept() {
             Ok((stream, _)) => {
                 let active = runtime.active_connections.fetch_add(1, Ordering::AcqRel);
@@ -165,190 +200,6 @@ fn run(initial: BackendInitial, options: CliOptions) -> Result<i32, CliError> {
     Ok(exit_code)
 }
 
-struct BackendRuntime {
-    snapshot: RwLock<Arc<ConfigSnapshot>>,
-    options: CliOptions,
-    allowed_peer_uid: u32,
-    materialization: RwLock<Arc<MaterializationService>>,
-    state: Mutex<BackendState>,
-    active_connections: AtomicUsize,
-    active_requests: AtomicUsize,
-    stopping: AtomicBool,
-    initial_pid: Mutex<Option<u32>>,
-    initial_exit_code: Mutex<Option<i32>>,
-    failure: Mutex<Option<String>>,
-}
-
-struct BackendTransport;
-
-impl BackendTransport {
-    fn sockaddr_for(endpoint: &[u8]) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        let path_capacity = std::mem::size_of_val(&address.sun_path);
-        if endpoint.first() != Some(&0)
-            || endpoint.len() > path_capacity
-            || endpoint[1..].contains(&0)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "abstract backend endpoint has invalid Linux sockaddr_un encoding",
-            ));
-        }
-        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                endpoint.as_ptr().cast::<libc::c_char>(),
-                address.sun_path.as_mut_ptr(),
-                endpoint.len(),
-            );
-        }
-        let address_length =
-            (std::mem::size_of::<libc::sa_family_t>() + endpoint.len()) as libc::socklen_t;
-        Ok((address, address_length))
-    }
-
-    fn bind() -> io::Result<UnixListener> {
-        Self::bind_endpoint(BACKEND_ABSTRACT_ENDPOINT)
-    }
-
-    fn bind_endpoint(endpoint: &[u8]) -> io::Result<UnixListener> {
-        let (address, address_length) = Self::sockaddr_for(endpoint)?;
-        let descriptor =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let bound = unsafe {
-            libc::bind(
-                descriptor,
-                (&address as *const libc::sockaddr_un).cast(),
-                address_length,
-            )
-        };
-        if bound != 0 {
-            let source = io::Error::last_os_error();
-            unsafe { libc::close(descriptor) };
-            return Err(source);
-        }
-        if unsafe { libc::listen(descriptor, MAX_ACTIVE_CONNECTIONS as libc::c_int) } != 0 {
-            let source = io::Error::last_os_error();
-            unsafe { libc::close(descriptor) };
-            return Err(source);
-        }
-        Ok(unsafe { UnixListener::from_raw_fd(descriptor) })
-    }
-
-    fn connect() -> io::Result<UnixStream> {
-        Self::connect_endpoint(BACKEND_ABSTRACT_ENDPOINT)
-    }
-
-    fn connect_endpoint(endpoint: &[u8]) -> io::Result<UnixStream> {
-        let (address, address_length) = Self::sockaddr_for(endpoint)?;
-        let descriptor =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let connected = unsafe {
-            libc::connect(
-                descriptor,
-                (&address as *const libc::sockaddr_un).cast(),
-                address_length,
-            )
-        };
-        if connected != 0 {
-            let source = io::Error::last_os_error();
-            unsafe { libc::close(descriptor) };
-            return Err(source);
-        }
-        Ok(unsafe { UnixStream::from_raw_fd(descriptor) })
-    }
-}
-
-fn backend_lock() -> Result<File, CliError> {
-    fs::create_dir_all(BACKEND_RUNTIME_DIRECTORY).map_err(|source| {
-        CliError::Backend(format!(
-            "could not initialize root-managed backend runtime directory: {source}"
-        ))
-    })?;
-    let directory_path = CString::new(BACKEND_RUNTIME_DIRECTORY)
-        .expect("backend runtime directory has no embedded NUL");
-    let directory_descriptor = unsafe {
-        libc::open(
-            directory_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if directory_descriptor < 0 {
-        return Err(CliError::Backend(format!(
-            "could not open trusted backend runtime directory: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    let directory = unsafe { File::from_raw_fd(directory_descriptor) };
-    if unsafe { libc::fchown(directory.as_raw_fd(), 0, 0) } != 0
-        || unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0
-    {
-        return Err(CliError::Backend(format!(
-            "could not secure backend runtime directory: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    let lock_name = CStr::from_bytes_with_nul(BACKEND_LOCK_NAME)
-        .expect("backend lock name must be NUL terminated");
-    let lock_descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            lock_name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0o600,
-        )
-    };
-    if lock_descriptor < 0 {
-        return Err(CliError::Backend(format!(
-            "could not open trusted backend instance lock: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    let lock = unsafe { File::from_raw_fd(lock_descriptor) };
-    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(lock.as_raw_fd(), &mut metadata) } != 0 {
-        return Err(CliError::Backend(format!(
-            "could not inspect backend instance lock: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
-        || metadata.st_uid != 0
-        || metadata.st_nlink != 1
-    {
-        return Err(CliError::Backend(
-            "backend instance lock must be a root-owned regular file with one link".to_owned(),
-        ));
-    }
-    if unsafe { libc::fchmod(lock.as_raw_fd(), 0o600) } != 0 {
-        return Err(CliError::Backend(format!(
-            "could not secure backend instance lock: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    Ok(lock)
-}
-
-fn configured_allowed_peer_uid() -> Result<u32, CliError> {
-    match env::var_os("CONTAINER_INIT_HANDOFF_UID") {
-        Some(value) => value
-            .to_str()
-            .and_then(|value| value.parse::<u32>().ok())
-            .ok_or_else(|| {
-                CliError::Backend(
-                    "CONTAINER_INIT_HANDOFF_UID must be an unsigned integer".to_owned(),
-                )
-            }),
-        None => Ok(unsafe { libc::geteuid() }),
-    }
-}
-
 impl BackendRuntime {
     fn current_snapshot(&self) -> Arc<ConfigSnapshot> {
         Arc::clone(
@@ -368,11 +219,12 @@ impl BackendRuntime {
         self.stopping.store(true, Ordering::Release);
     }
 
-    fn record_initial_exit(&self, status: std::process::ExitStatus) {
+    fn record_initial_exit(&self, status: ExitStatus) {
         *self
             .initial_exit_code
             .lock()
-            .expect("initial exit code lock poisoned") = Some(exit_status_code(status));
+            .expect("initial exit code lock poisoned") =
+            Some(BackendSupport::exit_status_code(status));
     }
 
     fn stop_initial_runtime(&self) {
@@ -386,10 +238,10 @@ impl BackendRuntime {
         };
         #[cfg(unix)]
         unsafe {
-            let group = -(pid as libc::pid_t);
-            let _ = libc::kill(group, libc::SIGTERM);
+            let group = -(pid as pid_t);
+            let _ = kill(group, SIGTERM);
             thread::sleep(Duration::from_millis(50));
-            let _ = libc::kill(group, libc::SIGKILL);
+            let _ = kill(group, SIGKILL);
         }
     }
 
@@ -403,151 +255,89 @@ impl BackendRuntime {
         let snapshot = self.current_snapshot();
         BackendResponseMessage::new(
             request_id,
-            BackendResponse::Error(BackendError {
-                error_version: dev_env_model::DEVENV_BACKEND_ERROR_VERSION,
-                class: class.to_owned(),
-                retryable,
-                message: message.into(),
-                generation: Some(snapshot.generation),
-                provider_id: None,
-                operation: None,
-                request_id: Some(request_id.to_owned()),
-            }),
+            BackendResponse::Error(
+                BackendError::new(class, retryable, message)
+                    .with_generation(snapshot.generation())
+                    .with_request_id(request_id),
+            ),
         )
     }
 }
 
 fn serve_connection(runtime: Arc<BackendRuntime>, mut stream: UnixStream) {
-    let (request, peer) = match read_authenticated_request(&mut stream, runtime.allowed_peer_uid) {
-        Ok(request) => request,
-        Err(ConnectionRequestError::Unauthorized(peer)) => {
-            record_rejected_peer(peer.uid);
-            let response = runtime.error(
-                "peer-authentication",
-                "BACKEND-PEER-REJECTED",
-                format!(
-                    "peer uid {} is not allowed; configured peer uid is {}",
-                    peer.uid, runtime.allowed_peer_uid
-                ),
-                false,
-            );
-            let _ = write_backend_response(&mut stream, &response);
-            return;
-        }
-        Err(ConnectionRequestError::PeerCredentials(_source)) => return,
-        Err(ConnectionRequestError::Protocol(
-            dev_env_model::BackendProtocolError::UnsupportedVersion(version),
-        )) => {
-            let response = protocol_mismatch_response(version);
-            let _ = write_backend_response(&mut stream, &response);
-            return;
-        }
-        Err(ConnectionRequestError::Protocol(_source)) => return,
-    };
+    let (request, peer) =
+        match BackendSupport::read_authenticated_request(&mut stream, runtime.allowed_peer_uid) {
+            Ok(request) => request,
+            Err(ConnectionRequestError::Unauthorized(peer)) => {
+                BackendSupport::record_rejected_peer(peer.uid);
+                let response = runtime.error(
+                    "peer-authentication",
+                    "BACKEND-PEER-REJECTED",
+                    format!(
+                        "peer uid {} is not allowed; configured peer uid is {}",
+                        peer.uid, runtime.allowed_peer_uid
+                    ),
+                    false,
+                );
+                let _ = response.write_to(&mut stream);
+                return;
+            }
+            Err(ConnectionRequestError::PeerCredentials(_source)) => return,
+            Err(ConnectionRequestError::Protocol(BackendProtocolError::UnsupportedVersion(
+                version,
+            ))) => {
+                let response = BackendSupport::protocol_mismatch_response(version);
+                let _ = response.write_to(&mut stream);
+                return;
+            }
+            Err(ConnectionRequestError::Protocol(_source)) => return,
+        };
     if runtime.active_requests.fetch_add(1, Ordering::AcqRel) >= MAX_ACTIVE_REQUESTS {
         runtime.active_requests.fetch_sub(1, Ordering::AcqRel);
         let response = runtime.error(
-            &request.request_id,
+            request.request_id(),
             "busy",
             "backend request limit reached",
             true,
         );
-        let _ = write_backend_response(&mut stream, &response);
+        let _ = response.write_to(&mut stream);
         return;
     }
     let response = handle_request(&runtime, &request, peer);
     runtime.active_requests.fetch_sub(1, Ordering::AcqRel);
-    let _ = write_backend_response(&mut stream, &response);
-}
-
-enum ConnectionRequestError {
-    PeerCredentials(io::Error),
-    Unauthorized(dev_env_model::IdentityPeer),
-    Protocol(dev_env_model::BackendProtocolError),
-}
-
-fn read_authenticated_request(
-    stream: &mut UnixStream,
-    allowed_peer_uid: u32,
-) -> Result<(BackendRequestMessage, dev_env_model::IdentityPeer), ConnectionRequestError> {
-    let peer = peer_credentials(stream).map_err(ConnectionRequestError::PeerCredentials)?;
-    let request = read_request_for_peer(stream, peer, allowed_peer_uid)?;
-    Ok((request, peer))
-}
-
-fn read_request_for_peer(
-    reader: &mut impl Read,
-    peer: dev_env_model::IdentityPeer,
-    allowed_peer_uid: u32,
-) -> Result<BackendRequestMessage, ConnectionRequestError> {
-    if !peer_is_authorized(peer, allowed_peer_uid) {
-        return Err(ConnectionRequestError::Unauthorized(peer));
-    }
-    read_backend_request(reader).map_err(ConnectionRequestError::Protocol)
-}
-
-fn peer_is_authorized(peer: dev_env_model::IdentityPeer, allowed_peer_uid: u32) -> bool {
-    peer.uid == 0 || peer.uid == allowed_peer_uid
-}
-
-fn protocol_mismatch_response(version: u16) -> BackendResponseMessage {
-    BackendResponseMessage::new(
-        "protocol-mismatch",
-        BackendResponse::Error(BackendError {
-            error_version: dev_env_model::DEVENV_BACKEND_ERROR_VERSION,
-            class: "BACKEND-PROTOCOL-MISMATCH".to_owned(),
-            retryable: false,
-            message: format!(
-                "received dev-env backend protocol v{version}; this backend requires v{}",
-                dev_env_model::DEVENV_BACKEND_PROTOCOL_VERSION
-            ),
-            generation: None,
-            provider_id: None,
-            operation: None,
-            request_id: None,
-        }),
-    )
-}
-
-static REJECTED_PEER_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-
-fn record_rejected_peer(uid: u32) {
-    let count = REJECTED_PEER_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count % 100 == 0 {
-        eprintln!("BACKEND-PEER-REJECTED: rejected peer uid {uid} ({count} rejected connections)");
-    }
+    let _ = response.write_to(&mut stream);
 }
 
 fn handle_request(
     runtime: &Arc<BackendRuntime>,
     request: &BackendRequestMessage,
-    peer: dev_env_model::IdentityPeer,
+    peer: IdentityPeer,
 ) -> BackendResponseMessage {
     let snapshot = runtime.current_snapshot();
-    match &request.request {
+    match &request.request() {
         BackendRequest::Hello => BackendResponseMessage::new(
-            &request.request_id,
+            request.request_id(),
             BackendResponse::Hello(HelloInfo {
                 state: *runtime.state.lock().expect("backend state lock poisoned"),
-                generation: snapshot.generation,
-                config_fingerprint: snapshot.config_fingerprint,
-                runtime_inputs: snapshot.runtime_inputs.keys().cloned().collect(),
+                generation: snapshot.generation(),
+                config_fingerprint: snapshot.config_fingerprint(),
+                runtime_inputs: snapshot.runtime_inputs().keys().cloned().collect(),
                 environment_names: snapshot
-                    .resolved_config
-                    .environment
-                    .variables
+                    .resolved_config()
+                    .environment()
+                    .variables()
                     .keys()
                     .cloned()
                     .collect(),
             }),
         ),
         BackendRequest::Status => BackendResponseMessage::new(
-            &request.request_id,
+            request.request_id().to_owned(),
             BackendResponse::Status(BackendStatus {
                 state: *runtime.state.lock().expect("backend state lock poisoned"),
-                generation: snapshot.generation,
-                config_fingerprint: snapshot.config_fingerprint,
-                backend_pid: std::process::id(),
+                generation: snapshot.generation(),
+                config_fingerprint: snapshot.config_fingerprint(),
+                backend_pid: id(),
                 active_requests: runtime
                     .active_requests
                     .load(Ordering::Acquire)
@@ -555,30 +345,34 @@ fn handle_request(
             }),
         ),
         BackendRequest::Plan => BackendResponseMessage::new(
-            &request.request_id,
-            BackendResponse::Plan(plan_value(&snapshot)),
+            request.request_id().to_owned(),
+            BackendResponse::Plan(BackendSupport::plan_value(&snapshot)),
         ),
         BackendRequest::Explain { path } => BackendResponseMessage::new(
-            &request.request_id,
-            BackendResponse::Explain(explain_value(&snapshot, path.as_deref())),
+            request.request_id().to_owned(),
+            BackendResponse::Explain(BackendSupport::explain_value(&snapshot, path.as_deref())),
         ),
         BackendRequest::Doctor => BackendResponseMessage::new(
-            &request.request_id,
-            BackendResponse::Doctor(doctor_value(&snapshot, peer.uid, runtime.allowed_peer_uid)),
+            request.request_id().to_owned(),
+            BackendResponse::Doctor(BackendSupport::doctor_value(
+                &snapshot,
+                peer.uid,
+                runtime.allowed_peer_uid,
+            )),
         ),
         BackendRequest::Prepare { context } => {
             handle_prepare(runtime, request, context, peer, false)
         }
         BackendRequest::Trust { target } if peer.uid == 0 => handle_trust(runtime, request, target),
         BackendRequest::Trust { .. } => runtime.error(
-            &request.request_id,
+            request.request_id(),
             "unauthorized",
             "trust updates require a root backend owner",
             false,
         ),
         BackendRequest::Reload { .. } if peer.uid == 0 => handle_reload(runtime, request),
         BackendRequest::Reload { .. } => runtime.error(
-            &request.request_id,
+            request.request_id(),
             "unauthorized",
             "reload requires a root backend owner",
             false,
@@ -586,10 +380,10 @@ fn handle_request(
         BackendRequest::Stop if peer.uid == 0 => {
             *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Stopping;
             runtime.stopping.store(true, Ordering::Release);
-            BackendResponseMessage::new(&request.request_id, BackendResponse::Stopped)
+            BackendResponseMessage::new(request.request_id().to_owned(), BackendResponse::Stopped)
         }
         BackendRequest::Stop => runtime.error(
-            &request.request_id,
+            request.request_id(),
             "unauthorized",
             "stop requires a root backend owner",
             false,
@@ -600,71 +394,71 @@ fn handle_request(
 fn handle_prepare(
     runtime: &Arc<BackendRuntime>,
     request: &BackendRequestMessage,
-    context: &dev_env_model::RequestContext,
-    peer: dev_env_model::IdentityPeer,
+    context: &RequestContext,
+    peer: IdentityPeer,
     allow_starting: bool,
 ) -> BackendResponseMessage {
     let state = *runtime.state.lock().expect("backend state lock poisoned");
     if state != BackendState::Ready && !(allow_starting && state == BackendState::Starting) {
         return runtime.error(
-            &request.request_id,
+            request.request_id(),
             "backend_busy",
             "backend is not ready for Prepare",
             true,
         );
     }
     let snapshot = runtime.current_snapshot();
-    let cwd = normalize_path(&context.cwd);
-    if !cwd.starts_with(&snapshot.workspace_root) {
+    let cwd = BackendSupport::normalize_path(context.cwd());
+    if !cwd.starts_with(snapshot.workspace_root()) {
         return runtime.error(
-            &request.request_id,
+            request.request_id(),
             "invalid_input",
             "request cwd is outside the snapshot workspace",
             false,
         );
     }
     if context
-        .typed_runtime_inputs
+        .typed_runtime_inputs()
         .keys()
-        .any(|name| !snapshot.runtime_inputs.contains_key(name))
+        .any(|name| !snapshot.runtime_inputs().contains_key(name))
     {
         return runtime.error(
-            &request.request_id,
+            request.request_id(),
             "invalid_input",
             "unknown runtime input",
             false,
         );
     }
-    let requested_identity = requested_identity(context, peer);
+    let requested_identity = BackendSupport::requested_identity(context, peer);
     if !matches!(requested_identity, IdentityRequest::Peer) && peer.uid != 0 {
         return runtime.error(
-            &request.request_id,
+            request.request_id(),
             "unauthorized",
             "non-root clients may only request their peer identity",
             false,
         );
     }
-    let shell = if context.shell == "default" {
-        snapshot.resolved_config.shell.default.clone()
+    let shell = if context.shell() == "default" {
+        snapshot.resolved_config().shell().default().to_owned()
     } else {
-        context.shell.clone()
+        context.shell().to_owned()
     };
-    let process_environment = if snapshot.resolved_config.environment.inherit_process {
-        context.filtered_ambient_environment.clone()
+    let process_environment = if snapshot.resolved_config().environment().inherit_process() {
+        context.filtered_ambient_environment().clone()
     } else {
         BTreeMap::new()
     };
-    let identity = match identity_broker::resolve(
+    let identity = match IdentityBroker::resolve(
         &requested_identity,
         peer,
         &cwd,
-        context.typed_runtime_inputs.clone(),
+        context.typed_runtime_inputs().clone(),
         process_environment.clone(),
     ) {
         Ok(identity) => identity,
         Err(error) => {
             return runtime.error(
-                &request.request_id,
+                request.request_id(),
                 "identity_broker",
                 error.to_string(),
                 true,
@@ -672,41 +466,52 @@ fn handle_prepare(
         }
     };
     let runtime_context = RuntimeContext::new(
-        snapshot.workspace_root.clone(),
+        snapshot.workspace_root().clone(),
         cwd.clone(),
         shell.clone(),
         process_environment.clone(),
     )
-    .with_user_id(identity.uid)
-    .with_workspace_config_present(snapshot.workspace_root.join(".dev-env.toml").is_file());
-    let detect_fingerprints = provider_detect_fingerprints(&snapshot, &runtime_context);
-    let key = match dev_env_model::MaterializationKey::new(
-        snapshot.generation,
-        snapshot.config_fingerprint,
-        snapshot.workspace_root.clone(),
+    .with_user_id(identity.uid())
+    .with_workspace_config_present(snapshot.workspace_root().join(".dev-env.toml").is_file());
+    let detect_fingerprints =
+        BackendSupport::provider_detect_fingerprints(&snapshot, &runtime_context);
+    let key = match MaterializationKeyBuilder::new(
+        snapshot.generation(),
+        snapshot.workspace_root().clone(),
         cwd.clone(),
         shell.clone(),
         identity.clone(),
-        context.typed_runtime_inputs.clone(),
-        process_environment.clone(),
-        detect_fingerprints,
-    ) {
+    )
+    .with_config_fingerprint(snapshot.config_fingerprint())
+    .with_runtime_inputs(context.typed_runtime_inputs().clone())
+    .with_ambient_environment(process_environment.clone())
+    .with_provider_detect_fingerprints(detect_fingerprints)
+    .build()
+    {
         Ok(key) => key,
         Err(error) => {
             return runtime.error(
-                &request.request_id,
+                request.request_id(),
                 "materialization",
                 error.to_string(),
                 false,
             )
         }
     };
-    let Some(shell_config) = snapshot.shells.get(&shell) else {
-        return runtime.error(&request.request_id, "invalid_input", "unknown shell", false);
+    let Some(shell_config) = snapshot.shells().get(&shell) else {
+        return runtime.error(
+            request.request_id(),
+            "invalid_input",
+            "unknown shell",
+            false,
+        );
     };
-    let shell_invocation = build_shell_invocation(context, &shell, shell_config);
-    let metadata =
-        MaterializationMetadata::new(&request.request_id, snapshot.generation, identity.clone());
+    let shell_invocation = BackendSupport::build_shell_invocation(context, &shell, shell_config);
+    let metadata = MaterializationMetadata::new(
+        request.request_id(),
+        snapshot.generation(),
+        identity.clone(),
+    );
     let materialization = {
         let service = Arc::clone(
             &runtime
@@ -718,7 +523,7 @@ fn handle_prepare(
             Ok(result) => result,
             Err(error) => {
                 return runtime.error(
-                    &request.request_id,
+                    request.request_id(),
                     "materialization",
                     error.to_string(),
                     false,
@@ -750,21 +555,21 @@ fn handle_prepare(
         .collect::<Vec<_>>();
     let receipt_summary = ReceiptSummary {
         succeeded: true,
-        action_count: materialization.environment().provider_receipts.len(),
+        action_count: materialization.environment().provider_receipts().len(),
         warning_count: diagnostics.len(),
     };
     BackendResponseMessage::new(
-        &request.request_id,
+        request.request_id(),
         BackendResponse::Prepared(Box::new(PreparedResponse {
-            generation: snapshot.generation,
-            config_fingerprint: snapshot.config_fingerprint,
+            generation: snapshot.generation(),
+            config_fingerprint: snapshot.config_fingerprint(),
             cwd,
             shell_invocation,
             materialized_environment: materialization.environment().clone(),
-            supplemental_groups: identity.supplementary_groups.clone(),
+            supplemental_groups: identity.supplementary_groups().clone(),
             identity,
             diagnostics,
-            cache_hit: materialization.cache_hit,
+            cache_hit: materialization.cache_hit(),
             receipt_summary,
         })),
     )
@@ -775,42 +580,40 @@ fn handle_reload(
     request: &BackendRequestMessage,
 ) -> BackendResponseMessage {
     *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Reloading;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while runtime.active_requests.load(Ordering::Acquire) > 1
-        && std::time::Instant::now() < deadline
-    {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while runtime.active_requests.load(Ordering::Acquire) > 1 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
     if runtime.active_requests.load(Ordering::Acquire) > 1 {
         *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Ready;
         return runtime.error(
-            &request.request_id,
+            request.request_id(),
             "reload_busy",
             "backend requests did not finish before reload deadline",
             true,
         );
     }
     let current = runtime.current_snapshot();
-    let result = config::load(&runtime.options).and_then(|loaded| {
-        make_snapshot(
+    let result = ConfigApi::load(&runtime.options).and_then(|loaded| {
+        BackendSupport::make_snapshot(
             &loaded,
             current
-                .generation
+                .generation()
                 .next()
-                .map_err(|error| crate::error::CliError::Backend(error.to_string()))?,
+                .map_err(|error| CliError::Backend(error.to_string()))?,
         )
     });
     match result {
         Ok(next) => {
-            let generation = next.generation;
-            let fingerprint = next.config_fingerprint;
-            let materializer = match Materializer::try_new(next.resolved_config.clone()) {
+            let generation = next.generation();
+            let fingerprint = next.config_fingerprint();
+            let materializer = match Materializer::try_new(next.resolved_config().clone()) {
                 Ok(materializer) => MaterializationService::new(materializer),
                 Err(error) => {
                     *runtime.state.lock().expect("backend state lock poisoned") =
                         BackendState::Ready;
                     return runtime.error(
-                        &request.request_id,
+                        request.request_id(),
                         "reload_failed",
                         error.to_string(),
                         false,
@@ -827,7 +630,7 @@ fn handle_reload(
                 .expect("materialization service lock poisoned") = Arc::new(materializer);
             *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Ready;
             BackendResponseMessage::new(
-                &request.request_id,
+                request.request_id(),
                 BackendResponse::Reloaded {
                     generation,
                     config_fingerprint: fingerprint,
@@ -837,7 +640,7 @@ fn handle_reload(
         Err(error) => {
             *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Ready;
             runtime.error(
-                &request.request_id,
+                request.request_id(),
                 "reload_failed",
                 error.to_string(),
                 false,
@@ -853,16 +656,16 @@ fn handle_trust(
 ) -> BackendResponseMessage {
     let target = match target {
         TrustTarget::Path { path } => path.clone(),
-        TrustTarget::Sha256 { digest } => PathBuf::from(hex(digest)),
+        TrustTarget::Sha256 { digest } => PathBuf::from(BackendSupport::hex(digest)),
     };
-    match crate::trust::trust(&target) {
+    match TrustApi::trust(&target) {
         Ok(_) => BackendResponseMessage::new(
-            &request.request_id,
+            request.request_id(),
             BackendResponse::Trusted {
-                generation: runtime.current_snapshot().generation,
+                generation: runtime.current_snapshot().generation(),
             },
         ),
-        Err(error) => runtime.error(&request.request_id, "trust", error.to_string(), false),
+        Err(error) => runtime.error(request.request_id(), "trust", error.to_string(), false),
     }
 }
 
@@ -880,20 +683,20 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
     } else {
         env::var("CONTAINER_INIT_HANDOFF_USER").unwrap_or_else(|_| "dev".to_owned())
     };
-    let context = dev_env_model::RequestContext::new(
+    let context = RequestContext::new(
         request_id,
-        dev_env_model::RequestMode::Shell,
-        snapshot.workspace_root.clone(),
-        snapshot.resolved_config.shell.default.clone(),
+        RequestMode::Shell,
+        snapshot.workspace_root().clone(),
+        snapshot.resolved_config().shell().default().to_owned(),
     )
     .with_identity(IdentityRequest::User { name: initial_user })
     .with_runtime_inputs(
         snapshot
-            .runtime_inputs
+            .runtime_inputs()
             .keys()
             .filter_map(|name| env::var(name).ok().map(|value| (name.clone(), value))),
     )
-    .with_ambient_environment(config::ambient_environment());
+    .with_ambient_environment(ConfigApi::ambient_environment());
     let response = handle_prepare(
         &runtime,
         &BackendRequestMessage::new(
@@ -903,15 +706,16 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
             },
         ),
         &context,
-        peer_credentials_from_current_thread(),
+        BackendSupport::peer_credentials_from_current_thread(),
         true,
     );
-    let prepared = match response.response {
-        BackendResponse::Prepared(prepared) => *prepared,
+    let prepared = match response.response() {
+        BackendResponse::Prepared(prepared) => prepared.as_ref().clone(),
         BackendResponse::Error(error) => {
             runtime.fail(format!(
                 "initial runtime preparation failed: {}: {}",
-                error.class, error.message
+                error.class(),
+                error.message()
             ));
             return;
         }
@@ -924,8 +728,8 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
     };
     let command: Result<CommandLine, ()> = match initial {
         BackendInitial::Shell => {
-            let shell = snapshot.resolved_config.shell.default.clone();
-            let Some(config) = snapshot.shells.get(&shell) else {
+            let shell = snapshot.resolved_config().shell().default().to_owned();
+            let Some(config) = snapshot.shells().get(&shell) else {
                 runtime.fail("initial shell is not configured".to_owned());
                 return;
             };
@@ -953,9 +757,9 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         return;
     };
     command
-        .env("HOME", &prepared.identity.home)
-        .env("USER", &prepared.identity.user)
-        .env("LOGNAME", &prepared.identity.user);
+        .env("HOME", prepared.identity.home())
+        .env("USER", prepared.identity.user())
+        .env("LOGNAME", prepared.identity.user());
     command.current_dir(&prepared.cwd);
     #[cfg(unix)]
     {
@@ -964,19 +768,19 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
         let groups = prepared.supplemental_groups.clone();
         unsafe {
             command.pre_exec(move || {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                if setpgid(0, 0) == -1 {
+                    return Err(IoError::last_os_error());
                 }
-                if identity.uid != 0 && libc::geteuid() == 0 {
+                if identity.uid() != 0 && geteuid() == 0 {
                     let groups = groups
                         .iter()
-                        .map(|group| *group as libc::gid_t)
+                        .map(|group| *group as gid_t)
                         .collect::<Vec<_>>();
-                    if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
-                        return Err(std::io::Error::last_os_error());
+                    if setgroups(groups.len(), groups.as_ptr()) != 0 {
+                        return Err(IoError::last_os_error());
                     }
-                    if libc::setgid(identity.gid) != 0 || libc::setuid(identity.uid) != 0 {
-                        return Err(std::io::Error::last_os_error());
+                    if setgid(identity.gid()) != 0 || setuid(identity.uid()) != 0 {
+                        return Err(IoError::last_os_error());
                     }
                 }
                 Ok(())
@@ -1013,470 +817,92 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
     runtime.stopping.store(true, Ordering::Release);
 }
 
-fn exit_status_code(status: std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            128 + status.signal().unwrap_or(libc::SIGTERM)
-        }
-        #[cfg(not(unix))]
-        {
-            1
-        }
-    })
+#[cfg(test)]
+struct ReadCounter {
+    reads: usize,
 }
 
-fn make_snapshot(
-    loaded: &LoadedConfig,
-    generation: Generation,
-) -> Result<ConfigSnapshot, CliError> {
-    ConfigSnapshot::from_resolved_config(
-        generation,
-        loaded
-            .profile_chain()
-            .iter()
-            .map(|profile| profile.id.clone())
-            .collect(),
-        loaded.config().clone(),
-        loaded.config().provenance.clone(),
-        [0; 32],
-    )
-    .map_err(|error| CliError::Backend(error.to_string()))
-}
-
-pub(crate) fn prepare(
-    context: dev_env_model::RequestContext,
-) -> Result<PreparedResponse, CliError> {
-    let response = request(BackendRequest::Prepare { context })?;
-    match response.response {
-        BackendResponse::Prepared(prepared) => {
-            if !prepared.cwd.is_absolute()
-                || !prepared.shell_invocation.executable.is_absolute()
-                || prepared
-                    .shell_invocation
-                    .args
-                    .iter()
-                    .any(|arg| arg.contains('\0'))
-            {
-                return Err(CliError::Backend(
-                    "backend returned an invalid prepared invocation".to_owned(),
-                ));
-            }
-            prepared
-                .materialized_environment
-                .validate()
-                .map_err(|error| CliError::Backend(error.to_string()))?;
-            Ok(*prepared)
-        }
-        BackendResponse::Error(error) => Err(CliError::Backend(format!(
-            "{}: {}",
-            error.class, error.message
-        ))),
-        other => Err(CliError::Backend(format!(
-            "backend returned unexpected response: {other:?}"
-        ))),
-    }
-}
-
-pub(crate) fn request_backend(message: BackendRequest) -> Result<BackendResponseMessage, CliError> {
-    request(message)
-}
-
-fn request(request: BackendRequest) -> Result<BackendResponseMessage, CliError> {
-    let mut stream = BackendTransport::connect().map_err(|source| {
-        CliError::BackendUnavailable(format!(
-            "BACKEND-TRANSPORT-UNAVAILABLE: cannot connect to {ENDPOINT_DISPLAY}: {source}"
-        ))
-    })?;
-    let request_id = format!(
-        "cli-{}-{}",
-        std::process::id(),
-        REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
-    let request = match request {
-        BackendRequest::Prepare { mut context } => {
-            context.request_id = request_id.clone();
-            BackendRequest::Prepare { context }
-        }
-        request => request,
-    };
-    let message = BackendRequestMessage::new(request_id, request);
-    write_backend_request(&mut stream, &message)
-        .map_err(|error| CliError::Backend(error.to_string()))?;
-    read_backend_response(&mut stream).map_err(|error| match error {
-        dev_env_model::BackendProtocolError::UnsupportedVersion(version) => CliError::Backend(
-            format!(
-                "BACKEND-PROTOCOL-MISMATCH: backend response uses protocol v{version}; expected v{}",
-                dev_env_model::DEVENV_BACKEND_PROTOCOL_VERSION
-            ),
-        ),
-        error => CliError::Backend(error.to_string()),
-    })
-}
-
-static REQUEST_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
-
-fn print_response(response: BackendResponseMessage) -> Result<(), CliError> {
-    if let BackendResponse::Error(error) = &response.response {
-        return Err(CliError::Backend(format!(
-            "{}: {}",
-            error.class, error.message
-        )));
-    }
-    let output = serde_json::to_string(&response.response)
-        .map_err(|error| CliError::Backend(error.to_string()))?;
-    crate::output::write_stdout(&format!("{output}\n"))
-        .map_err(|error| CliError::Backend(error.to_string()))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut output = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                output.push(component.as_os_str())
-            }
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                output.pop();
-            }
-            std::path::Component::Normal(value) => output.push(value),
-        }
-    }
-    output
-}
-
-fn plan_value(snapshot: &ConfigSnapshot) -> serde_json::Value {
-    serde_json::json!({
-        "generation": snapshot.generation,
-        "config_fingerprint": hex(&snapshot.config_fingerprint),
-        "profile_chain": snapshot.profile_chain,
-        "workspace_root": snapshot.workspace_root,
-        "provider_order": snapshot.provider_order,
-    })
-}
-
-fn explain_value(snapshot: &ConfigSnapshot, path: Option<&str>) -> serde_json::Value {
-    serde_json::json!({
-        "generation": snapshot.generation,
-        "config_fingerprint": hex(&snapshot.config_fingerprint),
-        "profile_chain": snapshot.profile_chain,
-        "path": path,
-        "provenance": snapshot.source_provenance,
-    })
-}
-
-fn doctor_value(
-    snapshot: &ConfigSnapshot,
-    peer_uid: u32,
-    allowed_peer_uid: u32,
-) -> serde_json::Value {
-    let workspace_ok = snapshot.workspace_root.is_dir();
-    let shells = snapshot
-        .shells
-        .iter()
-        .map(|(id, shell)| (id.clone(), Path::new(&shell.command).is_file()))
-        .collect::<BTreeMap<_, _>>();
-    let providers = snapshot
-        .resolved_config
-        .providers
-        .iter()
-        .map(|(id, provider)| {
-            let available = if provider.executable.starts_with('/') {
-                Path::new(&provider.executable).is_file()
-            } else {
-                true
-            };
-            (id.clone(), available)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let provider_failures = snapshot
-        .resolved_config
-        .providers
-        .iter()
-        .filter(|(_id, provider)| {
-            provider.detect_files.is_empty()
-                && provider.missing == dev_env_model::MissingProviderPolicy::Error
-                && !providers.get(*_id).copied().unwrap_or(true)
-        })
-        .count();
-    serde_json::json!({
-        "ok": workspace_ok && shells.values().all(|ok| *ok) && provider_failures == 0,
-        "backend_transport": {
-            "endpoint": ENDPOINT_DISPLAY,
-            "protocol": dev_env_model::DEVENV_BACKEND_PROTOCOL_VERSION,
-            "connected": true,
-            "peer_uid": peer_uid,
-            "allowed_peer_uid": allowed_peer_uid,
-            "peer_authorized": true,
-        },
-        "workspace": { "path": snapshot.workspace_root, "is_directory": workspace_ok },
-        "shells": shells,
-        "providers": providers,
-    })
-}
-
-fn requested_identity(
-    context: &dev_env_model::RequestContext,
-    peer: dev_env_model::IdentityPeer,
-) -> IdentityRequest {
-    match &context.requested_identity {
-        IdentityRequest::User { name } => IdentityRequest::User { name: name.clone() },
-        IdentityRequest::Root => IdentityRequest::Root,
-        IdentityRequest::Peer if peer.uid == 0 => IdentityRequest::Root,
-        IdentityRequest::Peer => IdentityRequest::Peer,
-    }
-}
-
-fn provider_detect_fingerprints(
-    snapshot: &ConfigSnapshot,
-    context: &RuntimeContext,
-) -> BTreeMap<String, [u8; 32]> {
-    snapshot
-        .provider_order
-        .iter()
-        .map(|provider_id| {
-            let fingerprint = snapshot
-                .resolved_config
-                .providers
-                .get(provider_id)
-                .and_then(|config| {
-                    dev_env_provider::detect(
-                        config,
-                        &context.workspace,
-                        &context.process_environment,
-                        &dev_env_provider::SystemExecutableLocator,
-                    )
-                    .ok()
-                })
-                .and_then(|detection| {
-                    dev_env_provider::workspace_fingerprint(
-                        &context.workspace,
-                        &detection.matched_files,
-                    )
-                    .ok()
-                })
-                .unwrap_or([0; 32]);
-            (provider_id.clone(), fingerprint)
-        })
-        .collect()
-}
-
-fn build_shell_invocation(
-    context: &dev_env_model::RequestContext,
-    shell_id: &str,
-    config: &dev_env_model::ShellConfig,
-) -> BackendShellInvocation {
-    let adapter = ConfiguredShellAdapter::new(shell_id);
-    let invocation = if matches!(context.mode, dev_env_model::RequestMode::LoginShell) {
-        ShellInvocation::login(context.shell_args.iter().cloned().map(Into::into))
-    } else {
-        ShellInvocation::interactive(context.shell_args.iter().cloned().map(Into::into))
-    };
-    let command = build_invocation(&adapter, config, &invocation);
-    match command {
-        Ok(command) => {
-            let (executable, args) = command.into_parts();
-            BackendShellInvocation {
-                executable,
-                args: args
-                    .into_iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect(),
-            }
-        }
-        Err(_) => BackendShellInvocation {
-            executable: PathBuf::from(&config.command),
-            args: context.shell_args.clone(),
-        },
-    }
-}
-
-fn hex(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[cfg(unix)]
-fn peer_credentials_from_current_thread() -> dev_env_model::IdentityPeer {
-    // 初始 runtime 由 backend 自身启动，不经过客户端连接授权。
-    dev_env_model::IdentityPeer {
-        pid: std::process::id(),
-        uid: unsafe { libc::geteuid() },
-        gid: unsafe { libc::getegid() },
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_credentials(stream: &UnixStream) -> io::Result<dev_env_model::IdentityPeer> {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if length as usize != std::mem::size_of::<libc::ucred>() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SO_PEERCRED returned an invalid credential size",
-        ));
-    }
-    Ok(dev_env_model::IdentityPeer {
-        pid: credentials.pid as u32,
-        uid: credentials.uid,
-        gid: credentials.gid,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_credentials(_stream: &UnixStream) -> io::Result<dev_env_model::IdentityPeer> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "dev-env backend peer authorization requires Linux SO_PEERCRED",
-    ))
-}
-
-#[cfg(not(unix))]
-fn peer_credentials_from_current_thread() -> dev_env_model::IdentityPeer {
-    dev_env_model::IdentityPeer {
-        pid: std::process::id(),
-        uid: 0,
-        gid: 0,
-    }
-}
-
-#[cfg(unix)]
-static SIGNAL_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(unix)]
-extern "C" fn signal_handler(_: libc::c_int) {
-    SIGNAL_REQUESTED.store(true, Ordering::Release);
-}
-
-fn install_signal_handlers() {
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            signal_handler as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGINT,
-            signal_handler as *const () as libc::sighandler_t,
-        );
-    }
-}
-
-fn signal_requested() -> bool {
-    #[cfg(unix)]
-    {
-        SIGNAL_REQUESTED.load(Ordering::Acquire)
-    }
-    #[cfg(not(unix))]
-    {
-        false
+#[cfg(test)]
+impl Read for ReadCounter {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.reads += 1;
+        buffer[0] = b'!';
+        Ok(1)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        peer_credentials, peer_is_authorized, protocol_mismatch_response, read_request_for_peer,
-        BackendTransport, ConnectionRequestError, BACKEND_ABSTRACT_ENDPOINT,
+#[test]
+fn abstract_endpoint_has_linux_abstract_namespace_encoding() {
+    let (address, length) = BackendTransport::sockaddr_for(BACKEND_ABSTRACT_ENDPOINT).unwrap();
+    let encoded = unsafe {
+        from_raw_parts(
+            address.sun_path.as_ptr().cast::<u8>(),
+            BACKEND_ABSTRACT_ENDPOINT.len(),
+        )
     };
-    use dev_env_model::{BackendResponse, IdentityPeer, DEVENV_BACKEND_PROTOCOL_VERSION};
-    use std::io::{self, Read};
+    assert_eq!(encoded, BACKEND_ABSTRACT_ENDPOINT);
+    assert_eq!(
+        length as usize,
+        size_of::<sa_family_t>() + BACKEND_ABSTRACT_ENDPOINT.len()
+    );
+    assert_eq!(DEVENV_BACKEND_PROTOCOL_VERSION, 4);
+}
 
-    struct ReadCounter {
-        reads: usize,
-    }
+#[cfg(test)]
+#[test]
+fn abstract_transport_connects_without_a_filesystem_socket() {
+    let endpoint = format!("\0dev-env-test-{}", id());
+    let listener = BackendTransport::bind_endpoint(endpoint.as_bytes()).unwrap();
+    let client = BackendTransport::connect_endpoint(endpoint.as_bytes()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    assert!(listener.local_addr().unwrap().as_pathname().is_none());
+    assert_eq!(
+        BackendSupport::peer_credentials(&server).unwrap().uid,
+        unsafe { geteuid() }
+    );
+    drop(client);
+}
 
-    impl Read for ReadCounter {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            self.reads += 1;
-            buffer[0] = b'!';
-            Ok(1)
-        }
-    }
+#[cfg(test)]
+#[test]
+fn uid_policy_does_not_depend_on_group_membership() {
+    let peer = IdentityPeer {
+        pid: 12,
+        uid: 1000,
+        gid: 4242,
+    };
+    assert!(BackendSupport::peer_is_authorized(peer, 1000));
+    assert!(!BackendSupport::peer_is_authorized(peer, 1001));
+    assert!(BackendSupport::peer_is_authorized(
+        IdentityPeer { uid: 0, ..peer },
+        1001
+    ));
+}
 
-    #[test]
-    fn abstract_endpoint_has_linux_abstract_namespace_encoding() {
-        let (address, length) = BackendTransport::sockaddr_for(BACKEND_ABSTRACT_ENDPOINT).unwrap();
-        let encoded = unsafe {
-            std::slice::from_raw_parts(
-                address.sun_path.as_ptr().cast::<u8>(),
-                BACKEND_ABSTRACT_ENDPOINT.len(),
-            )
-        };
-        assert_eq!(encoded, BACKEND_ABSTRACT_ENDPOINT);
-        assert_eq!(
-            length as usize,
-            std::mem::size_of::<libc::sa_family_t>() + BACKEND_ABSTRACT_ENDPOINT.len()
-        );
-        assert_eq!(DEVENV_BACKEND_PROTOCOL_VERSION, 4);
-    }
+#[cfg(test)]
+#[test]
+fn unauthorized_peer_is_rejected_before_frame_read() {
+    let peer = IdentityPeer {
+        pid: 12,
+        uid: 1000,
+        gid: 4242,
+    };
+    let mut reader = ReadCounter { reads: 0 };
+    let result = BackendSupport::read_request_for_peer(&mut reader, peer, 1001);
+    assert!(matches!(result, Err(ConnectionRequestError::Unauthorized(found)) if found == peer));
+    assert_eq!(reader.reads, 0);
+}
 
-    #[test]
-    fn abstract_transport_connects_without_a_filesystem_socket() {
-        let endpoint = format!("\0dev-env-test-{}", std::process::id());
-        let listener = BackendTransport::bind_endpoint(endpoint.as_bytes()).unwrap();
-        let client = BackendTransport::connect_endpoint(endpoint.as_bytes()).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        assert!(listener.local_addr().unwrap().as_pathname().is_none());
-        assert_eq!(peer_credentials(&server).unwrap().uid, unsafe {
-            libc::geteuid()
-        });
-        drop(client);
-    }
-
-    #[test]
-    fn uid_policy_does_not_depend_on_group_membership() {
-        let peer = IdentityPeer {
-            pid: 12,
-            uid: 1000,
-            gid: 4242,
-        };
-        assert!(peer_is_authorized(peer, 1000));
-        assert!(!peer_is_authorized(peer, 1001));
-        assert!(peer_is_authorized(IdentityPeer { uid: 0, ..peer }, 1001));
-    }
-
-    #[test]
-    fn unauthorized_peer_is_rejected_before_frame_read() {
-        let peer = IdentityPeer {
-            pid: 12,
-            uid: 1000,
-            gid: 4242,
-        };
-        let mut reader = ReadCounter { reads: 0 };
-        let result = read_request_for_peer(&mut reader, peer, 1001);
-        assert!(
-            matches!(result, Err(ConnectionRequestError::Unauthorized(found)) if found == peer)
-        );
-        assert_eq!(reader.reads, 0);
-    }
-
-    #[test]
-    fn legacy_protocol_version_gets_a_typed_mismatch() {
-        let response = protocol_mismatch_response(3);
-        assert_eq!(response.protocol, DEVENV_BACKEND_PROTOCOL_VERSION);
-        assert!(matches!(
-            response.response,
-            BackendResponse::Error(error)
-                if error.class == "BACKEND-PROTOCOL-MISMATCH"
-                    && error.message.contains("protocol v3")
-        ));
-    }
+#[cfg(test)]
+#[test]
+fn legacy_protocol_version_gets_a_typed_mismatch() {
+    let response = BackendSupport::protocol_mismatch_response(3);
+    assert_eq!(response.protocol(), DEVENV_BACKEND_PROTOCOL_VERSION);
+    assert!(matches!(
+        response.response(),
+        BackendResponse::Error(error)
+            if error.class() == "BACKEND-PROTOCOL-MISMATCH"
+                && error.message().contains("protocol v3")
+    ));
 }

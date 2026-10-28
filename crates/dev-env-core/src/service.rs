@@ -1,23 +1,38 @@
-use crate::{CoreError, Materialization, MaterializationMetadata, Materializer, RuntimeContext};
-use dev_env_model::MaterializationKey;
-use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use crate::{
+    CoreError, Materialization, MaterializationDiagnostic, MaterializationMetadata, Materializer,
+    RuntimeContext,
+};
+use dev_env_model::{MaterializationKey, MaterializedEnv, Sensitivity};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
 
 /// The result returned by the backend-owned materialization service.
 #[derive(Clone, Debug)]
 pub struct MaterializationServiceResult {
-    pub materialization: Arc<Materialization>,
-    pub cache_hit: bool,
+    materialization: Arc<Materialization>,
+    cache_hit: bool,
 }
 
 impl MaterializationServiceResult {
-    pub fn environment(&self) -> &dev_env_model::MaterializedEnv {
+    pub fn materialization(&self) -> &Materialization {
+        &self.materialization
+    }
+
+    pub fn environment(&self) -> &MaterializedEnv {
         self.materialization.environment()
     }
 
-    pub fn diagnostics(&self) -> &[crate::MaterializationDiagnostic] {
+    pub fn diagnostics(&self) -> &[MaterializationDiagnostic] {
         self.materialization.diagnostics()
+    }
+
+    pub fn cache_hit(&self) -> bool {
+        self.cache_hit
     }
 }
 
@@ -31,8 +46,8 @@ pub enum MaterializationServiceError {
     SharedFailure(String),
 }
 
-impl std::fmt::Display for MaterializationServiceError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for MaterializationServiceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Core(source) => source.fmt(formatter),
             Self::SharedFailure(message) => formatter.write_str(message),
@@ -40,8 +55,8 @@ impl std::fmt::Display for MaterializationServiceError {
     }
 }
 
-impl std::error::Error for MaterializationServiceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for MaterializationServiceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Core(source) => Some(source),
             Self::SharedFailure(_) => None,
@@ -261,9 +276,9 @@ impl MaterializationService {
 fn sensitive_bytes(materialization: &Materialization) -> usize {
     materialization
         .environment()
-        .values
+        .values()
         .iter()
-        .filter(|(_, value)| value.sensitivity != dev_env_model::Sensitivity::Public)
-        .map(|(name, value)| name.len().saturating_add(value.value.len()))
+        .filter(|(_, value)| value.sensitivity() != Sensitivity::Public)
+        .map(|(name, value)| name.len().saturating_add(value.value().len()))
         .sum()
 }

@@ -1,11 +1,12 @@
-use crate::error::LoaderError;
-use crate::merge::MergedBootstrap;
-use crate::raw::{parse_profile, validate_profile_id};
-use crate::source::{LoadedBootstrap, LoadedProfile, ProfileSource};
+use crate::{
+    error::LoaderError,
+    merge::MergedBootstrap,
+    raw::RawProfileParser,
+    source::{LoadedBootstrap, LoadedProfile, ProfileSource},
+};
 use container_init_bootstrap_model::SourceKind;
 use profile_graph::{traverse_with_max_depth, ProfileGraphError, TraverseError};
-use std::fs;
-use std::path::Path;
+use std::{collections::BTreeMap, fs, path::Path};
 
 const MAX_PROFILE_COLLECTION_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PROFILE_INHERITANCE_DEPTH: usize = 64;
@@ -14,7 +15,7 @@ const MAX_PROFILE_INHERITANCE_DEPTH: usize = 64;
 /// overlay profiles.
 #[derive(Clone, Debug, Default)]
 pub struct ProfileLoader {
-    profiles: std::collections::BTreeMap<String, ProfileSource>,
+    profiles: BTreeMap<String, ProfileSource>,
 }
 
 /// Short name for callers that think in terms of the binary rather than the
@@ -28,12 +29,12 @@ impl ProfileLoader {
 
     /// Add a profile, indexing it by the id declared in its document.
     pub fn add_profile(&mut self, profile: ProfileSource) -> Result<(), LoaderError> {
-        if profile.contents.len() > 8 * 1024 * 1024 {
+        if profile.contents().len() > 8 * 1024 * 1024 {
             return Err(LoaderError::Invalid {
                 location: profile
-                    .location
-                    .clone()
-                    .unwrap_or_else(|| format!("profile {}", profile.id)),
+                    .location()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("profile {}", profile.id())),
                 message: "profile file exceeds the 8388608 byte limit".to_owned(),
             });
         }
@@ -41,14 +42,14 @@ impl ProfileLoader {
             .profiles
             .values()
             .try_fold(0_usize, |total, entry| {
-                total.checked_add(entry.contents.len())
+                total.checked_add(entry.contents().len())
             })
             .ok_or_else(|| LoaderError::Invalid {
                 location: "profiles".to_owned(),
                 message: "profile collection byte count overflowed".to_owned(),
             })?;
         let collection_bytes = existing_bytes
-            .checked_add(profile.contents.len())
+            .checked_add(profile.contents().len())
             .ok_or_else(|| LoaderError::Invalid {
                 location: "profiles".to_owned(),
                 message: "profile collection byte count overflowed".to_owned(),
@@ -61,34 +62,35 @@ impl ProfileLoader {
                 ),
             });
         }
-        validate_profile_id(&profile.id)?;
-        let parsed = parse_profile(
-            &profile.contents,
+        RawProfileParser::validate_profile_id(profile.id())?;
+        let parsed = RawProfileParser::parse_profile(
+            profile.contents(),
             profile
-                .location
-                .clone()
-                .unwrap_or_else(|| format!("profile {}", profile.id)),
+                .location()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("profile {}", profile.id())),
         )?;
-        if parsed.id != profile.id {
+        if parsed.id != profile.id() {
             return Err(LoaderError::Invalid {
                 location: profile
-                    .location
-                    .clone()
-                    .unwrap_or_else(|| format!("profile {}", profile.id)),
+                    .location()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("profile {}", profile.id())),
                 message: format!(
                     "profile source id {:?} does not match document id {:?}",
-                    profile.id, parsed.id
+                    profile.id(),
+                    parsed.id
                 ),
             });
         }
-        if let Some(previous) = self.profiles.get(&profile.id) {
+        if let Some(previous) = self.profiles.get(profile.id()) {
             return Err(LoaderError::DuplicateProfile {
-                id: profile.id,
-                first: previous.location.clone(),
-                second: profile.location,
+                id: profile.id().to_owned(),
+                first: previous.location().map(str::to_owned),
+                second: profile.location().map(str::to_owned),
             });
         }
-        self.profiles.insert(profile.id.clone(), profile);
+        self.profiles.insert(profile.id().to_owned(), profile);
         Ok(())
     }
 
@@ -153,20 +155,21 @@ impl ProfileLoader {
                     return Ok(None);
                 };
                 let location = profile
-                    .location
-                    .clone()
+                    .location()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| format!("profile {id}"));
-                let raw = parse_profile(&profile.contents, location.clone())?;
-                if raw.id != profile.id {
+                let raw = RawProfileParser::parse_profile(profile.contents(), location.clone())?;
+                if raw.id != profile.id() {
                     return Err(LoaderError::Invalid {
                         location,
                         message: format!(
                             "profile source id {:?} does not match document id {:?}",
-                            profile.id, raw.id
+                            profile.id(),
+                            raw.id
                         ),
                     });
                 }
-                validate_profile_id(&raw.id)?;
+                RawProfileParser::validate_profile_id(&raw.id)?;
                 let parents = raw.extends.clone();
                 Ok(Some((raw, parents)))
             },
@@ -174,8 +177,8 @@ impl ProfileLoader {
                 let profile = profiles.get(id).expect("traversed profile was loaded");
                 let profile_info = LoadedProfile {
                     id: raw.id.clone(),
-                    source: profile.source.clone(),
-                    location: profile.location.clone(),
+                    source: profile.source().clone(),
+                    location: profile.location().map(str::to_owned),
                 };
                 merged.merge_profile(&raw, profile, &profile_info)?;
                 chain.push(profile_info);
@@ -184,10 +187,7 @@ impl ProfileLoader {
         )
         .map_err(map_graph_error)?;
         let config = merged.finish()?;
-        Ok(LoadedBootstrap {
-            config,
-            profile_chain: chain,
-        })
+        Ok(LoadedBootstrap::new(config, chain))
     }
 }
 

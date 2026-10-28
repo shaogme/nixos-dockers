@@ -17,15 +17,15 @@ use std::{
 };
 
 #[derive(Debug)]
-pub enum InstanceClaim {
-    Acquired(InstanceLock),
-    Occupied,
-}
-
-#[derive(Debug)]
 pub struct InstanceLock {
     path: PathBuf,
     file: File,
+}
+
+#[derive(Debug)]
+pub enum InstanceClaim {
+    Acquired(InstanceLock),
+    Occupied,
 }
 
 impl InstanceLock {

@@ -2,8 +2,12 @@ use dev_env_loader::{CliPatch, LoaderError, ProfileLoader, ProfileSource, Source
 use dev_env_model::{
     InputError, ModelError, OverrideOperation, OverrideSpec, Sensitivity, SourceId, ValueTree,
 };
-use std::collections::BTreeMap;
-use std::error::Error;
+use std::{
+    collections::BTreeMap,
+    env,
+    error::Error,
+    fs::{create_dir, remove_dir, remove_file, write},
+};
 
 const BASE: &str = r#"
 schema = 1
@@ -69,12 +73,8 @@ fn base_loader() -> ProfileLoader {
 }
 
 fn set_override(value: &str) -> OverrideSpec {
-    OverrideSpec {
-        op: OverrideOperation::Set,
-        value: Some(ValueTree::String(value.to_owned())),
-        values: Vec::new(),
-        reason: "repository policy".to_owned(),
-    }
+    OverrideSpec::new(OverrideOperation::Set, "repository policy")
+        .with_value(ValueTree::String(value.to_owned()))
 }
 
 fn map_value<'a>(value: &'a ValueTree, key: &str) -> &'a ValueTree {
@@ -107,9 +107,9 @@ auto_init = "never"
 
     let loaded = loader.load("derived").unwrap();
     let config = loaded.config();
-    assert_eq!(config.workspace.root, "/workspace");
-    assert_eq!(config.environment.variables["DERIVED_VALUE"], "derived");
-    assert_eq!(map_value(&config.features, "base"), &ValueTree::Bool(true));
+    assert_eq!(config.workspace().root(), "/workspace");
+    assert_eq!(config.environment().variables()["DERIVED_VALUE"], "derived");
+    assert_eq!(map_value(config.features(), "base"), &ValueTree::Bool(true));
     assert_eq!(
         loaded
             .profile_chain()
@@ -120,12 +120,12 @@ auto_init = "never"
     );
 
     let provenance = config
-        .provenance
+        .provenance()
         .get("environment.variables.DERIVED_VALUE")
         .unwrap();
     assert_eq!(
-        provenance.origins[0].source,
-        SourceId::Profile("derived".to_owned())
+        provenance.origins[0].source(),
+        &SourceId::Profile("derived".to_owned())
     );
 }
 
@@ -164,8 +164,8 @@ runtime = "/usr/bin/dev-env"
         .unwrap();
 
     let loaded = loader.load("shared").unwrap();
-    assert_eq!(loaded.config().workspace.root, "/workspace");
-    assert_eq!(loaded.config().shell.default, "bash");
+    assert_eq!(loaded.config().workspace().root(), "/workspace");
+    assert_eq!(loaded.config().shell().default(), "bash");
 }
 
 #[test]
@@ -213,16 +213,16 @@ OVERRIDE_ME = "ignored because override owns this path"
         .unwrap();
     let loaded = loader.load("override").unwrap();
     assert_eq!(
-        loaded.config().environment.variables["OVERRIDE_ME"],
+        loaded.config().environment().variables()["OVERRIDE_ME"],
         "from-override"
     );
     let entry = loaded
         .config()
-        .provenance
+        .provenance()
         .get("environment.variables.OVERRIDE_ME")
         .unwrap();
     assert_eq!(
-        entry.origins.last().unwrap().reason.as_deref(),
+        entry.origins.last().unwrap().reason(),
         Some("repository policy")
     );
 }
@@ -270,7 +270,7 @@ prepend = ["/not-used"]
         .unwrap();
     let loaded = loader.load("list-override").unwrap();
     assert_eq!(
-        loaded.config().environment.path.prepend,
+        loaded.config().environment().path().prepend(),
         ["/opt/base", "/opt/child", "/opt/base"]
     );
 }
@@ -336,7 +336,7 @@ OVERRIDE_ME = "ignored"
     );
     let loaded = loader.load_with_overlays("base", [&allowed]).unwrap();
     assert_eq!(
-        loaded.config().environment.variables["OVERRIDE_ME"],
+        loaded.config().environment().variables()["OVERRIDE_ME"],
         "from-workspace"
     );
 
@@ -370,7 +370,7 @@ fn runtime_inputs_are_typed_and_aliases_are_generic() {
         )
         .unwrap();
     assert_eq!(
-        map_value(map_value(&loaded.config().features, "devbox"), "auto_init"),
+        map_value(map_value(loaded.config().features(), "devbox"), "auto_init"),
         &ValueTree::String("if-missing".to_owned())
     );
 
@@ -460,19 +460,19 @@ runtime = true
         )
         .unwrap();
     assert_eq!(
-        loaded.config().environment.conditional_variables["CARGO_INCREMENTAL"].value,
+        loaded.config().environment().conditional_variables()["CARGO_INCREMENTAL"].value(),
         "1"
     );
     assert_eq!(
-        loaded.config().environment.variables["CARGO_TARGET_DIR"],
+        loaded.config().environment().variables()["CARGO_TARGET_DIR"],
         "/tmp/rust-target"
     );
     assert_eq!(
-        loaded.config().environment.variables["SCCACHE_DIR"],
+        loaded.config().environment().variables()["SCCACHE_DIR"],
         "/tmp/sccache"
     );
     assert_eq!(
-        map_value(map_value(&loaded.config().features, "sccache"), "disabled"),
+        map_value(map_value(loaded.config().features(), "sccache"), "disabled"),
         &ValueTree::Bool(true)
     );
 }
@@ -502,9 +502,12 @@ reason = "workspace policy"
             [patch],
         )
         .unwrap();
-    assert_eq!(loaded.config().environment.variables["OVERRIDE_ME"], "cli");
     assert_eq!(
-        map_value(map_value(&loaded.config().features, "devbox"), "auto_init"),
+        loaded.config().environment().variables()["OVERRIDE_ME"],
+        "cli"
+    );
+    assert_eq!(
+        map_value(map_value(loaded.config().features(), "devbox"), "auto_init"),
         &ValueTree::String("if-missing".to_owned())
     );
 }
@@ -514,7 +517,10 @@ fn cli_patches_are_checked_against_policy() {
     let loader = base_loader();
     let patch = CliPatch::new("environment.variables.OVERRIDE_ME", set_override("cli"));
     let loaded = loader.load_with_cli("base", [patch]).unwrap();
-    assert_eq!(loaded.config().environment.variables["OVERRIDE_ME"], "cli");
+    assert_eq!(
+        loaded.config().environment().variables()["OVERRIDE_ME"],
+        "cli"
+    );
 
     let patch = CliPatch::new("environment.variables.BASE_VALUE", set_override("cli"));
     // Both names match the base policy in this fixture, so changing the patch
@@ -534,7 +540,7 @@ fn malformed_toml_keeps_the_parser_error_as_the_source() {
 
 #[test]
 fn directory_loader_uses_declared_ids() {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = env::temp_dir().join(format!(
         "dev-env-loader-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -542,16 +548,16 @@ fn directory_loader_uses_declared_ids() {
             .unwrap()
             .as_nanos()
     ));
-    std::fs::create_dir(&directory).unwrap();
-    std::fs::write(directory.join("arbitrary.toml"), BASE).unwrap();
-    std::fs::write(directory.join("ignored.txt"), "not toml").unwrap();
+    create_dir(&directory).unwrap();
+    write(directory.join("arbitrary.toml"), BASE).unwrap();
+    write(directory.join("ignored.txt"), "not toml").unwrap();
 
     let loader = ProfileLoader::from_directory(&directory).unwrap();
     assert_eq!(loader.profile_ids().collect::<Vec<_>>(), ["base"]);
     assert!(loader.load("base").is_ok());
-    std::fs::remove_file(directory.join("arbitrary.toml")).unwrap();
-    std::fs::remove_file(directory.join("ignored.txt")).unwrap();
-    std::fs::remove_dir(&directory).unwrap();
+    remove_file(directory.join("arbitrary.toml")).unwrap();
+    remove_file(directory.join("ignored.txt")).unwrap();
+    remove_dir(&directory).unwrap();
 }
 
 #[test]
@@ -614,13 +620,13 @@ mode = "unset"
         )
         .unwrap();
     assert_eq!(
-        map_value(map_value(&loaded.config().features, "secret"), "mode"),
+        map_value(map_value(loaded.config().features(), "secret"), "mode"),
         &ValueTree::String("value".to_owned())
     );
     assert_eq!(
         loaded
             .config()
-            .provenance
+            .provenance()
             .get("features.secret.mode")
             .unwrap()
             .sensitivity,

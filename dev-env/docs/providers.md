@@ -238,4 +238,4 @@ request : {"protocol":1,"op":"detect|prepare|shellenv","context":...,"config":..
 response: {"ok":true,"env":...,"diagnostics":...,"receipt":...}
 ```
 
-协议会校验版本、shell 和 argv，并提供错误分类。但当前默认 `ProviderRunner` 只使用 `ProcessExecutor` 运行 `ProviderConfig.executable`；它不会根据 provider id 自动查找 `dev-env-provider-<id>`。如果接入外部 provider，需要在上层实现 `ProviderRuntime` 适配，而不是假设只添加一个可执行文件就会被 CLI 使用。
+协议会校验版本、shell 和 argv，并提供错误分类。但当前默认 `ProviderRunner` 只使用 `ProcessExecutor` 运行 `ProviderConfig.executable`；它不会根据 provider id 自动查找 `dev-env-provider-<id>`。如果接入外部 provider，需要在上层实现 `ProviderSupervisor` 适配，而不是假设只添加一个可执行文件就会被 CLI 使用。

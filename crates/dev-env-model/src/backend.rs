@@ -1,10 +1,18 @@
-use crate::identity::EffectiveIdentity;
-use crate::materialized::MaterializedEnv;
-use crate::request::{RequestContext, RequestValidationError};
-use crate::snapshot::Generation;
+use crate::{
+    identity::EffectiveIdentity,
+    materialized::MaterializedEnv,
+    request::{RequestContext, RequestValidationError},
+    snapshot::Generation,
+};
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use serde_json::{from_slice, to_vec, Error as JsonError, Value};
+use std::{
+    error::Error as StdError,
+    fmt::{Display, Formatter, Result as FmtResult},
+    io::{self, Read, Write},
+    path::PathBuf,
+};
+use unix_frame::{read_payload_frame, write_payload_frame, FrameError};
 
 /// The dev-env backend protocol is deliberately independent from the
 /// container-init protocol number.
@@ -12,6 +20,17 @@ pub const DEVENV_BACKEND_PROTOCOL_VERSION: u16 = 4;
 pub const BACKEND_PROTOCOL_VERSION: u16 = DEVENV_BACKEND_PROTOCOL_VERSION;
 pub const DEVENV_BACKEND_ERROR_VERSION: u16 = 2;
 pub const MAX_BACKEND_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+pub enum BackendProtocolError {
+    Json(JsonError),
+    Io(io::Error),
+    UnsupportedVersion(u16),
+    UnsupportedErrorVersion(u16),
+    InvalidRequest(String),
+    InvalidContext { source: RequestValidationError },
+    FrameTooLarge(usize),
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,14 +43,11 @@ pub enum BackendState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BackendRequestMessage {
-    pub protocol: u16,
-    pub request_id: String,
-    pub request: BackendRequest,
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TrustTarget {
+    Path { path: PathBuf },
+    Sha256 { digest: [u8; 32] },
 }
-
-pub type BackendRequestEnvelope = BackendRequestMessage;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -58,33 +74,13 @@ pub enum BackendRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct BackendResponseMessage {
-    pub protocol: u16,
-    pub request_id: String,
-    pub response: BackendResponse,
+pub struct BackendRequestMessage {
+    protocol: u16,
+    request_id: String,
+    request: BackendRequest,
 }
 
-pub type BackendResponseEnvelope = BackendResponseMessage;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum BackendResponse {
-    Hello(HelloInfo),
-    Prepared(Box<PreparedResponse>),
-    Status(BackendStatus),
-    Plan(serde_json::Value),
-    Explain(serde_json::Value),
-    Doctor(serde_json::Value),
-    Trusted {
-        generation: Generation,
-    },
-    Reloaded {
-        generation: Generation,
-        config_fingerprint: [u8; 32],
-    },
-    Stopped,
-    Error(BackendError),
-}
+pub type BackendRequestEnvelope = BackendRequestMessage;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -97,29 +93,6 @@ pub struct HelloInfo {
     #[serde(default)]
     pub environment_names: Vec<String>,
 }
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedResponse {
-    pub generation: Generation,
-    pub config_fingerprint: [u8; 32],
-    pub cwd: PathBuf,
-    pub shell_invocation: ShellInvocation,
-    pub materialized_environment: MaterializedEnv,
-    /// Identity resolved by the container-init broker for this request.
-    /// Clients normally already run as this peer; the backend uses these
-    /// fields for the initial service handoff and auditability.
-    #[serde(default = "EffectiveIdentity::root")]
-    pub identity: EffectiveIdentity,
-    #[serde(default)]
-    pub supplemental_groups: Vec<u32>,
-    #[serde(default)]
-    pub diagnostics: Vec<ProviderDiagnosticSummary>,
-    pub cache_hit: bool,
-    pub receipt_summary: ReceiptSummary,
-}
-
-pub type PrepareResponse = PreparedResponse;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -165,26 +138,72 @@ pub struct BackendStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendError {
-    pub error_version: u16,
-    pub class: String,
-    pub retryable: bool,
-    pub message: String,
+    error_version: u16,
+    class: String,
+    retryable: bool,
+    message: String,
     #[serde(default)]
-    pub generation: Option<Generation>,
+    generation: Option<Generation>,
     #[serde(default)]
-    pub provider_id: Option<String>,
+    provider_id: Option<String>,
     #[serde(default)]
-    pub operation: Option<String>,
+    operation: Option<String>,
     #[serde(default)]
-    pub request_id: Option<String>,
+    request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum TrustTarget {
-    Path { path: PathBuf },
-    Sha256 { digest: [u8; 32] },
+#[serde(deny_unknown_fields)]
+pub struct PreparedResponse {
+    pub generation: Generation,
+    pub config_fingerprint: [u8; 32],
+    pub cwd: PathBuf,
+    pub shell_invocation: ShellInvocation,
+    pub materialized_environment: MaterializedEnv,
+    /// Identity resolved by the container-init broker for this request.
+    /// Clients normally already run as this peer; the backend uses these
+    /// fields for the initial service handoff and auditability.
+    #[serde(default = "EffectiveIdentity::root")]
+    pub identity: EffectiveIdentity,
+    #[serde(default)]
+    pub supplemental_groups: Vec<u32>,
+    #[serde(default)]
+    pub diagnostics: Vec<ProviderDiagnosticSummary>,
+    pub cache_hit: bool,
+    pub receipt_summary: ReceiptSummary,
 }
+
+pub type PrepareResponse = PreparedResponse;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BackendResponse {
+    Hello(HelloInfo),
+    Prepared(Box<PreparedResponse>),
+    Status(BackendStatus),
+    Plan(Value),
+    Explain(Value),
+    Doctor(Value),
+    Trusted {
+        generation: Generation,
+    },
+    Reloaded {
+        generation: Generation,
+        config_fingerprint: [u8; 32],
+    },
+    Stopped,
+    Error(BackendError),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendResponseMessage {
+    protocol: u16,
+    request_id: String,
+    response: BackendResponse,
+}
+
+pub type BackendResponseEnvelope = BackendResponseMessage;
 
 impl TrustTarget {
     pub fn validate(&self) -> Result<(), BackendProtocolError> {
@@ -230,7 +249,7 @@ impl BackendRequestMessage {
         }
         match &self.request {
             BackendRequest::Prepare { context } => {
-                if context.request_id != self.request_id {
+                if context.request_id() != self.request_id {
                     return Err(BackendProtocolError::InvalidRequest(
                         "prepare context request id does not match envelope".to_owned(),
                     ));
@@ -291,6 +310,44 @@ impl BackendResponseMessage {
 }
 
 impl BackendError {
+    pub fn new(class: impl Into<String>, retryable: bool, message: impl Into<String>) -> Self {
+        Self {
+            error_version: DEVENV_BACKEND_ERROR_VERSION,
+            class: class.into(),
+            retryable,
+            message: message.into(),
+            generation: None,
+            provider_id: None,
+            operation: None,
+            request_id: None,
+        }
+    }
+
+    pub fn with_error_version(mut self, error_version: u16) -> Self {
+        self.error_version = error_version;
+        self
+    }
+
+    pub fn with_generation(mut self, generation: Generation) -> Self {
+        self.generation = Some(generation);
+        self
+    }
+
+    pub fn with_provider(mut self, provider_id: impl Into<String>) -> Self {
+        self.provider_id = Some(provider_id.into());
+        self
+    }
+
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(operation.into());
+        self
+    }
+
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
     fn validate(&self) -> Result<(), BackendProtocolError> {
         if self.error_version != DEVENV_BACKEND_ERROR_VERSION {
             return Err(BackendProtocolError::UnsupportedErrorVersion(
@@ -301,19 +358,8 @@ impl BackendError {
     }
 }
 
-#[derive(Debug)]
-pub enum BackendProtocolError {
-    Json(serde_json::Error),
-    Io(io::Error),
-    UnsupportedVersion(u16),
-    UnsupportedErrorVersion(u16),
-    InvalidRequest(String),
-    InvalidContext { source: RequestValidationError },
-    FrameTooLarge(usize),
-}
-
-impl std::fmt::Display for BackendProtocolError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for BackendProtocolError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Json(source) => write!(formatter, "backend protocol JSON failed: {source}"),
             Self::Io(source) => write!(formatter, "backend protocol IO failed: {source}"),
@@ -345,8 +391,8 @@ impl std::fmt::Display for BackendProtocolError {
     }
 }
 
-impl std::error::Error for BackendProtocolError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for BackendProtocolError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Json(source) => Some(source),
             Self::Io(source) => Some(source),
@@ -359,91 +405,72 @@ impl std::error::Error for BackendProtocolError {
     }
 }
 
-pub fn encode_backend_request(
-    message: &BackendRequestMessage,
-) -> Result<Vec<u8>, BackendProtocolError> {
-    message.validate()?;
-    encode_json(message)
+impl BackendRequestMessage {
+    pub fn encode(&self) -> Result<Vec<u8>, BackendProtocolError> {
+        self.validate()?;
+        encode_json(self)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, BackendProtocolError> {
+        ensure_frame_size(payload)?;
+        let message: Self = from_slice(payload).map_err(BackendProtocolError::Json)?;
+        message.validate()?;
+        Ok(message)
+    }
+
+    pub fn write_to(&self, writer: &mut impl Write) -> Result<(), BackendProtocolError> {
+        write_frame(writer, &self.encode()?)
+    }
+
+    pub fn read_from(reader: &mut impl Read) -> Result<Self, BackendProtocolError> {
+        Self::decode(&read_frame(reader)?)
+    }
 }
 
-pub fn decode_backend_request(
-    payload: &[u8],
-) -> Result<BackendRequestMessage, BackendProtocolError> {
-    ensure_frame_size(payload)?;
-    let message: BackendRequestMessage =
-        serde_json::from_slice(payload).map_err(BackendProtocolError::Json)?;
-    message.validate()?;
-    Ok(message)
-}
+impl BackendResponseMessage {
+    pub fn encode(&self) -> Result<Vec<u8>, BackendProtocolError> {
+        self.validate()?;
+        encode_json(self)
+    }
 
-pub fn encode_backend_response(
-    message: &BackendResponseMessage,
-) -> Result<Vec<u8>, BackendProtocolError> {
-    message.validate()?;
-    encode_json(message)
-}
+    pub fn decode(payload: &[u8]) -> Result<Self, BackendProtocolError> {
+        ensure_frame_size(payload)?;
+        let message: Self = from_slice(payload).map_err(BackendProtocolError::Json)?;
+        message.validate()?;
+        Ok(message)
+    }
 
-pub fn decode_backend_response(
-    payload: &[u8],
-) -> Result<BackendResponseMessage, BackendProtocolError> {
-    ensure_frame_size(payload)?;
-    let message: BackendResponseMessage =
-        serde_json::from_slice(payload).map_err(BackendProtocolError::Json)?;
-    message.validate()?;
-    Ok(message)
+    pub fn write_to(&self, writer: &mut impl Write) -> Result<(), BackendProtocolError> {
+        write_frame(writer, &self.encode()?)
+    }
+
+    pub fn read_from(reader: &mut impl Read) -> Result<Self, BackendProtocolError> {
+        Self::decode(&read_frame(reader)?)
+    }
 }
 
 fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>, BackendProtocolError> {
-    let payload = serde_json::to_vec(value).map_err(BackendProtocolError::Json)?;
+    let payload = to_vec(value).map_err(BackendProtocolError::Json)?;
     if payload.len() > MAX_BACKEND_FRAME_BYTES {
         return Err(BackendProtocolError::FrameTooLarge(payload.len()));
     }
     Ok(payload)
 }
 
-/// Write one JSON envelope using the backend's four-byte big-endian frame.
-pub fn write_backend_request(
-    writer: &mut impl Write,
-    message: &BackendRequestMessage,
-) -> Result<(), BackendProtocolError> {
-    write_frame(writer, &encode_backend_request(message)?)
-}
-
-pub fn read_backend_request(
-    reader: &mut impl Read,
-) -> Result<BackendRequestMessage, BackendProtocolError> {
-    decode_backend_request(&read_frame(reader)?)
-}
-
-pub fn write_backend_response(
-    writer: &mut impl Write,
-    message: &BackendResponseMessage,
-) -> Result<(), BackendProtocolError> {
-    write_frame(writer, &encode_backend_response(message)?)
-}
-
-pub fn read_backend_response(
-    reader: &mut impl Read,
-) -> Result<BackendResponseMessage, BackendProtocolError> {
-    decode_backend_response(&read_frame(reader)?)
-}
-
 fn write_frame(writer: &mut impl Write, payload: &[u8]) -> Result<(), BackendProtocolError> {
-    unix_frame::write_payload_frame(writer, payload, MAX_BACKEND_FRAME_BYTES)
-        .map_err(map_frame_error)
+    write_payload_frame(writer, payload, MAX_BACKEND_FRAME_BYTES).map_err(map_frame_error)
 }
 
 fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>, BackendProtocolError> {
-    unix_frame::read_payload_frame(reader, MAX_BACKEND_FRAME_BYTES).map_err(map_frame_error)
+    read_payload_frame(reader, MAX_BACKEND_FRAME_BYTES).map_err(map_frame_error)
 }
 
-fn map_frame_error(error: unix_frame::FrameError) -> BackendProtocolError {
+fn map_frame_error(error: FrameError) -> BackendProtocolError {
     match error {
-        unix_frame::FrameError::Io(error) => BackendProtocolError::Io(error),
-        unix_frame::FrameError::Json(error) => BackendProtocolError::Json(error),
-        unix_frame::FrameError::Empty => BackendProtocolError::FrameTooLarge(0),
-        unix_frame::FrameError::TooLarge { length, .. }
-        | unix_frame::FrameError::LengthOverflow(length) => {
+        FrameError::Io(error) => BackendProtocolError::Io(error),
+        FrameError::Json(error) => BackendProtocolError::Json(error),
+        FrameError::Empty => BackendProtocolError::FrameTooLarge(0),
+        FrameError::TooLarge { length, .. } | FrameError::LengthOverflow(length) => {
             BackendProtocolError::FrameTooLarge(length)
         }
     }
@@ -454,4 +481,66 @@ fn ensure_frame_size(payload: &[u8]) -> Result<(), BackendProtocolError> {
         return Err(BackendProtocolError::FrameTooLarge(payload.len()));
     }
     Ok(())
+}
+
+impl BackendRequestMessage {
+    pub fn protocol(&self) -> u16 {
+        self.protocol
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn request(&self) -> &BackendRequest {
+        &self.request
+    }
+}
+
+impl BackendResponseMessage {
+    pub fn protocol(&self) -> u16 {
+        self.protocol
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn response(&self) -> &BackendResponse {
+        &self.response
+    }
+}
+
+impl BackendError {
+    pub fn error_version(&self) -> u16 {
+        self.error_version
+    }
+
+    pub fn class(&self) -> &str {
+        &self.class
+    }
+
+    pub fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn generation(&self) -> Option<Generation> {
+        self.generation
+    }
+
+    pub fn provider_id(&self) -> Option<&str> {
+        self.provider_id.as_deref()
+    }
+
+    pub fn operation(&self) -> Option<&str> {
+        self.operation.as_deref()
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
 }

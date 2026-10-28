@@ -1,13 +1,21 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, convert::Infallible};
 
-use crate::environment::EnvironmentPath;
-use crate::input::InputSpec;
-use crate::provenance::{Layer, ProvenanceIndex};
-use crate::provider::ProviderConfig;
-use crate::shell::ShellConfig;
-use crate::validation::{validate_concrete_path, validate_config_path, validate_id};
-use crate::{ModelError, ModelErrorReason, ValueTree, DEV_ENV_SCHEMA_V1};
+use crate::{
+    environment::{
+        ConditionalEnvironmentVariable, ConfiguredValuePrecedence, EnvironmentConfig,
+        EnvironmentPath,
+    },
+    input::InputSpec,
+    provenance::{Layer, ProvenanceIndex},
+    provider::ProviderConfig,
+    shell::ShellConfig,
+    validation::StringValidation,
+    ModelError, ModelErrorReason, ValueTree, DEV_ENV_SCHEMA_V1,
+};
+use profile_graph::{
+    traverse, validate_extends, validate_profile_id, ProfileGraphError, TraverseError,
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,15 +46,15 @@ pub enum UntrustedWorkspacePolicy {
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     #[serde(default)]
-    pub merge: MergePolicy,
+    merge: MergePolicy,
     #[serde(default)]
-    pub workspace_can_override: Vec<String>,
+    workspace_can_override: Vec<String>,
     #[serde(default)]
-    pub cli_can_override: Vec<String>,
+    cli_can_override: Vec<String>,
     #[serde(default)]
-    pub unknown_input: UnknownInputPolicy,
+    unknown_input: UnknownInputPolicy,
     #[serde(default)]
-    pub untrusted_workspace: UntrustedWorkspacePolicy,
+    untrusted_workspace: UntrustedWorkspacePolicy,
 }
 
 impl Default for PolicyConfig {
@@ -62,13 +70,28 @@ impl Default for PolicyConfig {
 }
 
 impl PolicyConfig {
+    pub fn with_merge(mut self, merge: MergePolicy) -> Self {
+        self.merge = merge;
+        self
+    }
+
+    pub fn with_workspace_can_override(mut self, paths: Vec<String>) -> Self {
+        self.workspace_can_override = paths;
+        self
+    }
+
+    pub fn with_untrusted_workspace(mut self, policy: UntrustedWorkspacePolicy) -> Self {
+        self.untrusted_workspace = policy;
+        self
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         for path in self
             .workspace_can_override
             .iter()
             .chain(self.cli_can_override.iter())
         {
-            validate_config_path("policy.override", path)?;
+            path.validate_config_path("policy.override")?;
         }
         Ok(())
     }
@@ -113,40 +136,53 @@ pub enum WorkspaceSearch {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
-    pub root: String,
+    root: String,
     #[serde(default)]
-    pub search: WorkspaceSearch,
+    search: WorkspaceSearch,
 }
 
 impl WorkspaceConfig {
+    pub fn new(root: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            search: WorkspaceSearch::Upward,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
-        validate_concrete_path("workspace.root", &self.root)
+        self.root.validate_concrete_path("workspace.root")
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellSelection {
-    pub default: String,
+    default: String,
 }
 
 impl ShellSelection {
+    pub fn new(default: impl Into<String>) -> Self {
+        Self {
+            default: default.into(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
-        validate_id("shell.default", &self.default)
+        self.default.validate_id("shell.default")
     }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentLayer {
-    pub inherit_process: Option<bool>,
-    pub configured_value_precedence: Option<crate::ConfiguredValuePrecedence>,
+    inherit_process: Option<bool>,
+    configured_value_precedence: Option<ConfiguredValuePrecedence>,
     #[serde(default)]
-    pub variables: BTreeMap<String, String>,
+    variables: BTreeMap<String, String>,
     #[serde(default)]
-    pub conditional_variables: BTreeMap<String, crate::ConditionalEnvironmentVariable>,
+    conditional_variables: BTreeMap<String, ConditionalEnvironmentVariable>,
     #[serde(default)]
-    pub path: EnvironmentPath,
+    path: EnvironmentPath,
 }
 
 impl EnvironmentLayer {
@@ -154,13 +190,13 @@ impl EnvironmentLayer {
         if let Some(precedence) = self.configured_value_precedence {
             let _ = precedence;
         }
-        crate::EnvironmentConfig {
-            inherit_process: self.inherit_process.unwrap_or(true),
-            configured_value_precedence: self.configured_value_precedence.unwrap_or_default(),
-            variables: self.variables.clone(),
-            conditional_variables: self.conditional_variables.clone(),
-            path: self.path.clone(),
-        }
+        EnvironmentConfig::new(
+            self.inherit_process.unwrap_or(true),
+            self.configured_value_precedence.unwrap_or_default(),
+            self.variables.clone(),
+            self.conditional_variables.clone(),
+            self.path.clone(),
+        )
         .validate()
     }
 }
@@ -168,16 +204,16 @@ impl EnvironmentLayer {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigLayer {
-    pub workspace: Option<WorkspaceConfig>,
-    pub shell: Option<ShellSelection>,
+    workspace: Option<WorkspaceConfig>,
+    shell: Option<ShellSelection>,
     #[serde(default)]
-    pub shells: BTreeMap<String, ShellConfig>,
+    shells: BTreeMap<String, ShellConfig>,
     #[serde(default)]
-    pub environment: EnvironmentLayer,
+    environment: EnvironmentLayer,
     #[serde(default)]
-    pub features: ValueTree,
+    features: ValueTree,
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    providers: BTreeMap<String, ProviderConfig>,
 }
 
 impl ConfigLayer {
@@ -213,16 +249,35 @@ pub enum OverrideOperation {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverrideSpec {
-    pub op: OverrideOperation,
-    pub value: Option<ValueTree>,
+    op: OverrideOperation,
+    value: Option<ValueTree>,
     #[serde(default)]
-    pub values: Vec<ValueTree>,
-    pub reason: String,
+    values: Vec<ValueTree>,
+    reason: String,
 }
 
 impl OverrideSpec {
+    pub fn new(op: OverrideOperation, reason: impl Into<String>) -> Self {
+        Self {
+            op,
+            value: None,
+            values: Vec::new(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn with_value(mut self, value: ValueTree) -> Self {
+        self.value = Some(value);
+        self
+    }
+
+    pub fn with_values(mut self, values: Vec<ValueTree>) -> Self {
+        self.values = values;
+        self
+    }
+
     pub fn validate(&self, path: &str) -> Result<(), ModelError> {
-        validate_config_path(&format!("override.{path}"), path)?;
+        path.validate_config_path(&format!("override.{path}"))?;
         if self.reason.is_empty() || self.reason.contains('\0') {
             return Err(ModelError::InvalidOverride {
                 path: path.to_owned(),
@@ -272,7 +327,7 @@ impl OverrideSpec {
                         reason: ModelErrorReason::MustBeScalar,
                     });
                 };
-                validate_concrete_path(&format!("override.{path}.values"), path_value)?;
+                path_value.validate_concrete_path(&format!("override.{path}.values"))?;
             }
         }
         Ok(())
@@ -282,21 +337,43 @@ impl OverrideSpec {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileDocument {
-    pub schema: u32,
-    pub id: String,
+    schema: u32,
+    id: String,
     #[serde(default)]
-    pub extends: Vec<String>,
+    extends: Vec<String>,
     #[serde(default)]
-    pub policy: PolicyConfig,
+    policy: PolicyConfig,
     #[serde(default)]
-    pub config: ConfigLayer,
+    config: ConfigLayer,
     #[serde(rename = "override", default)]
-    pub overrides: BTreeMap<String, OverrideSpec>,
+    overrides: BTreeMap<String, OverrideSpec>,
     #[serde(default)]
-    pub inputs: BTreeMap<String, InputSpec>,
+    inputs: BTreeMap<String, InputSpec>,
 }
 
 impl ProfileDocument {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            schema: DEV_ENV_SCHEMA_V1,
+            id: id.into(),
+            extends: Vec::new(),
+            policy: PolicyConfig::default(),
+            config: ConfigLayer::default(),
+            overrides: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    pub fn with_extends(mut self, extends: Vec<String>) -> Self {
+        self.extends = extends;
+        self
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.schema != DEV_ENV_SCHEMA_V1 {
             return Err(ModelError::UnsupportedSchema {
@@ -304,17 +381,15 @@ impl ProfileDocument {
                 expected: DEV_ENV_SCHEMA_V1,
             });
         }
-        profile_graph::validate_profile_id(&self.id).map_err(|_| ModelError::InvalidProfileId {
+        validate_profile_id(&self.id).map_err(|_| ModelError::InvalidProfileId {
             id: self.id.clone(),
         })?;
-        profile_graph::validate_extends(&self.id, &self.extends).map_err(|error| match error {
-            profile_graph::ProfileGraphError::InvalidId(reference) => {
-                ModelError::InvalidProfileReference {
-                    profile: self.id.clone(),
-                    reference,
-                }
-            }
-            profile_graph::ProfileGraphError::DuplicateParent { .. } => ModelError::InvalidValue {
+        validate_extends(&self.id, &self.extends).map_err(|error| match error {
+            ProfileGraphError::InvalidId(reference) => ModelError::InvalidProfileReference {
+                profile: self.id.clone(),
+                reference,
+            },
+            ProfileGraphError::DuplicateParent { .. } => ModelError::InvalidValue {
                 location: format!("profile {}.extends", self.id),
                 reason: ModelErrorReason::Duplicate,
             },
@@ -386,10 +461,10 @@ impl ProfileSet {
 
     fn resolve_chain(&self, id: &str) -> Result<Vec<&ProfileDocument>, ModelError> {
         let mut result = Vec::new();
-        profile_graph::traverse(
+        traverse(
             id,
             |profile_id| {
-                Ok::<_, std::convert::Infallible>(
+                Ok::<_, Infallible>(
                     self.profiles
                         .get(profile_id)
                         .map(|profile| (profile, profile.extends.clone())),
@@ -401,34 +476,34 @@ impl ProfileSet {
             },
         )
         .map_err(|error| match error {
-            profile_graph::TraverseError::Source(never) => match never {},
-            profile_graph::TraverseError::Graph(
-                profile_graph::ProfileGraphError::MissingProfile(_),
-            ) => ModelError::UnknownDefaultProfile { id: id.to_owned() },
-            profile_graph::TraverseError::Graph(
-                profile_graph::ProfileGraphError::MissingParent { profile, parent },
-            ) => ModelError::MissingParentProfile { profile, parent },
-            profile_graph::TraverseError::Graph(profile_graph::ProfileGraphError::Cycle(
-                profiles,
-            )) => ModelError::ProfileCycle { profiles },
-            profile_graph::TraverseError::Graph(profile_graph::ProfileGraphError::InvalidId(
-                reference,
-            )) => ModelError::InvalidProfileReference {
-                profile: id.to_owned(),
-                reference,
-            },
-            profile_graph::TraverseError::Graph(
-                profile_graph::ProfileGraphError::DuplicateParent { profile, .. },
-            ) => ModelError::InvalidValue {
-                location: format!("profile {profile}.extends"),
-                reason: ModelErrorReason::Duplicate,
-            },
-            profile_graph::TraverseError::Graph(
-                profile_graph::ProfileGraphError::InheritanceDepthExceeded { limit: _ },
-            ) => ModelError::InvalidValue {
-                location: "profile inheritance".to_owned(),
-                reason: ModelErrorReason::Unsupported,
-            },
+            TraverseError::Source(never) => match never {},
+            TraverseError::Graph(ProfileGraphError::MissingProfile(_)) => {
+                ModelError::UnknownDefaultProfile { id: id.to_owned() }
+            }
+            TraverseError::Graph(ProfileGraphError::MissingParent { profile, parent }) => {
+                ModelError::MissingParentProfile { profile, parent }
+            }
+            TraverseError::Graph(ProfileGraphError::Cycle(profiles)) => {
+                ModelError::ProfileCycle { profiles }
+            }
+            TraverseError::Graph(ProfileGraphError::InvalidId(reference)) => {
+                ModelError::InvalidProfileReference {
+                    profile: id.to_owned(),
+                    reference,
+                }
+            }
+            TraverseError::Graph(ProfileGraphError::DuplicateParent { profile, .. }) => {
+                ModelError::InvalidValue {
+                    location: format!("profile {profile}.extends"),
+                    reason: ModelErrorReason::Duplicate,
+                }
+            }
+            TraverseError::Graph(ProfileGraphError::InheritanceDepthExceeded { limit: _ }) => {
+                ModelError::InvalidValue {
+                    location: "profile inheritance".to_owned(),
+                    reason: ModelErrorReason::Unsupported,
+                }
+            }
         })?;
         Ok(result)
     }
@@ -443,24 +518,82 @@ enum VisitState {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedConfig {
-    pub workspace: WorkspaceConfig,
-    pub shell: ShellSelection,
+    workspace: WorkspaceConfig,
+    shell: ShellSelection,
     #[serde(default)]
-    pub shells: BTreeMap<String, ShellConfig>,
-    pub environment: crate::EnvironmentConfig,
+    shells: BTreeMap<String, ShellConfig>,
+    environment: EnvironmentConfig,
     #[serde(default)]
-    pub features: ValueTree,
+    features: ValueTree,
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
-    pub inputs: BTreeMap<String, InputSpec>,
+    inputs: BTreeMap<String, InputSpec>,
     #[serde(default)]
-    pub policy: PolicyConfig,
+    policy: PolicyConfig,
     #[serde(default)]
-    pub provenance: ProvenanceIndex,
+    provenance: ProvenanceIndex,
 }
 
 impl ResolvedConfig {
+    pub fn new(
+        workspace: WorkspaceConfig,
+        shell: ShellSelection,
+        environment: EnvironmentConfig,
+    ) -> Self {
+        Self {
+            workspace,
+            shell,
+            shells: BTreeMap::new(),
+            environment,
+            features: ValueTree::default(),
+            providers: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            policy: PolicyConfig::default(),
+            provenance: ProvenanceIndex::default(),
+        }
+    }
+
+    pub fn with_shells(mut self, shells: BTreeMap<String, ShellConfig>) -> Self {
+        self.shells = shells;
+        self
+    }
+
+    pub fn with_providers(mut self, providers: BTreeMap<String, ProviderConfig>) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    pub fn with_inputs(mut self, inputs: BTreeMap<String, InputSpec>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    pub fn with_policy(mut self, policy: PolicyConfig) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_features(mut self, features: ValueTree) -> Self {
+        self.features = features;
+        self
+    }
+
+    pub fn with_provenance(mut self, provenance: ProvenanceIndex) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    pub fn with_environment(mut self, environment: EnvironmentConfig) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    pub fn with_shell(mut self, shell: ShellSelection) -> Self {
+        self.shell = shell;
+        self
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         self.workspace.validate()?;
         self.shell.validate()?;
@@ -498,7 +631,7 @@ impl ResolvedConfig {
 
 fn validate_provider_graph(providers: &BTreeMap<String, ProviderConfig>) -> Result<(), ModelError> {
     for (id, provider) in providers {
-        for dependency in &provider.depends_on {
+        for dependency in provider.depends_on() {
             if !providers.contains_key(dependency) {
                 return Err(ModelError::MissingProviderDependency {
                     provider: id.clone(),
@@ -541,11 +674,183 @@ fn visit_provider(
         })?;
     state.insert(id.to_owned(), VisitState::Visiting);
     stack.push(id.to_owned());
-    for dependency in &provider.depends_on {
+    for dependency in provider.depends_on() {
         visit_provider(dependency, providers, state, stack, result)?;
     }
     stack.pop();
     state.insert(id.to_owned(), VisitState::Done);
     result.push(id.to_owned());
     Ok(())
+}
+
+impl PolicyConfig {
+    pub fn merge(&self) -> MergePolicy {
+        self.merge
+    }
+
+    pub fn workspace_can_override(&self) -> &Vec<String> {
+        &self.workspace_can_override
+    }
+
+    pub fn cli_can_override(&self) -> &Vec<String> {
+        &self.cli_can_override
+    }
+
+    pub fn unknown_input(&self) -> UnknownInputPolicy {
+        self.unknown_input
+    }
+
+    pub fn untrusted_workspace(&self) -> UntrustedWorkspacePolicy {
+        self.untrusted_workspace
+    }
+}
+
+impl WorkspaceConfig {
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn search(&self) -> WorkspaceSearch {
+        self.search
+    }
+}
+
+impl ShellSelection {
+    pub fn default(&self) -> &str {
+        &self.default
+    }
+}
+
+impl EnvironmentLayer {
+    pub fn inherit_process(&self) -> Option<bool> {
+        self.inherit_process
+    }
+
+    pub fn configured_value_precedence(&self) -> &Option<ConfiguredValuePrecedence> {
+        &self.configured_value_precedence
+    }
+
+    pub fn variables(&self) -> &BTreeMap<String, String> {
+        &self.variables
+    }
+
+    pub fn conditional_variables(&self) -> &BTreeMap<String, ConditionalEnvironmentVariable> {
+        &self.conditional_variables
+    }
+
+    pub fn path(&self) -> &EnvironmentPath {
+        &self.path
+    }
+}
+
+impl ConfigLayer {
+    pub fn workspace(&self) -> &Option<WorkspaceConfig> {
+        &self.workspace
+    }
+
+    pub fn shell(&self) -> &Option<ShellSelection> {
+        &self.shell
+    }
+
+    pub fn shells(&self) -> &BTreeMap<String, ShellConfig> {
+        &self.shells
+    }
+
+    pub fn environment(&self) -> &EnvironmentLayer {
+        &self.environment
+    }
+
+    pub fn features(&self) -> &ValueTree {
+        &self.features
+    }
+
+    pub fn providers(&self) -> &BTreeMap<String, ProviderConfig> {
+        &self.providers
+    }
+}
+
+impl OverrideSpec {
+    pub fn op(&self) -> OverrideOperation {
+        self.op
+    }
+
+    pub fn value(&self) -> &Option<ValueTree> {
+        &self.value
+    }
+
+    pub fn values(&self) -> &Vec<ValueTree> {
+        &self.values
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl ProfileDocument {
+    pub fn schema(&self) -> u32 {
+        self.schema
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn extends(&self) -> &Vec<String> {
+        &self.extends
+    }
+
+    pub fn policy(&self) -> &PolicyConfig {
+        &self.policy
+    }
+
+    pub fn config(&self) -> &ConfigLayer {
+        &self.config
+    }
+
+    pub fn overrides(&self) -> &BTreeMap<String, OverrideSpec> {
+        &self.overrides
+    }
+
+    pub fn inputs(&self) -> &BTreeMap<String, InputSpec> {
+        &self.inputs
+    }
+}
+
+impl ResolvedConfig {
+    pub fn workspace(&self) -> &WorkspaceConfig {
+        &self.workspace
+    }
+
+    pub fn shell(&self) -> &ShellSelection {
+        &self.shell
+    }
+
+    pub fn shells(&self) -> &BTreeMap<String, ShellConfig> {
+        &self.shells
+    }
+
+    pub fn environment(&self) -> &EnvironmentConfig {
+        &self.environment
+    }
+
+    pub fn features(&self) -> &ValueTree {
+        &self.features
+    }
+
+    pub fn providers(&self) -> &BTreeMap<String, ProviderConfig> {
+        &self.providers
+    }
+
+    pub fn inputs(&self) -> &BTreeMap<String, InputSpec> {
+        &self.inputs
+    }
+
+    pub fn policy(&self) -> &PolicyConfig {
+        &self.policy
+    }
+
+    pub fn provenance(&self) -> &ProvenanceIndex {
+        &self.provenance
+    }
 }

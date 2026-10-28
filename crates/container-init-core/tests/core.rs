@@ -1,51 +1,57 @@
 use container_init_bootstrap_model::{
-    Action, ActionKind, BootstrapConfig, BootstrapMode, BootstrapPolicy, HandoffConfig,
-    IdentityConfig, NonInteractivePolicy, Origin, PlanPhase, RunAs,
+    Action, ActionKind, BootstrapConfig, BootstrapInput, FailurePolicy, HandoffConfig,
+    IdentityConfig, InputNamespace, InputType, Origin, PlanPhase, RunAs,
 };
 use container_init_core::{
     ActionStatus, CoreError, ExecutionOptions, IdentityResolver, IdentitySource, PlanExecutor,
     PosixSystem, RuntimeContext, SshCapability, WorkspaceObservation, WorkspaceStatus,
 };
-use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::symlink;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::process::Command;
+use std::{
+    collections::BTreeMap,
+    env::{current_exe, var_os},
+    fs,
+    os::unix::fs::{symlink, PermissionsExt},
+    path::{Path, PathBuf},
+    process::{id, Command},
+};
 use tempfile::TempDir;
 
 fn config(workspace: &Path, actions: Vec<Action>) -> BootstrapConfig {
     let (uid, gid) = PosixSystem::new().current_ids();
-    BootstrapConfig {
-        schema: 1,
-        mode: BootstrapMode::Strict,
-        workspace_root: workspace.display().to_string(),
-        allow_workspace_overlay: false,
-        non_interactive: NonInteractivePolicy::Deny,
-        identity: IdentityConfig {
-            default_user: None,
-            default_uid: Some(uid),
-            default_gid: Some(gid),
-            default_home: None,
-            auto_mapping: false,
-            run_as_root_input: None,
-            uid_input: None,
-            gid_input: None,
-            home_input: None,
-        },
-        handoff: HandoffConfig {
-            runtime: "/bin/sh".to_owned(),
-            exec_prefix: vec!["-c".to_owned()],
-            initial_exec_prefix: vec!["-c".to_owned()],
-            shell_prefix: vec!["-c".to_owned(), "true".to_owned()],
-            root_service: false,
-            ssh_daemon: None,
-            login_shell: None,
-        },
-        policy: BootstrapPolicy::default(),
-        inputs: BTreeMap::new(),
+    let mut identity = IdentityConfig::new();
+    identity.set_default_uid(Some(uid));
+    identity.set_default_gid(Some(gid));
+
+    let mut handoff = HandoffConfig::new("/bin/sh");
+    handoff.set_exec_prefix(vec!["-c".to_owned()]);
+    handoff.set_initial_exec_prefix(vec!["-c".to_owned()]);
+    handoff.set_shell_prefix(vec!["-c".to_owned(), "true".to_owned()]);
+
+    BootstrapConfig::new(
+        workspace.display().to_string(),
+        identity,
+        handoff,
+        BTreeMap::new(),
         actions,
-    }
+    )
+}
+
+struct BootstrapInputSpec {
+    input_type: InputType,
+    aliases: Vec<String>,
+    format: Option<String>,
+    namespace: Option<InputNamespace>,
+    allow_outside_workspace: bool,
+}
+
+fn bootstrap_input(target: &str, spec: BootstrapInputSpec) -> BootstrapInput {
+    let mut input = BootstrapInput::new(target, spec.input_type);
+    input.set_aliases(spec.aliases);
+    input.set_runtime(true);
+    input.set_format(spec.format);
+    input.set_namespace(spec.namespace);
+    input.set_allow_outside_workspace(spec.allow_outside_workspace);
+    input
 }
 
 fn action(id: &str, kind: ActionKind) -> Action {
@@ -54,53 +60,57 @@ fn action(id: &str, kind: ActionKind) -> Action {
 
 fn root_action(id: &str, kind: ActionKind) -> Action {
     let mut action = action(id, kind);
-    action.run_as = RunAs::Root;
+    action.set_run_as(RunAs::Root);
     action
 }
 
 fn executor(config: BootstrapConfig) -> PlanExecutor {
-    let cwd = config.workspace_root.clone();
+    let cwd = config.workspace_root().to_owned();
     PlanExecutor::new(config, RuntimeContext::new(cwd))
 }
 
 fn identity_input_config(workspace: &Path) -> BootstrapConfig {
     let mut config = config(workspace, Vec::new());
-    config.identity.default_user = Some("dev".to_owned());
-    config.identity.default_uid = Some(1000);
-    config.identity.default_gid = Some(1000);
-    config.identity.auto_mapping = true;
-    config.identity.uid_input = Some("HOST_UID".to_owned());
-    config.identity.gid_input = Some("HOST_GID".to_owned());
-    config.inputs = [
+    config
+        .identity_mut()
+        .set_default_user(Some("dev".to_owned()));
+    config.identity_mut().set_default_uid(Some(1000));
+    config.identity_mut().set_default_gid(Some(1000));
+    config.identity_mut().set_auto_mapping(true);
+    config
+        .identity_mut()
+        .set_uid_input(Some("HOST_UID".to_owned()));
+    config
+        .identity_mut()
+        .set_gid_input(Some("HOST_GID".to_owned()));
+    config.inputs_mut().extend([
         (
             "HOST_UID".to_owned(),
-            container_init_bootstrap_model::BootstrapInput {
-                target: "identity.uid".to_owned(),
-                input_type: container_init_bootstrap_model::InputType::UidPair,
-                aliases: Vec::new(),
-                runtime: true,
-                format: Some("uid[:gid]".to_owned()),
-                namespace: Some(container_init_bootstrap_model::InputNamespace::Host),
-                default: None,
-                allow_outside_workspace: false,
-            },
+            bootstrap_input(
+                "identity.uid",
+                BootstrapInputSpec {
+                    input_type: InputType::UidPair,
+                    aliases: Vec::new(),
+                    format: Some("uid[:gid]".to_owned()),
+                    namespace: Some(InputNamespace::Host),
+                    allow_outside_workspace: false,
+                },
+            ),
         ),
         (
             "HOST_GID".to_owned(),
-            container_init_bootstrap_model::BootstrapInput {
-                target: "identity.gid".to_owned(),
-                input_type: container_init_bootstrap_model::InputType::Gid,
-                aliases: Vec::new(),
-                runtime: true,
-                format: None,
-                namespace: Some(container_init_bootstrap_model::InputNamespace::Host),
-                default: None,
-                allow_outside_workspace: false,
-            },
+            bootstrap_input(
+                "identity.gid",
+                BootstrapInputSpec {
+                    input_type: InputType::Gid,
+                    aliases: Vec::new(),
+                    format: None,
+                    namespace: Some(InputNamespace::Host),
+                    allow_outside_workspace: false,
+                },
+            ),
         ),
-    ]
-    .into_iter()
-    .collect();
+    ]);
     config
 }
 
@@ -164,10 +174,12 @@ fn workspace_owner_is_used_only_when_mount_observation_is_explicitly_mounted() {
     fs::write(&group, "root:x:0:\ndev:x:1000:\n").unwrap();
     let resolver = IdentityResolver::with_posix(PosixSystem::with_account_files(&passwd, &group));
     let mut config = config(temp.path(), Vec::new());
-    config.identity.default_user = Some("dev".to_owned());
-    config.identity.default_uid = Some(1000);
-    config.identity.default_gid = Some(1000);
-    config.identity.auto_mapping = true;
+    config
+        .identity_mut()
+        .set_default_user(Some("dev".to_owned()));
+    config.identity_mut().set_default_uid(Some(1000));
+    config.identity_mut().set_default_gid(Some(1000));
+    config.identity_mut().set_auto_mapping(true);
 
     let not_mounted = resolver
         .resolve(
@@ -196,7 +208,7 @@ fn workspace_owner_is_used_only_when_mount_observation_is_explicitly_mounted() {
     assert_eq!(mounted.uid_source, IdentitySource::WorkspaceMount);
 }
 
-fn fake_ssh_keygen(root: &Path) -> std::path::PathBuf {
+fn fake_ssh_keygen(root: &Path) -> PathBuf {
     let path = root.join("fake-ssh-keygen");
     fs::write(
         &path,
@@ -217,17 +229,17 @@ fn filesystem_actions_are_idempotent_and_atomic() {
     let link = temp.path().join("current");
 
     let mut ensure_dir = action("directory", ActionKind::FilesystemEnsureDir);
-    ensure_dir.path = Some(directory.display().to_string());
-    ensure_dir.mode = Some("0750".to_owned());
+    ensure_dir.set_path(Some(directory.display().to_string()));
+    ensure_dir.set_mode(Some("0750".to_owned()));
     let mut ensure_file = action("file", ActionKind::FilesystemEnsureFile);
-    ensure_file.path = Some(file.display().to_string());
-    ensure_file.content = Some("stable configuration\n".to_owned());
-    ensure_file.mode = Some("0640".to_owned());
-    ensure_file.depends_on = vec!["directory".to_owned()];
+    ensure_file.set_path(Some(file.display().to_string()));
+    ensure_file.set_content(Some("stable configuration\n".to_owned()));
+    ensure_file.set_mode(Some("0640".to_owned()));
+    ensure_file.set_depends_on(vec!["directory".to_owned()]);
     let mut ensure_link = action("link", ActionKind::FilesystemEnsureSymlink);
-    ensure_link.link = Some(link.display().to_string());
-    ensure_link.target = Some(file.display().to_string());
-    ensure_link.depends_on = vec!["file".to_owned()];
+    ensure_link.set_link(Some(link.display().to_string()));
+    ensure_link.set_target(Some(file.display().to_string()));
+    ensure_link.set_depends_on(vec!["file".to_owned()]);
 
     let config = config(temp.path(), vec![ensure_link, ensure_file, ensure_dir]);
     let plan = config.build_plan().unwrap();
@@ -263,55 +275,61 @@ fn filesystem_actions_are_idempotent_and_atomic() {
 fn rendered_identity_paths_and_runtime_input_precedence_are_safe() {
     let temp = TempDir::new().unwrap();
     let mut config = config(temp.path(), vec![]);
-    config.identity.default_user = Some("dev".to_owned());
-    config.identity.default_uid = Some(1234);
-    config.identity.default_gid = Some(1234);
-    config.identity.uid_input = Some("HOST_UID".to_owned());
-    config.identity.gid_input = Some("HOST_GID".to_owned());
-    config.identity.home_input = Some("CONTAINER_HOME".to_owned());
-    config.inputs = [
+    config
+        .identity_mut()
+        .set_default_user(Some("dev".to_owned()));
+    config.identity_mut().set_default_uid(Some(1234));
+    config.identity_mut().set_default_gid(Some(1234));
+    config
+        .identity_mut()
+        .set_uid_input(Some("HOST_UID".to_owned()));
+    config
+        .identity_mut()
+        .set_gid_input(Some("HOST_GID".to_owned()));
+    config
+        .identity_mut()
+        .set_home_input(Some("CONTAINER_HOME".to_owned()));
+    config.inputs_mut().extend([
         (
             "HOST_UID".to_owned(),
-            container_init_bootstrap_model::BootstrapInput {
-                target: "identity.uid".to_owned(),
-                input_type: container_init_bootstrap_model::InputType::UidPair,
-                aliases: vec!["LEGACY_UID".to_owned()],
-                runtime: true,
-                format: Some("uid[:gid]".to_owned()),
-                namespace: Some(container_init_bootstrap_model::InputNamespace::Container),
-                default: None,
-                allow_outside_workspace: false,
-            },
+            bootstrap_input(
+                "identity.uid",
+                BootstrapInputSpec {
+                    input_type: InputType::UidPair,
+                    aliases: vec!["LEGACY_UID".to_owned()],
+                    format: Some("uid[:gid]".to_owned()),
+                    namespace: Some(InputNamespace::Container),
+                    allow_outside_workspace: false,
+                },
+            ),
         ),
         (
             "HOST_GID".to_owned(),
-            container_init_bootstrap_model::BootstrapInput {
-                target: "identity.gid".to_owned(),
-                input_type: container_init_bootstrap_model::InputType::Gid,
-                aliases: vec![],
-                runtime: true,
-                format: None,
-                namespace: Some(container_init_bootstrap_model::InputNamespace::Container),
-                default: None,
-                allow_outside_workspace: false,
-            },
+            bootstrap_input(
+                "identity.gid",
+                BootstrapInputSpec {
+                    input_type: InputType::Gid,
+                    aliases: vec![],
+                    format: None,
+                    namespace: Some(InputNamespace::Container),
+                    allow_outside_workspace: false,
+                },
+            ),
         ),
         (
             "CONTAINER_HOME".to_owned(),
-            container_init_bootstrap_model::BootstrapInput {
-                target: "identity.home".to_owned(),
-                input_type: container_init_bootstrap_model::InputType::Path,
-                aliases: vec![],
-                runtime: true,
-                format: None,
-                namespace: None,
-                default: None,
-                allow_outside_workspace: true,
-            },
+            bootstrap_input(
+                "identity.home",
+                BootstrapInputSpec {
+                    input_type: InputType::Path,
+                    aliases: vec![],
+                    format: None,
+                    namespace: None,
+                    allow_outside_workspace: true,
+                },
+            ),
         ),
-    ]
-    .into_iter()
-    .collect();
+    ]);
     let context = RuntimeContext::new(temp.path())
         .with_environment([
             ("HOST_UID".to_owned(), "1001:1002".to_owned()),
@@ -331,10 +349,10 @@ fn rendered_identity_paths_and_runtime_input_precedence_are_safe() {
         .with_environment([("CONTAINER_HOME".to_owned(), "/tmp/not-inside".to_owned())]);
     let mut restricted = config.clone();
     restricted
-        .inputs
+        .inputs_mut()
         .get_mut("CONTAINER_HOME")
         .unwrap()
-        .allow_outside_workspace = false;
+        .set_allow_outside_workspace(false);
     let error = IdentityResolver::new()
         .resolve(&restricted, &unsafe_home)
         .unwrap_err();
@@ -350,18 +368,20 @@ fn conditions_and_failure_policies_do_not_run_dependents() {
     let dependent_path = temp.path().join("dependent");
 
     let mut skipped = action("skipped", ActionKind::FilesystemEnsureDir);
-    skipped.path = Some(skipped_path.display().to_string());
-    skipped.when = Some("false".to_owned());
+    skipped.set_path(Some(skipped_path.display().to_string()));
+    skipped.set_when(Some("false".to_owned()));
     let mut dependent = action("dependent", ActionKind::FilesystemEnsureDir);
-    dependent.path = Some(dependent_path.display().to_string());
-    dependent.depends_on = vec!["skipped".to_owned()];
+    dependent.set_path(Some(dependent_path.display().to_string()));
+    dependent.set_depends_on(vec!["skipped".to_owned()]);
     let mut warned = action("warned", ActionKind::FilesystemEnsureSymlink);
-    warned.link = Some(collision.display().to_string());
-    warned.target = Some(temp.path().join("target").display().to_string());
-    warned.failure = container_init_bootstrap_model::FailurePolicy::Warn;
+    warned.set_link(Some(collision.display().to_string()));
+    warned.set_target(Some(temp.path().join("target").display().to_string()));
+    warned.set_failure(FailurePolicy::Warn);
     let mut warned_dependent = action("warned-dependent", ActionKind::FilesystemEnsureDir);
-    warned_dependent.path = Some(temp.path().join("warned-dependent").display().to_string());
-    warned_dependent.depends_on = vec!["warned".to_owned()];
+    warned_dependent.set_path(Some(
+        temp.path().join("warned-dependent").display().to_string(),
+    ));
+    warned_dependent.set_depends_on(vec!["warned".to_owned()]);
 
     let config = config(
         temp.path(),
@@ -406,15 +426,17 @@ fn passwd_mapping_shell_update_and_receipt_are_auditable() {
     fs::write(&group, "\n").unwrap();
     let identity = root_action("identity", ActionKind::IdentityResolve);
     let mut map = root_action("map", ActionKind::IdentityMapUser);
-    map.depends_on = vec!["identity".to_owned()];
+    map.set_depends_on(vec!["identity".to_owned()]);
     let mut shell = root_action("shell", ActionKind::ProcessSetUserShell);
-    shell.user = Some("identity.target".to_owned());
-    shell.shell = Some("/usr/bin/test-shell".to_owned());
-    shell.depends_on = vec!["map".to_owned()];
+    shell.set_user(Some("identity.target".to_owned()));
+    shell.set_shell(Some("/usr/bin/test-shell".to_owned()));
+    shell.set_depends_on(vec!["map".to_owned()]);
     let mut config = config(temp.path(), vec![shell, map, identity]);
-    config.identity.default_user = Some("fixture".to_owned());
-    config.identity.default_uid = Some(2100);
-    config.identity.default_gid = Some(2101);
+    config
+        .identity_mut()
+        .set_default_user(Some("fixture".to_owned()));
+    config.identity_mut().set_default_uid(Some(2100));
+    config.identity_mut().set_default_gid(Some(2101));
     let receipt = temp.path().join("receipt.json");
     let options = ExecutionOptions::default()
         .with_posix(PosixSystem::with_account_files(&passwd, &group))
@@ -452,13 +474,16 @@ fn prepare_exec_resolves_identity_and_builds_handoff_without_lock() {
     let config = config(temp.path(), vec![]);
     let (uid, gid) = PosixSystem::new().current_ids();
     let runner = executor(config);
-    let (identity, command, root_service) = runner
+    let prepared = runner
         .prepare_exec(&["echo".to_owned(), "direct exec".to_owned()])
         .unwrap();
-    assert_eq!(identity.uid, uid);
-    assert_eq!(identity.gid, gid);
-    assert!(!root_service);
-    assert_eq!(command.argv(), ["/bin/sh", "-c", "echo", "direct exec"]);
+    assert_eq!(prepared.identity().uid, uid);
+    assert_eq!(prepared.identity().gid, gid);
+    assert!(!prepared.root_service_handoff());
+    assert_eq!(
+        prepared.handoff().argv(),
+        ["/bin/sh", "-c", "echo", "direct exec"]
+    );
 }
 
 #[test]
@@ -466,7 +491,7 @@ fn executor_delegates_privilege_drop_to_the_posix_backend() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let status = Command::new(std::env::current_exe().unwrap())
+    let status = Command::new(current_exe().unwrap())
         .arg("--exact")
         .arg("executor_drops_privileges_in_child")
         .env("CONTAINER_INIT_CORE_DROP_CHILD", "1")
@@ -477,16 +502,18 @@ fn executor_delegates_privilege_drop_to_the_posix_backend() {
 
 #[test]
 fn executor_drops_privileges_in_child() {
-    if std::env::var_os("CONTAINER_INIT_CORE_DROP_CHILD").is_none() {
+    if var_os("CONTAINER_INIT_CORE_DROP_CHILD").is_none() {
         return;
     }
     let resolve = root_action("resolve", ActionKind::IdentityResolve);
     let mut drop = root_action("drop", ActionKind::ProcessDropPrivileges);
-    drop.depends_on = vec!["resolve".to_owned()];
+    drop.set_depends_on(vec!["resolve".to_owned()]);
     let mut config = config(Path::new("/tmp"), vec![drop, resolve]);
-    config.identity.default_user = Some("nobody".to_owned());
-    config.identity.default_uid = Some(65_534);
-    config.identity.default_gid = Some(65_534);
+    config
+        .identity_mut()
+        .set_default_user(Some("nobody".to_owned()));
+    config.identity_mut().set_default_uid(Some(65_534));
+    config.identity_mut().set_default_gid(Some(65_534));
     let plan = config.build_plan().unwrap();
     let report = executor(config).execute_plan(&plan).unwrap();
     assert!(report.succeeded());
@@ -501,14 +528,18 @@ fn root_service_handoff_keeps_the_bootstrap_process_privileged() {
 
     let resolve = root_action("resolve", ActionKind::IdentityResolve);
     let mut drop = root_action("drop", ActionKind::ProcessDropPrivileges);
-    drop.depends_on = vec!["resolve".to_owned()];
+    drop.set_depends_on(vec!["resolve".to_owned()]);
     let mut handoff = root_action("handoff", ActionKind::HandoffExec);
-    handoff.depends_on = vec!["drop".to_owned()];
+    handoff.set_depends_on(vec!["drop".to_owned()]);
     let mut config = config(Path::new("/tmp"), vec![handoff, drop, resolve]);
-    config.identity.default_user = Some("nobody".to_owned());
-    config.identity.default_uid = Some(65_534);
-    config.identity.default_gid = Some(65_534);
-    config.handoff.ssh_daemon = Some("/bin/sshd".to_owned());
+    config
+        .identity_mut()
+        .set_default_user(Some("nobody".to_owned()));
+    config.identity_mut().set_default_uid(Some(65_534));
+    config.identity_mut().set_default_gid(Some(65_534));
+    config
+        .handoff_mut()
+        .set_ssh_daemon(Some("/bin/sshd".to_owned()));
     let plan = config.build_plan().unwrap();
 
     let report = executor(config)
@@ -525,9 +556,9 @@ fn root_service_handoff_keeps_the_bootstrap_process_privileged() {
 fn unexpected_symlink_components_are_rejected_before_mutation() {
     let temp = TempDir::new().unwrap();
     let outside = TempDir::new().unwrap();
-    std::os::unix::fs::symlink(outside.path(), temp.path().join("escape")).unwrap();
+    symlink(outside.path(), temp.path().join("escape")).unwrap();
     let mut action = action("unsafe", ActionKind::FilesystemEnsureDir);
-    action.path = Some(temp.path().join("escape/new").display().to_string());
+    action.set_path(Some(temp.path().join("escape/new").display().to_string()));
     let resolve = root_action("resolve", ActionKind::IdentityResolve);
     let config = config(temp.path(), vec![action, resolve]);
     let plan = config.build_plan().unwrap();
@@ -535,7 +566,7 @@ fn unexpected_symlink_components_are_rejected_before_mutation() {
     assert!(matches!(
         error,
         CoreError::Annotated { origin, source, .. }
-            if origin.profile == "test-profile"
+            if origin.profile() == "test-profile"
                 && matches!(source.as_ref(), CoreError::Action { .. })
     ));
     assert!(!outside.path().join("new").exists());
@@ -554,11 +585,11 @@ fn ssh_prepare_generates_reconciles_and_preserves_host_keys() {
     let authorized_keys_source = temp.path().join("authorized_keys.pub");
     fs::write(&authorized_keys_source, "ssh-ed25519 AAAAunit-test\n").unwrap();
     let mut action = root_action("ssh", ActionKind::ServiceSshPrepare);
-    action.host_key_dir = Some(host_keys.display().to_string());
-    action.authorized_keys_dir = Some(authorized_keys.display().to_string());
-    action.runtime_dir = Some(runtime.display().to_string());
-    action.host_key_types = Some(vec!["ed25519".to_owned()]);
-    action.authorized_keys_source = Some(authorized_keys_source.display().to_string());
+    action.set_host_key_dir(Some(host_keys.display().to_string()));
+    action.set_authorized_keys_dir(Some(authorized_keys.display().to_string()));
+    action.set_runtime_dir(Some(runtime.display().to_string()));
+    action.set_host_key_types(Some(vec!["ed25519".to_owned()]));
+    action.set_authorized_keys_source(Some(authorized_keys_source.display().to_string()));
 
     let resolve = root_action("resolve", ActionKind::IdentityResolve);
     let config = config(temp.path(), vec![action, resolve]);
@@ -611,11 +642,11 @@ fn ssh_prepare_requires_capability_and_refuses_authorized_key_overwrite() {
 
     let temp = TempDir::new().unwrap();
     let mut action = root_action("ssh", ActionKind::ServiceSshPrepare);
-    action.host_key_dir = Some(temp.path().join("ssh").display().to_string());
-    action.authorized_keys_dir = Some(temp.path().join("authorized").display().to_string());
-    action.runtime_dir = Some(temp.path().join("run").display().to_string());
-    action.host_key_types = Some(vec!["ed25519".to_owned()]);
-    action.content = Some("ssh-ed25519 AAAAone\n".to_owned());
+    action.set_host_key_dir(Some(temp.path().join("ssh").display().to_string()));
+    action.set_authorized_keys_dir(Some(temp.path().join("authorized").display().to_string()));
+    action.set_runtime_dir(Some(temp.path().join("run").display().to_string()));
+    action.set_host_key_types(Some(vec!["ed25519".to_owned()]));
+    action.set_content(Some("ssh-ed25519 AAAAone\n".to_owned()));
 
     let resolve = root_action("resolve", ActionKind::IdentityResolve);
     let config = config(temp.path(), vec![action, resolve]);
@@ -631,7 +662,7 @@ fn ssh_prepare_requires_capability_and_refuses_authorized_key_overwrite() {
         .with_options(ExecutionOptions::default().with_ssh(SshCapability::new(&keygen)));
     runner.execute_plan(&plan).unwrap();
     let mut changed = runner.config().clone();
-    changed.actions[0].content = Some("ssh-ed25519 AAAAtwo\n".to_owned());
+    changed.actions_mut()[0].set_content(Some("ssh-ed25519 AAAAtwo\n".to_owned()));
     let changed_plan = changed.build_plan().unwrap();
     let error = PlanExecutor::new(changed, RuntimeContext::new(temp.path()))
         .with_options(ExecutionOptions::default().with_ssh(SshCapability::new(&keygen)))
@@ -651,10 +682,10 @@ fn ssh_prepare_rejects_incomplete_or_symlinked_host_keys() {
     fs::create_dir_all(&host_keys).unwrap();
     fs::write(host_keys.join("ssh_host_ed25519_key"), "private").unwrap();
     let mut action = root_action("ssh", ActionKind::ServiceSshPrepare);
-    action.host_key_dir = Some(host_keys.display().to_string());
-    action.authorized_keys_dir = Some(temp.path().join("authorized").display().to_string());
-    action.runtime_dir = Some(temp.path().join("run").display().to_string());
-    action.host_key_types = Some(vec!["ed25519".to_owned()]);
+    action.set_host_key_dir(Some(host_keys.display().to_string()));
+    action.set_authorized_keys_dir(Some(temp.path().join("authorized").display().to_string()));
+    action.set_runtime_dir(Some(temp.path().join("run").display().to_string()));
+    action.set_host_key_types(Some(vec!["ed25519".to_owned()]));
     let resolve = root_action("resolve", ActionKind::IdentityResolve);
     let config = config(temp.path(), vec![action, resolve]);
     let plan = config.build_plan().unwrap();
@@ -686,9 +717,9 @@ fn cgroup_v2_init_delegates_controllers_and_moves_processes() {
     fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
 
     let mut action = root_action("cg", ActionKind::CgroupV2Init);
-    action.path = Some(cgroup_dir.display().to_string());
-    action.subgroup = Some("libpod_parent".to_string());
-    action.controllers = Some(vec!["cpu".to_string(), "memory".to_string()]);
+    action.set_path(Some(cgroup_dir.display().to_string()));
+    action.set_subgroup(Some("libpod_parent".to_string()));
+    action.set_controllers(Some(vec!["cpu".to_string(), "memory".to_string()]));
 
     let config = config(temp.path(), vec![action]);
     let plan = config.build_plan().unwrap();
@@ -736,20 +767,20 @@ fn cgroup_v2_init_initializes_explicit_nested_cpuset_parent() {
     fs::write(parent.join("cpuset.mems"), "\n").unwrap();
 
     let mut action = root_action("cg", ActionKind::CgroupV2Init);
-    action.path = Some(cgroup_dir.display().to_string());
-    action.subgroup = Some("libpod_parent".to_owned());
-    action.controllers = Some(vec!["cpu".to_owned(), "pids".to_owned()]);
-    action.optional_controllers = Some(vec!["cpuset".to_owned()]);
-    action.subgroup_type = Some("threaded".to_owned());
-    action.subgroup_controllers = Some(vec![
+    action.set_path(Some(cgroup_dir.display().to_string()));
+    action.set_subgroup(Some("libpod_parent".to_owned()));
+    action.set_controllers(Some(vec!["cpu".to_owned(), "pids".to_owned()]));
+    action.set_optional_controllers(Some(vec!["cpuset".to_owned()]));
+    action.set_subgroup_type(Some("threaded".to_owned()));
+    action.set_subgroup_controllers(Some(vec![
         "cpuset".to_owned(),
         "cpu".to_owned(),
         "pids".to_owned(),
-    ]);
-    action.subgroup_controller_values = Some(BTreeMap::from([
+    ]));
+    action.set_subgroup_controller_values(Some(BTreeMap::from([
         ("cpuset.cpus".to_owned(), "cpuset.cpus.effective".to_owned()),
         ("cpuset.mems".to_owned(), "cpuset.mems.effective".to_owned()),
-    ]));
+    ])));
 
     let config = config(temp.path(), vec![action]);
     let plan = config.build_plan().unwrap();
@@ -783,16 +814,12 @@ fn cgroup_v2_init_can_preserve_the_supervisor_process() {
     let cgroup_dir = temp.path().join("cgroup");
     fs::create_dir_all(&cgroup_dir).unwrap();
     fs::write(cgroup_dir.join("cgroup.controllers"), "cpu\n").unwrap();
-    fs::write(
-        cgroup_dir.join("cgroup.procs"),
-        format!("{}\n1001\n", std::process::id()),
-    )
-    .unwrap();
+    fs::write(cgroup_dir.join("cgroup.procs"), format!("{}\n1001\n", id())).unwrap();
     fs::write(cgroup_dir.join("cgroup.subtree_control"), "cpu ").unwrap();
 
     let mut action = root_action("cg", ActionKind::CgroupV2Init);
-    action.path = Some(cgroup_dir.display().to_string());
-    action.controllers = Some(vec!["cpu".to_owned()]);
+    action.set_path(Some(cgroup_dir.display().to_string()));
+    action.set_controllers(Some(vec!["cpu".to_owned()]));
     let config = config(temp.path(), vec![action]);
     let plan = config.build_plan().unwrap();
     executor(config)
@@ -802,9 +829,7 @@ fn cgroup_v2_init_can_preserve_the_supervisor_process() {
 
     let subgroup = fs::read_to_string(cgroup_dir.join("libpod_parent/cgroup.procs")).unwrap();
     assert!(subgroup.lines().any(|pid| pid == "1001"));
-    assert!(!subgroup
-        .lines()
-        .any(|pid| pid == std::process::id().to_string()));
+    assert!(!subgroup.lines().any(|pid| pid == id().to_string()));
 }
 
 #[test]
@@ -819,7 +844,7 @@ fn cgroup_v2_init_fails_on_unavailable_controller_or_missing_cgroup() {
 
     // 1. Missing cgroup.controllers
     let mut action = root_action("cg", ActionKind::CgroupV2Init);
-    action.path = Some(cgroup_dir.display().to_string());
+    action.set_path(Some(cgroup_dir.display().to_string()));
     let cfg = config(temp.path(), vec![action.clone()]);
     let plan = cfg.build_plan().unwrap();
     let err = executor(cfg).execute_plan(&plan).unwrap_err();
@@ -828,7 +853,7 @@ fn cgroup_v2_init_fails_on_unavailable_controller_or_missing_cgroup() {
     // 2. Request controller not in cgroup.controllers
     fs::write(cgroup_dir.join("cgroup.controllers"), "cpu memory\n").unwrap();
     fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
-    action.controllers = Some(vec!["unsupported_controller".to_string()]);
+    action.set_controllers(Some(vec!["unsupported_controller".to_string()]));
     let cfg2 = config(temp.path(), vec![action]);
     let plan2 = cfg2.build_plan().unwrap();
     let err2 = executor(cfg2).execute_plan(&plan2).unwrap_err();
@@ -849,9 +874,9 @@ fn cgroup_v2_init_skips_unavailable_optional_controllers() {
     fs::write(cgroup_dir.join("cgroup.subtree_control"), "").unwrap();
 
     let mut action = root_action("cg", ActionKind::CgroupV2Init);
-    action.path = Some(cgroup_dir.display().to_string());
-    action.controllers = Some(vec!["cpu".to_owned()]);
-    action.optional_controllers = Some(vec!["io".to_owned(), "memory".to_owned()]);
+    action.set_path(Some(cgroup_dir.display().to_string()));
+    action.set_controllers(Some(vec!["cpu".to_owned()]));
+    action.set_optional_controllers(Some(vec!["io".to_owned(), "memory".to_owned()]));
     let config = config(temp.path(), vec![action]);
     let plan = config.build_plan().unwrap();
     let report = executor(config).execute_plan(&plan).unwrap();
@@ -882,8 +907,8 @@ fn cgroup_v2_init_skips_optional_controller_write_errors() {
     symlink("/proc/uptime", cgroup_dir.join("cgroup.subtree_control")).unwrap();
 
     let mut action = root_action("cg", ActionKind::CgroupV2Init);
-    action.path = Some(cgroup_dir.display().to_string());
-    action.optional_controllers = Some(vec!["memory".to_owned()]);
+    action.set_path(Some(cgroup_dir.display().to_string()));
+    action.set_optional_controllers(Some(vec!["memory".to_owned()]));
     let config = config(temp.path(), vec![action]);
     let plan = config.build_plan().unwrap();
     let report = executor(config).execute_plan(&plan).unwrap();
@@ -916,11 +941,11 @@ fn cgroup_v2_init_bind_mount_mode_shadows_and_delegates() {
     fs::write(shadow_dir.join("cgroup.subtree_control"), "").unwrap();
 
     let mut action = root_action("cg_bind", ActionKind::CgroupV2Init);
-    action.path = Some(target_dir.display().to_string());
-    action.shadow_path = Some(shadow_dir.display().to_string());
-    action.mount_mode = Some("bind_mount".to_string());
-    action.subgroup = Some("libpod_parent".to_string());
-    action.controllers = Some(vec!["cpu".to_string(), "pids".to_string()]);
+    action.set_path(Some(target_dir.display().to_string()));
+    action.set_shadow_path(Some(shadow_dir.display().to_string()));
+    action.set_mount_mode(Some("bind_mount".to_string()));
+    action.set_subgroup(Some("libpod_parent".to_string()));
+    action.set_controllers(Some(vec!["cpu".to_string(), "pids".to_string()]));
 
     let config = config(temp.path(), vec![action]);
     let plan = config.build_plan().unwrap();

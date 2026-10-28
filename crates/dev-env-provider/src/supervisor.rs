@@ -1,4 +1,4 @@
-use crate::{ProviderContext, ProviderRunResult, ProviderRunner, ProviderRuntimeError};
+use crate::{ProviderContext, ProviderRunResult, ProviderRuntimeError};
 use dev_env_model::{EffectiveIdentity, Generation, ProviderConfig};
 
 /// Owned input for one provider operation. A backend creates a job once and
@@ -6,6 +6,17 @@ use dev_env_model::{EffectiveIdentity, Generation, ProviderConfig};
 /// boundary for provider commands.
 #[derive(Clone, Debug)]
 pub struct ProviderJob {
+    job_id: String,
+    request_id: String,
+    generation: Generation,
+    provider_id: String,
+    config: ProviderConfig,
+    context: ProviderContext,
+    identity: EffectiveIdentity,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderJobParts {
     pub job_id: String,
     pub request_id: String,
     pub generation: Generation,
@@ -16,24 +27,44 @@ pub struct ProviderJob {
 }
 
 impl ProviderJob {
-    pub fn new(
-        job_id: impl Into<String>,
-        request_id: impl Into<String>,
-        generation: Generation,
-        provider_id: impl Into<String>,
-        config: ProviderConfig,
-        context: ProviderContext,
-        identity: EffectiveIdentity,
-    ) -> Self {
+    pub fn new(parts: ProviderJobParts) -> Self {
         Self {
-            job_id: job_id.into(),
-            request_id: request_id.into(),
-            generation,
-            provider_id: provider_id.into(),
-            config,
-            context,
-            identity,
+            job_id: parts.job_id,
+            request_id: parts.request_id,
+            generation: parts.generation,
+            provider_id: parts.provider_id,
+            config: parts.config,
+            context: parts.context,
+            identity: parts.identity,
         }
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn generation(&self) -> &Generation {
+        &self.generation
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn config(&self) -> &ProviderConfig {
+        &self.config
+    }
+
+    pub fn context(&self) -> &ProviderContext {
+        &self.context
+    }
+
+    pub fn identity(&self) -> &EffectiveIdentity {
+        &self.identity
     }
 
     /// Build a job for the compatibility materializer path. Backend callers
@@ -43,15 +74,15 @@ impl ProviderJob {
         config: ProviderConfig,
         context: ProviderContext,
     ) -> Self {
-        Self::new(
-            "legacy-materialize",
-            "legacy-materialize",
-            Generation::new(0),
-            provider_id,
+        Self::new(ProviderJobParts {
+            job_id: "legacy-materialize".to_owned(),
+            request_id: "legacy-materialize".to_owned(),
+            generation: Generation::new(0),
+            provider_id: provider_id.into(),
             config,
             context,
-            EffectiveIdentity::root(),
-        )
+            identity: EffectiveIdentity::root(),
+        })
     }
 }
 
@@ -67,16 +98,5 @@ pub trait ProviderSupervisor: Send + Sync {
 
     fn run(&self, job: &ProviderJob) -> Result<ProviderRunResult, ProviderRuntimeError> {
         self.prepare(job)
-    }
-}
-
-impl ProviderSupervisor for ProviderRunner {
-    fn prepare(&self, job: &ProviderJob) -> Result<ProviderRunResult, ProviderRuntimeError> {
-        self.run_with_identity(
-            &job.provider_id,
-            &job.config,
-            &job.context,
-            Some(&job.identity),
-        )
     }
 }

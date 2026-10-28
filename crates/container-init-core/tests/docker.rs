@@ -1,48 +1,31 @@
 use container_init_bootstrap_model::{
-    Action, ActionKind, BootstrapConfig, BootstrapMode, BootstrapPolicy, HandoffConfig,
-    IdentityConfig, NonInteractivePolicy, Origin, RunAs,
+    Action, ActionKind, BootstrapConfig, HandoffConfig, IdentityConfig, Origin, RunAs,
 };
 use container_init_core::{
     ExecutionOptions, PlanExecutor, PosixSystem, RuntimeContext, SshCapability,
 };
-use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path};
 use tempfile::TempDir;
 
 fn fixture_config(root: &Path, actions: Vec<Action>) -> BootstrapConfig {
     let (uid, gid) = PosixSystem::new().current_ids();
-    BootstrapConfig {
-        schema: 1,
-        mode: BootstrapMode::Strict,
-        workspace_root: root.display().to_string(),
-        allow_workspace_overlay: false,
-        non_interactive: NonInteractivePolicy::Deny,
-        identity: IdentityConfig {
-            default_user: Some("root".to_owned()),
-            default_uid: Some(uid),
-            default_gid: Some(gid),
-            default_home: None,
-            auto_mapping: false,
-            run_as_root_input: None,
-            uid_input: None,
-            gid_input: None,
-            home_input: None,
-        },
-        handoff: HandoffConfig {
-            runtime: "/bin/sh".to_owned(),
-            exec_prefix: vec!["-c".to_owned()],
-            initial_exec_prefix: vec!["-c".to_owned()],
-            shell_prefix: vec!["-c".to_owned(), "true".to_owned()],
-            root_service: false,
-            ssh_daemon: None,
-            login_shell: None,
-        },
-        policy: BootstrapPolicy::default(),
-        inputs: BTreeMap::new(),
+    let mut identity = IdentityConfig::new();
+    identity.set_default_user(Some("root".to_owned()));
+    identity.set_default_uid(Some(uid));
+    identity.set_default_gid(Some(gid));
+
+    let mut handoff = HandoffConfig::new("/bin/sh");
+    handoff.set_exec_prefix(vec!["-c".to_owned()]);
+    handoff.set_initial_exec_prefix(vec!["-c".to_owned()]);
+    handoff.set_shell_prefix(vec!["-c".to_owned(), "true".to_owned()]);
+
+    BootstrapConfig::new(
+        root.display().to_string(),
+        identity,
+        handoff,
+        BTreeMap::new(),
         actions,
-    }
+    )
 }
 
 fn action(id: &str, kind: ActionKind) -> Action {
@@ -63,31 +46,31 @@ fn executes_real_linux_filesystem_primitives_as_root() {
     let file = state.join("marker");
     let link = temp.path().join("state-link");
     let mut resolve = action("resolve", ActionKind::IdentityResolve);
-    resolve.run_as = RunAs::Root;
+    resolve.set_run_as(RunAs::Root);
     let mut directory = action("directory", ActionKind::FilesystemEnsureDir);
-    directory.path = Some(state.display().to_string());
-    directory.mode = Some("0750".to_owned());
-    directory.owner = Some("root".to_owned());
-    directory.run_as = RunAs::Root;
-    directory.depends_on = vec!["resolve".to_owned()];
+    directory.set_path(Some(state.display().to_string()));
+    directory.set_mode(Some("0750".to_owned()));
+    directory.set_owner(Some("root".to_owned()));
+    directory.set_run_as(RunAs::Root);
+    directory.set_depends_on(vec!["resolve".to_owned()]);
     let mut marker = action("marker", ActionKind::FilesystemEnsureFile);
-    marker.path = Some(file.display().to_string());
-    marker.content = Some("docker integration\n".to_owned());
-    marker.mode = Some("0640".to_owned());
-    marker.owner = Some("root".to_owned());
-    marker.run_as = RunAs::Root;
-    marker.depends_on = vec!["directory".to_owned()];
+    marker.set_path(Some(file.display().to_string()));
+    marker.set_content(Some("docker integration\n".to_owned()));
+    marker.set_mode(Some("0640".to_owned()));
+    marker.set_owner(Some("root".to_owned()));
+    marker.set_run_as(RunAs::Root);
+    marker.set_depends_on(vec!["directory".to_owned()]);
     let mut symlink = action("link", ActionKind::FilesystemEnsureSymlink);
-    symlink.link = Some(link.display().to_string());
-    symlink.target = Some(file.display().to_string());
-    symlink.owner = Some("root".to_owned());
-    symlink.run_as = RunAs::Root;
-    symlink.depends_on = vec!["marker".to_owned()];
+    symlink.set_link(Some(link.display().to_string()));
+    symlink.set_target(Some(file.display().to_string()));
+    symlink.set_owner(Some("root".to_owned()));
+    symlink.set_run_as(RunAs::Root);
+    symlink.set_depends_on(vec!["marker".to_owned()]);
     let mut chmod = action("chmod", ActionKind::FilesystemChmod);
-    chmod.path = Some(state.display().to_string());
-    chmod.mode = Some("0700".to_owned());
-    chmod.run_as = RunAs::Root;
-    chmod.depends_on = vec!["link".to_owned()];
+    chmod.set_path(Some(state.display().to_string()));
+    chmod.set_mode(Some("0700".to_owned()));
+    chmod.set_run_as(RunAs::Root);
+    chmod.set_depends_on(vec!["link".to_owned()]);
 
     let config = fixture_config(
         temp.path(),
@@ -125,15 +108,15 @@ fn executes_real_openssh_preparation_and_is_idempotent() {
     let authorized_keys = temp.path().join("etc/ssh/authorized_keys");
     let runtime = temp.path().join("run/sshd");
     let mut ssh = action("ssh", ActionKind::ServiceSshPrepare);
-    ssh.run_as = RunAs::Root;
-    ssh.host_key_dir = Some(host_keys.display().to_string());
-    ssh.authorized_keys_dir = Some(authorized_keys.display().to_string());
-    ssh.runtime_dir = Some(runtime.display().to_string());
-    ssh.host_key_types = Some(vec!["ed25519".to_owned()]);
-    ssh.content = Some("ssh-ed25519 AAAAdocker-test\n".to_owned());
+    ssh.set_run_as(RunAs::Root);
+    ssh.set_host_key_dir(Some(host_keys.display().to_string()));
+    ssh.set_authorized_keys_dir(Some(authorized_keys.display().to_string()));
+    ssh.set_runtime_dir(Some(runtime.display().to_string()));
+    ssh.set_host_key_types(Some(vec!["ed25519".to_owned()]));
+    ssh.set_content(Some("ssh-ed25519 AAAAdocker-test\n".to_owned()));
 
     let mut resolve = action("resolve", ActionKind::IdentityResolve);
-    resolve.run_as = RunAs::Root;
+    resolve.set_run_as(RunAs::Root);
     let config = fixture_config(temp.path(), vec![ssh, resolve]);
     let plan = config.build_plan().unwrap();
     let runner = PlanExecutor::new(config, RuntimeContext::new(temp.path()))
@@ -182,13 +165,13 @@ fn executes_real_cgroup_v2_init_as_root() {
 
     let temp = TempDir::new().unwrap();
     let mut resolve = action("resolve", ActionKind::IdentityResolve);
-    resolve.run_as = RunAs::Root;
+    resolve.set_run_as(RunAs::Root);
 
     // Test 1: Real cgroup v2 init on /sys/fs/cgroup with default subgroup "libpod_parent"
     let mut cg = action("cg-init", ActionKind::CgroupV2Init);
-    cg.run_as = RunAs::Root;
-    cg.subgroup = Some("libpod_parent".to_owned());
-    cg.depends_on = vec!["resolve".to_owned()];
+    cg.set_run_as(RunAs::Root);
+    cg.set_subgroup(Some("libpod_parent".to_owned()));
+    cg.set_depends_on(vec!["resolve".to_owned()]);
 
     let config = fixture_config(temp.path(), vec![cg, resolve.clone()]);
     let plan = config.build_plan().unwrap();
@@ -224,11 +207,11 @@ fn executes_real_cgroup_v2_init_as_root() {
     fs::create_dir_all(&child_cgroup).unwrap();
 
     let mut nested_cg = action("nested-cg", ActionKind::CgroupV2Init);
-    nested_cg.run_as = RunAs::Root;
-    nested_cg.path = Some(child_cgroup.display().to_string());
-    nested_cg.subgroup = Some("child_worker".to_owned());
-    nested_cg.controllers = Some(vec!["memory".to_owned(), "pids".to_owned()]);
-    nested_cg.depends_on = vec!["resolve".to_owned()];
+    nested_cg.set_run_as(RunAs::Root);
+    nested_cg.set_path(Some(child_cgroup.display().to_string()));
+    nested_cg.set_subgroup(Some("child_worker".to_owned()));
+    nested_cg.set_controllers(Some(vec!["memory".to_owned(), "pids".to_owned()]));
+    nested_cg.set_depends_on(vec!["resolve".to_owned()]);
 
     let nested_config = fixture_config(temp.path(), vec![nested_cg, resolve]);
     let nested_plan = nested_config.build_plan().unwrap();
@@ -262,16 +245,16 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
     fs::create_dir_all(&target_path).unwrap();
 
     let mut resolve = action("resolve", ActionKind::IdentityResolve);
-    resolve.run_as = RunAs::Root;
+    resolve.set_run_as(RunAs::Root);
 
     let mut cg = action("cg-bind", ActionKind::CgroupV2Init);
-    cg.run_as = RunAs::Root;
-    cg.mount_mode = Some("bind_mount".to_owned());
-    cg.shadow_path = Some(shadow_path.display().to_string());
-    cg.path = Some(target_path.display().to_string());
-    cg.subgroup = Some("libpod_parent".to_owned());
-    cg.controllers = Some(vec!["pids".to_owned()]);
-    cg.depends_on = vec!["resolve".to_owned()];
+    cg.set_run_as(RunAs::Root);
+    cg.set_mount_mode(Some("bind_mount".to_owned()));
+    cg.set_shadow_path(Some(shadow_path.display().to_string()));
+    cg.set_path(Some(target_path.display().to_string()));
+    cg.set_subgroup(Some("libpod_parent".to_owned()));
+    cg.set_controllers(Some(vec!["pids".to_owned()]));
+    cg.set_depends_on(vec!["resolve".to_owned()]);
 
     let config = fixture_config(temp.path(), vec![cg, resolve]);
     let plan = config.build_plan().unwrap();
@@ -298,19 +281,21 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_unprivileged_non_root() {
     let target_path = Path::new("/sys/fs/cgroup");
 
     let mut resolve = action("resolve", ActionKind::IdentityResolve);
-    resolve.run_as = RunAs::Root;
+    resolve.set_run_as(RunAs::Root);
 
     let mut cg = action("cg-bind", ActionKind::CgroupV2Init);
-    cg.run_as = RunAs::Root;
-    cg.mount_mode = Some("bind_mount".to_owned());
-    cg.shadow_path = Some(shadow_path.display().to_string());
-    cg.path = Some(target_path.display().to_string());
-    cg.depends_on = vec!["resolve".to_owned()];
+    cg.set_run_as(RunAs::Root);
+    cg.set_mount_mode(Some("bind_mount".to_owned()));
+    cg.set_shadow_path(Some(shadow_path.display().to_string()));
+    cg.set_path(Some(target_path.display().to_string()));
+    cg.set_depends_on(vec!["resolve".to_owned()]);
 
     let mut config = fixture_config(temp.path(), vec![cg, resolve]);
-    config.identity.default_user = Some("nobody".to_owned());
-    config.identity.default_uid = Some(65534);
-    config.identity.default_gid = Some(65534);
+    config
+        .identity_mut()
+        .set_default_user(Some("nobody".to_owned()));
+    config.identity_mut().set_default_uid(Some(65534));
+    config.identity_mut().set_default_gid(Some(65534));
 
     let plan = config.build_plan().unwrap();
     let runner = PlanExecutor::new(config, RuntimeContext::new(temp.path()));
@@ -334,19 +319,23 @@ fn executes_real_home_ownership_reconciliation_between_root_and_dev() {
 
     // 1. Bootstrap as dev (UID 1000, GID 1000)
     let mut resolve_dev = action("resolve", ActionKind::IdentityResolve);
-    resolve_dev.run_as = RunAs::Root;
+    resolve_dev.set_run_as(RunAs::Root);
     let mut ensure_home_dev = action("ensure-home", ActionKind::IdentityEnsureHome);
-    ensure_home_dev.path = Some(user_home.display().to_string());
-    ensure_home_dev.owner = Some("identity.target".to_owned());
-    ensure_home_dev.mode = Some("0755".to_owned());
-    ensure_home_dev.run_as = RunAs::Root;
-    ensure_home_dev.depends_on = vec!["resolve".to_owned()];
+    ensure_home_dev.set_path(Some(user_home.display().to_string()));
+    ensure_home_dev.set_owner(Some("identity.target".to_owned()));
+    ensure_home_dev.set_mode(Some("0755".to_owned()));
+    ensure_home_dev.set_run_as(RunAs::Root);
+    ensure_home_dev.set_depends_on(vec!["resolve".to_owned()]);
 
     let mut config_dev = fixture_config(temp.path(), vec![ensure_home_dev, resolve_dev]);
-    config_dev.identity.default_uid = Some(1000);
-    config_dev.identity.default_gid = Some(1000);
-    config_dev.identity.default_user = Some("dev".to_owned());
-    config_dev.identity.default_home = Some(user_home.display().to_string());
+    config_dev.identity_mut().set_default_uid(Some(1000));
+    config_dev.identity_mut().set_default_gid(Some(1000));
+    config_dev
+        .identity_mut()
+        .set_default_user(Some("dev".to_owned()));
+    config_dev
+        .identity_mut()
+        .set_default_home(Some(user_home.display().to_string()));
 
     let plan_dev = config_dev.build_plan().unwrap();
     let runner_dev = PlanExecutor::new(config_dev.clone(), RuntimeContext::new(temp.path()));
@@ -363,19 +352,23 @@ fn executes_real_home_ownership_reconciliation_between_root_and_dev() {
 
     // 2. Now enter/bootstrap as root (UID 0, GID 0)
     let mut resolve_root = action("resolve", ActionKind::IdentityResolve);
-    resolve_root.run_as = RunAs::Root;
+    resolve_root.set_run_as(RunAs::Root);
     let mut ensure_home_root = action("ensure-home", ActionKind::IdentityEnsureHome);
-    ensure_home_root.path = Some(user_home.display().to_string());
-    ensure_home_root.owner = Some("identity.target".to_owned());
-    ensure_home_root.mode = Some("0755".to_owned());
-    ensure_home_root.run_as = RunAs::Root;
-    ensure_home_root.depends_on = vec!["resolve".to_owned()];
+    ensure_home_root.set_path(Some(user_home.display().to_string()));
+    ensure_home_root.set_owner(Some("identity.target".to_owned()));
+    ensure_home_root.set_mode(Some("0755".to_owned()));
+    ensure_home_root.set_run_as(RunAs::Root);
+    ensure_home_root.set_depends_on(vec!["resolve".to_owned()]);
 
     let mut config_root = fixture_config(temp.path(), vec![ensure_home_root, resolve_root]);
-    config_root.identity.default_uid = Some(0);
-    config_root.identity.default_gid = Some(0);
-    config_root.identity.default_user = Some("root".to_owned());
-    config_root.identity.default_home = Some(user_home.display().to_string());
+    config_root.identity_mut().set_default_uid(Some(0));
+    config_root.identity_mut().set_default_gid(Some(0));
+    config_root
+        .identity_mut()
+        .set_default_user(Some("root".to_owned()));
+    config_root
+        .identity_mut()
+        .set_default_home(Some(user_home.display().to_string()));
 
     let plan_root = config_root.build_plan().unwrap();
     let runner_root = PlanExecutor::new(config_root, RuntimeContext::new(temp.path()));

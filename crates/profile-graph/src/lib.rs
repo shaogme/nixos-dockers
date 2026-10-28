@@ -3,9 +3,7 @@
 //! This crate knows only profile ids and parent relationships. Product
 //! loaders remain responsible for parsing profile documents and merging them.
 
-use std::collections::BTreeSet;
-use std::error::Error;
-use std::fmt;
+use std::{collections::BTreeSet, error::Error, fmt};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProfileGraphError {
@@ -48,6 +46,24 @@ impl fmt::Display for ProfileGraphError {
 }
 
 impl Error for ProfileGraphError {}
+
+#[derive(Debug)]
+pub enum ResolveError<E> {
+    Graph(ProfileGraphError),
+    Source(E),
+}
+
+#[derive(Debug)]
+pub enum TraverseError<E> {
+    Graph(ProfileGraphError),
+    Source(E),
+}
+
+struct VisitState {
+    max_depth: usize,
+    visiting: Vec<String>,
+    visited: BTreeSet<String>,
+}
 
 /// Validate the common profile id syntax used by the profile DSLs.
 pub fn validate_profile_id(id: &str) -> Result<(), ProfileGraphError> {
@@ -99,12 +115,6 @@ pub fn resolve_order<E>(
     Ok(order)
 }
 
-#[derive(Debug)]
-pub enum ResolveError<E> {
-    Graph(ProfileGraphError),
-    Source(E),
-}
-
 impl<E> From<TraverseError<E>> for ResolveError<E> {
     fn from(error: TraverseError<E>) -> Self {
         match error {
@@ -133,45 +143,34 @@ pub fn traverse_with_max_depth<T, E>(
     mut load: impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, E>,
     mut apply: impl FnMut(&str, T) -> Result<(), E>,
 ) -> Result<(), TraverseError<E>> {
-    let mut visiting = Vec::new();
-    let mut visited = BTreeSet::new();
-    visit(
-        root,
-        &mut load,
-        &mut apply,
+    let mut state = VisitState {
         max_depth,
-        None,
-        &mut visiting,
-        &mut visited,
-    )
-}
-
-#[derive(Debug)]
-pub enum TraverseError<E> {
-    Graph(ProfileGraphError),
-    Source(E),
+        visiting: Vec::new(),
+        visited: BTreeSet::new(),
+    };
+    visit(root, None, &mut load, &mut apply, &mut state)
 }
 
 fn visit<T, E>(
     id: &str,
+    parent: Option<&str>,
     load: &mut impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, E>,
     apply: &mut impl FnMut(&str, T) -> Result<(), E>,
-    max_depth: usize,
-    parent: Option<&str>,
-    visiting: &mut Vec<String>,
-    visited: &mut BTreeSet<String>,
+    state: &mut VisitState,
 ) -> Result<(), TraverseError<E>> {
-    if let Some(index) = visiting.iter().position(|current| current == id) {
-        let mut cycle = visiting[index..].to_vec();
+    if let Some(index) = state.visiting.iter().position(|current| current == id) {
+        let mut cycle = state.visiting[index..].to_vec();
         cycle.push(id.to_owned());
         return Err(TraverseError::Graph(ProfileGraphError::Cycle(cycle)));
     }
-    if visiting.len() >= max_depth {
+    if state.visiting.len() >= state.max_depth {
         return Err(TraverseError::Graph(
-            ProfileGraphError::InheritanceDepthExceeded { limit: max_depth },
+            ProfileGraphError::InheritanceDepthExceeded {
+                limit: state.max_depth,
+            },
         ));
     }
-    if visited.contains(id) {
+    if state.visited.contains(id) {
         return Ok(());
     }
 
@@ -188,12 +187,12 @@ fn visit<T, E>(
     };
     validate_extends(id, &parents).map_err(TraverseError::Graph)?;
 
-    visiting.push(id.to_owned());
+    state.visiting.push(id.to_owned());
     for parent in &parents {
-        visit(parent, load, apply, max_depth, Some(id), visiting, visited)?;
+        visit(parent, Some(id), load, apply, state)?;
     }
-    visiting.pop();
-    visited.insert(id.to_owned());
+    state.visiting.pop();
+    state.visited.insert(id.to_owned());
     apply(id, value).map_err(TraverseError::Source)?;
     Ok(())
 }

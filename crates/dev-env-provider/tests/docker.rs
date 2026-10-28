@@ -1,15 +1,19 @@
 use dev_env_model::{
-    FailurePolicy, MaterializedEnv, MissingProviderPolicy, PathMode, PrepareStep, ProviderConfig,
-    Sensitivity, ShellEnvConfig, ShellEnvFormat, ValueTree,
+    EnvValue, FailurePolicy, MaterializedEnv, MissingProviderPolicy, PathMode, PrepareStep,
+    ProviderConfig, Sensitivity, ShellEnvConfig, ShellEnvFormat, ValueTree,
 };
 use dev_env_provider::{
     ProviderContext, ProviderRunner, ProviderRuntimeError, ProviderRuntimeErrorKind,
 };
-use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::BTreeMap,
+    env::temp_dir,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::id,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 struct TempWorkspace {
     path: PathBuf,
@@ -18,9 +22,9 @@ struct TempWorkspace {
 impl TempWorkspace {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = temp_dir().join(format!(
             "dev-env-provider-docker-{}-{}",
-            std::process::id(),
+            id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
@@ -35,36 +39,35 @@ impl Drop for TempWorkspace {
 }
 
 fn provider_config(executable: &Path, shellenv: ShellEnvConfig) -> ProviderConfig {
-    ProviderConfig {
-        executable: executable.display().to_string(),
-        detect_files: vec!["project.config".to_owned()],
-        missing: MissingProviderPolicy::Error,
-        depends_on: Vec::new(),
-        prepare: vec![PrepareStep {
-            argv: vec![
+    ProviderConfig::new(
+        executable.display().to_string(),
+        vec!["project.config".to_owned()],
+        MissingProviderPolicy::Error,
+        Vec::new(),
+        vec![PrepareStep::new(
+            vec![
                 "prepare".to_owned(),
                 "{shell}".to_owned(),
                 "{workspace}".to_owned(),
                 "literal;$(not-a-command)".to_owned(),
             ],
-            when: Some("workspace.config-present && features.tool.mode == 'enabled'".to_owned()),
-            failure: FailurePolicy::Error,
-            timeout_ms: Some(1_000),
-            sensitivity: Sensitivity::Public,
-        }],
-        shellenv: Some(shellenv),
-        sensitivity: Sensitivity::Public,
-    }
+            Some("workspace.config-present && features.tool.mode == 'enabled'".to_owned()),
+            FailurePolicy::Error,
+            Some(1_000),
+            Sensitivity::Public,
+        )],
+    )
+    .with_shellenv(shellenv)
 }
 
 fn shellenv(format: ShellEnvFormat) -> ShellEnvConfig {
-    ShellEnvConfig {
-        argv: vec!["env".to_owned(), "{shell}".to_owned()],
+    ShellEnvConfig::new(
+        vec!["env".to_owned(), "{shell}".to_owned()],
         format,
-        failure: FailurePolicy::Error,
-        path_mode: PathMode::Merge,
-        timeout_ms: Some(1_000),
-    }
+        FailurePolicy::Error,
+        PathMode::Merge,
+        Some(1_000),
+    )
 }
 
 fn context(workspace: &Path, log: &Path, mode: &str) -> ProviderContext {
@@ -152,16 +155,19 @@ fn runs_a_real_provider_process_and_materializes_its_environment() {
         )
         .unwrap();
 
-    assert!(result.detection.applicable);
+    assert!(result.detection().applicable);
     assert_eq!(
-        result.detection.matched_files,
+        result.detection().matched_files,
         vec![workspace.join("project.config")]
     );
-    assert_eq!(result.prepared_steps, 1);
-    assert_eq!(result.environment.set["FROM_PROVIDER"], "real-provider");
-    assert_eq!(result.environment.set["PROVIDER_PATH"], "/opt/provider/bin");
-    assert_eq!(result.environment.set["LEAK_CHECK"], "absent");
-    assert!(result.receipt.is_some());
+    assert_eq!(result.prepared_steps(), 1);
+    assert_eq!(result.environment().set()["FROM_PROVIDER"], "real-provider");
+    assert_eq!(
+        result.environment().set()["PROVIDER_PATH"],
+        "/opt/provider/bin"
+    );
+    assert_eq!(result.environment().set()["LEAK_CHECK"], "absent");
+    assert!(result.receipt().is_some());
 
     assert_eq!(
         fs::read_to_string(log).unwrap(),
@@ -172,15 +178,15 @@ fn runs_a_real_provider_process_and_materializes_its_environment() {
     );
 
     let mut environment = MaterializedEnv::new(
-        BTreeMap::from([("BASE".to_owned(), dev_env_model::EnvValue::public("value"))]),
+        BTreeMap::from([("BASE".to_owned(), EnvValue::public("value"))]),
         [9; 32],
     );
     result.apply_to(&mut environment);
     assert_eq!(
-        environment.values["FROM_PROVIDER"].provider.as_deref(),
+        environment.values()["FROM_PROVIDER"].provider(),
         Some("tool")
     );
-    assert_eq!(environment.provider_receipts.len(), 1);
+    assert_eq!(environment.provider_receipts().len(), 1);
 }
 
 #[test]
@@ -197,7 +203,7 @@ fn rejects_unsafe_output_from_a_real_provider_without_executing_it() {
 
     let mut provider_context = context(&workspace, &log, "reject");
     provider_context
-        .environment
+        .environment_mut()
         .insert("REJECT_MARKER".to_owned(), marker.display().to_string());
     let error = ProviderRunner::default()
         .run(

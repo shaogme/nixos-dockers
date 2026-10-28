@@ -1,9 +1,8 @@
-use crate::error::LoaderError;
-use crate::raw::parse_profile;
-use dev_env_model::{Layer, Origin, SourceId};
+use crate::{error::LoaderError, raw::RawProfile};
+use dev_env_model::{Layer, Origin, OverrideSpec, ResolvedConfig, SourceId};
 use serde::Serialize;
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
+use toml::Value;
 
 /// Origin class used by the loader to enforce trust boundaries.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -69,10 +68,10 @@ impl From<SourceId> for SourceKind {
 /// filenames never participate in inheritance resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileSource {
-    pub(crate) id: String,
-    pub(crate) source: SourceKind,
-    pub(crate) location: Option<String>,
-    pub(crate) contents: String,
+    id: String,
+    source: SourceKind,
+    location: Option<String>,
+    contents: String,
 }
 
 impl ProfileSource {
@@ -112,9 +111,9 @@ impl ProfileSource {
             path: path.clone(),
             source,
         })?;
-        let parsed = parse_profile(&contents, path.display().to_string())?;
+        let parsed = RawProfile::parse(&contents, path.display().to_string())?;
         Ok(Self {
-            id: parsed.document.id.clone(),
+            id: parsed.id().to_owned(),
             source: source.into(),
             location: Some(path.display().to_string()),
             contents,
@@ -135,11 +134,10 @@ impl ProfileSource {
             path: path.clone(),
             source,
         })?;
-        let value: toml::Value =
-            toml::from_str(&contents).map_err(|source| LoaderError::Parse {
-                location: path.display().to_string(),
-                source,
-            })?;
+        let value: Value = contents.parse().map_err(|source| LoaderError::Parse {
+            location: path.display().to_string(),
+            source,
+        })?;
         let table = value.as_table().expect("a TOML document is always a table");
         let id = id.into();
         let mut header = String::new();
@@ -147,7 +145,7 @@ impl ProfileSource {
             header.push_str("schema = 1\n");
         }
         if !table.contains_key("id") {
-            let encoded_id = toml::Value::String(id.clone()).to_string();
+            let encoded_id = Value::String(id.clone()).to_string();
             header.push_str("id = ");
             header.push_str(&encoded_id);
             header.push('\n');
@@ -156,9 +154,9 @@ impl ProfileSource {
             header.push_str(&contents);
             contents = header;
         }
-        let parsed = parse_profile(&contents, path.display().to_string())?;
+        let parsed = RawProfile::parse(&contents, path.display().to_string())?;
         Ok(Self {
-            id: parsed.document.id.clone(),
+            id: parsed.id().to_owned(),
             source: source.into(),
             location: Some(path.display().to_string()),
             contents,
@@ -177,6 +175,10 @@ impl ProfileSource {
         self.location.as_deref()
     }
 
+    pub(crate) fn contents(&self) -> &str {
+        &self.contents
+    }
+
     pub(crate) fn origin(&self, profile: &str, reason: Option<String>) -> Origin {
         let source = match self.source {
             SourceKind::ImageProfile => SourceId::Profile(profile.to_owned()),
@@ -189,13 +191,7 @@ impl ProfileSource {
             SourceKind::Cli => SourceId::Cli,
             SourceKind::Unknown => SourceId::Unknown,
         };
-        Origin {
-            source,
-            line: None,
-            column: None,
-            layer: self.source.layer(),
-            reason,
-        }
+        Origin::new(source, self.source.layer()).with_reason(reason)
     }
 }
 
@@ -210,16 +206,23 @@ pub struct LoadedProfile {
 /// A validated environment configuration and the profile chain that produced it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedConfig {
-    pub(crate) config: dev_env_model::ResolvedConfig,
-    pub(crate) profile_chain: Vec<LoadedProfile>,
+    config: ResolvedConfig,
+    profile_chain: Vec<LoadedProfile>,
 }
 
 impl LoadedConfig {
-    pub fn config(&self) -> &dev_env_model::ResolvedConfig {
+    pub(crate) fn new(config: ResolvedConfig, profile_chain: Vec<LoadedProfile>) -> Self {
+        Self {
+            config,
+            profile_chain,
+        }
+    }
+
+    pub fn config(&self) -> &ResolvedConfig {
         &self.config
     }
 
-    pub fn into_config(self) -> dev_env_model::ResolvedConfig {
+    pub fn into_config(self) -> ResolvedConfig {
         self.config
     }
 
@@ -232,15 +235,23 @@ impl LoadedConfig {
 /// this type so both paths can be tested without process-global state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CliPatch {
-    pub path: String,
-    pub spec: dev_env_model::OverrideSpec,
+    path: String,
+    spec: OverrideSpec,
 }
 
 impl CliPatch {
-    pub fn new(path: impl Into<String>, spec: dev_env_model::OverrideSpec) -> Self {
+    pub fn new(path: impl Into<String>, spec: OverrideSpec) -> Self {
         Self {
             path: path.into(),
             spec,
         }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn spec(&self) -> &OverrideSpec {
+        &self.spec
     }
 }

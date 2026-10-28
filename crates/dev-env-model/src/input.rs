@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeMap, error::Error as StdError, fmt};
 
-use crate::validation::{
-    is_env_name, validate_concrete_path, validate_config_path, validate_env_name,
-};
-use crate::{ModelError, Sensitivity, ValueTree};
+use crate::{validation::StringValidation, ModelError, Sensitivity, ValueTree};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -113,40 +110,82 @@ impl fmt::Display for InputError {
     }
 }
 
-impl std::error::Error for InputError {}
+impl StdError for InputError {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputSpec {
-    pub target: String,
+    target: String,
     #[serde(rename = "type")]
-    pub input_type: InputType,
+    input_type: InputType,
     #[serde(default)]
-    pub values: Vec<String>,
+    values: Vec<String>,
     #[serde(default)]
-    pub aliases: std::collections::BTreeMap<String, String>,
+    aliases: BTreeMap<String, String>,
     #[serde(default)]
-    pub runtime: bool,
-    pub export_as: Option<String>,
-    pub default: Option<InputValue>,
+    runtime: bool,
+    export_as: Option<String>,
+    default: Option<InputValue>,
     #[serde(default)]
-    pub sensitivity: Sensitivity,
+    sensitivity: Sensitivity,
 }
 
 impl InputSpec {
+    pub fn new(target: impl Into<String>, input_type: InputType) -> Self {
+        Self {
+            target: target.into(),
+            input_type,
+            values: Vec::new(),
+            aliases: BTreeMap::new(),
+            runtime: false,
+            export_as: None,
+            default: None,
+            sensitivity: Sensitivity::Public,
+        }
+    }
+
+    pub fn with_values(mut self, values: Vec<String>) -> Self {
+        self.values = values;
+        self
+    }
+
+    pub fn with_aliases(mut self, aliases: BTreeMap<String, String>) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    pub fn with_runtime(mut self, runtime: bool) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    pub fn with_export_as(mut self, export_as: impl Into<String>) -> Self {
+        self.export_as = Some(export_as.into());
+        self
+    }
+
+    pub fn with_default(mut self, default: InputValue) -> Self {
+        self.default = Some(default);
+        self
+    }
+
+    pub fn with_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
+        self.sensitivity = sensitivity;
+        self
+    }
+
     pub fn validate(&self, name: &str) -> Result<(), ModelError> {
-        validate_env_name(&format!("inputs.{name}"), name).map_err(|_| {
-            ModelError::InvalidInput {
+        name.validate_env_name(&format!("inputs.{name}"))
+            .map_err(|_| ModelError::InvalidInput {
                 name: name.to_owned(),
                 reason: InputError::InvalidName,
-            }
-        })?;
-        validate_config_path(&format!("inputs.{name}.target"), &self.target).map_err(|_| {
-            ModelError::InvalidInput {
+            })?;
+        self.target
+            .validate_config_path(&format!("inputs.{name}.target"))
+            .map_err(|_| ModelError::InvalidInput {
                 name: name.to_owned(),
                 reason: InputError::InvalidTarget,
-            }
-        })?;
+            })?;
         if self.target.contains('*') {
             return Err(ModelError::InvalidInput {
                 name: name.to_owned(),
@@ -154,7 +193,7 @@ impl InputSpec {
             });
         }
         if let Some(export_as) = &self.export_as {
-            if !is_env_name(export_as) {
+            if !export_as.is_env_name() {
                 return Err(ModelError::InvalidInput {
                     name: name.to_owned(),
                     reason: InputError::InvalidName,
@@ -231,10 +270,10 @@ impl InputSpec {
                     Ok(())
                 }
             }
-            InputType::Path if matches!(default, InputValue::String(_)) => {
-                validate_concrete_path("input.default", &default.as_raw())
-                    .map_err(|_| InputError::InvalidPath)
-            }
+            InputType::Path if matches!(default, InputValue::String(_)) => default
+                .as_raw()
+                .validate_concrete_path("input.default")
+                .map_err(|_| InputError::InvalidPath),
             InputType::Enum if matches!(default, InputValue::String(_)) => {
                 let value = default.as_raw();
                 self.parse_value(&value)
@@ -276,7 +315,7 @@ impl InputSpec {
                     value: raw.to_owned(),
                 }
             }),
-            InputType::Path => match validate_concrete_path("input", raw) {
+            InputType::Path => match raw.validate_concrete_path("input") {
                 Ok(()) => Ok(ParsedInput::Path(raw.to_owned())),
                 Err(_) => Err(InputError::InvalidPath),
             },
@@ -322,5 +361,39 @@ impl InputSpec {
                 reason: InputError::WrongDefaultType,
             }),
         }
+    }
+}
+
+impl InputSpec {
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn input_type(&self) -> InputType {
+        self.input_type
+    }
+
+    pub fn values(&self) -> &Vec<String> {
+        &self.values
+    }
+
+    pub fn aliases(&self) -> &BTreeMap<String, String> {
+        &self.aliases
+    }
+
+    pub fn runtime(&self) -> bool {
+        self.runtime
+    }
+
+    pub fn export_as(&self) -> Option<&str> {
+        self.export_as.as_deref()
+    }
+
+    pub fn default(&self) -> &Option<InputValue> {
+        &self.default
+    }
+
+    pub fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
     }
 }

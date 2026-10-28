@@ -1,5 +1,5 @@
 use crate::context::ProviderContext;
-use std::fmt;
+use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TemplateError {
@@ -28,19 +28,24 @@ impl fmt::Display for TemplateError {
     }
 }
 
-impl std::error::Error for TemplateError {}
+impl Error for TemplateError {}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProviderTemplate;
 
 /// Expand only known data placeholders.  Values are returned as individual
 /// argv elements and are never interpreted as shell source.
-pub fn expand_argv(
-    arguments: &[String],
-    provider: &str,
-    context: &ProviderContext,
-) -> Result<Vec<String>, TemplateError> {
-    arguments
-        .iter()
-        .map(|argument| expand_argument(argument, provider, context))
-        .collect()
+impl ProviderTemplate {
+    pub fn expand_argv(
+        arguments: &[String],
+        provider: &str,
+        context: &ProviderContext,
+    ) -> Result<Vec<String>, TemplateError> {
+        arguments
+            .iter()
+            .map(|argument| expand_argument(argument, provider, context))
+            .collect()
+    }
 }
 
 fn expand_argument(

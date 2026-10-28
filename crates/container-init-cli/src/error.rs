@@ -1,10 +1,8 @@
 use container_init_bootstrap_loader::LoaderError;
 use container_init_bootstrap_model::ModelError;
 use container_init_core::CoreError;
-use std::error::Error;
-use std::fmt;
-use std::io;
-use std::path::PathBuf;
+use serde_json::Error as JsonError;
+use std::{error::Error, fmt, io, path::PathBuf};
 
 #[derive(Debug)]
 pub enum CliError {
@@ -19,7 +17,7 @@ pub enum CliError {
         path: Option<PathBuf>,
         source: io::Error,
     },
-    Output(serde_json::Error),
+    Output(JsonError),
     DoctorFailed {
         check: String,
         source: Option<Box<CoreError>>,

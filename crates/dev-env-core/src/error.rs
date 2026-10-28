@@ -1,10 +1,41 @@
-use crate::context::ContextError;
-use crate::fingerprint::FingerprintError;
-use crate::ConfigTreeError;
-use dev_env_model::ModelError;
-use dev_env_provider::ProviderRuntimeError;
-use std::error::Error;
-use std::fmt;
+use crate::{context::ContextError, ConfigTreeError};
+use dev_env_model::{ModelError, ResolvedConfig};
+use dev_env_provider::{fingerprint_bytes, ProviderRuntimeError};
+use serde_json::{to_vec, Error as JsonError};
+use std::{env::JoinPathsError, error::Error, fmt};
+
+#[derive(Debug)]
+pub enum FingerprintError {
+    Serialize { source: JsonError },
+}
+
+impl FingerprintError {
+    pub(crate) fn config_fingerprint(config: &ResolvedConfig) -> Result<[u8; 32], Self> {
+        let encoded = to_vec(config).map_err(|source| Self::Serialize { source })?;
+        Ok(fingerprint_bytes(&encoded))
+    }
+}
+
+impl fmt::Display for FingerprintError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Serialize { source } => {
+                write!(
+                    formatter,
+                    "could not serialize resolved configuration: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for FingerprintError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Serialize { source } => Some(source),
+        }
+    }
+}
 
 /// Structured failures raised by the materializer.
 ///
@@ -21,7 +52,7 @@ pub enum CoreError {
         provider: String,
         source: Box<ProviderRuntimeError>,
     },
-    PathJoin(std::env::JoinPathsError),
+    PathJoin(JoinPathsError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

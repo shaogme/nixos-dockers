@@ -1,7 +1,11 @@
 use crate::identity::{IdentityRequest, IdentityRequestError};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    error::Error as StdError,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 /// Operations that can ask the backend for a materialized environment.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize)]
@@ -14,31 +18,48 @@ pub enum RequestMode {
     Print,
 }
 
+#[derive(Debug)]
+pub enum RequestValidationError {
+    InvalidRequestId,
+    InvalidCwd(PathBuf),
+    InvalidShell,
+    Identity(IdentityRequestError),
+    TooManyRuntimeInputs,
+    TooManyShellArguments,
+    InvalidEnvironmentName(String),
+    NulValue(String),
+}
+
 /// Per-request facts accepted by a backend. Configuration and executable
 /// policy are intentionally absent: those come from ConfigSnapshot.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestContext {
-    pub request_id: String,
-    pub mode: RequestMode,
-    pub cwd: PathBuf,
-    pub shell: String,
+    request_id: String,
+    mode: RequestMode,
+    cwd: PathBuf,
+    shell: String,
     /// Arguments that belong to the selected shell invocation. They are
     /// request data and do not alter the snapshot or provider policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub shell_args: Vec<String>,
+    shell_args: Vec<String>,
     #[serde(default)]
-    pub requested_identity: IdentityRequest,
+    requested_identity: IdentityRequest,
     #[serde(default)]
-    pub typed_runtime_inputs: BTreeMap<String, String>,
+    typed_runtime_inputs: BTreeMap<String, String>,
     #[serde(default)]
-    pub filtered_ambient_environment: BTreeMap<String, String>,
+    filtered_ambient_environment: BTreeMap<String, String>,
 }
 
 /// The protocol uses the name PrepareRequest for the same context shape.
 pub type PrepareRequest = RequestContext;
 
 impl RequestContext {
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = request_id.into();
+        self
+    }
+
     pub fn new(
         request_id: impl Into<String>,
         mode: RequestMode,
@@ -123,20 +144,8 @@ impl RequestContext {
     }
 }
 
-#[derive(Debug)]
-pub enum RequestValidationError {
-    InvalidRequestId,
-    InvalidCwd(PathBuf),
-    InvalidShell,
-    Identity(IdentityRequestError),
-    TooManyRuntimeInputs,
-    TooManyShellArguments,
-    InvalidEnvironmentName(String),
-    NulValue(String),
-}
-
-impl std::fmt::Display for RequestValidationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for RequestValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRequestId => formatter.write_str("request id is invalid"),
             Self::InvalidCwd(path) => {
@@ -158,8 +167,8 @@ impl std::fmt::Display for RequestValidationError {
     }
 }
 
-impl std::error::Error for RequestValidationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for RequestValidationError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Identity(source) => Some(source),
             _ => None,
@@ -194,4 +203,38 @@ fn validate_values(values: &BTreeMap<String, String>) -> Result<(), RequestValid
         return Err(RequestValidationError::TooManyRuntimeInputs);
     }
     Ok(())
+}
+
+impl RequestContext {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn mode(&self) -> RequestMode {
+        self.mode
+    }
+
+    pub fn cwd(&self) -> &PathBuf {
+        &self.cwd
+    }
+
+    pub fn shell(&self) -> &str {
+        &self.shell
+    }
+
+    pub fn shell_args(&self) -> &Vec<String> {
+        &self.shell_args
+    }
+
+    pub fn requested_identity(&self) -> &IdentityRequest {
+        &self.requested_identity
+    }
+
+    pub fn typed_runtime_inputs(&self) -> &BTreeMap<String, String> {
+        &self.typed_runtime_inputs
+    }
+
+    pub fn filtered_ambient_environment(&self) -> &BTreeMap<String, String> {
+        &self.filtered_ambient_environment
+    }
 }

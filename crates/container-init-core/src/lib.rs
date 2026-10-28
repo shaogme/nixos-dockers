@@ -13,23 +13,21 @@ mod executor;
 mod filesystem;
 mod handoff;
 mod identity;
-mod receipt;
+mod report;
 mod resource_lock;
 mod ssh;
 
 pub use condition::ConditionContext;
-pub use container_init_posix::PosixSystem;
-pub use container_init_posix::WorkspaceObservation;
+pub use container_init_posix::{PosixSystem, WorkspaceObservation};
 pub use context::RuntimeContext;
 pub use error::{CoreError, ErrorClass};
-pub use executor::{
-    ActionExecutor, ActionOutcome, ActionStatus, ExecutionOptions, ExecutionReport, PlanExecutor,
-};
-pub use handoff::HandoffCommand;
+pub use executor::{ActionExecutor, PlanExecutor};
+pub use handoff::{HandoffCommand, HandoffContext};
 pub use identity::{
     IdentityResolver, IdentitySource, ParsedRuntimeInput, ResolvedIdentity, ResolvedInputs,
     RuntimeInput, WorkspaceStatus,
 };
+pub use report::{ActionOutcome, ActionStatus, ExecutionOptions, ExecutionReport, PreparedExec};
 pub use resource_lock::{
     PathScope, ProcessNamespace, ResourceKey, ResourceLockGuard, ResourceLockManager,
 };

@@ -1,8 +1,31 @@
-use crate::adapter::ShellAdapter;
-use crate::command::CommandLine;
-use crate::error::{ShellBuildError, ShellInvocationError};
+use crate::{adapter::ShellAdapter, command::CommandLine, error::ShellBuildError};
 use dev_env_model::ShellConfig;
-use std::ffi::OsString;
+use std::{error::Error, ffi::OsString, fmt};
+
+/// Errors raised while selecting one of the configured shell invocation
+/// modes.
+#[derive(Debug)]
+pub enum ShellInvocationError {
+    Build { source: ShellBuildError },
+}
+
+impl fmt::Display for ShellInvocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build { source } => {
+                write!(formatter, "could not build shell invocation: {source}")
+            }
+        }
+    }
+}
+
+impl Error for ShellInvocationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Build { source } => Some(source),
+        }
+    }
+}
 
 /// One of the shell entry points supported by `dev-env shell` and
 /// `dev-env login-shell`.
@@ -31,23 +54,27 @@ impl ShellInvocation {
             script: script.into(),
         }
     }
-}
 
-pub fn build_invocation<A: ShellAdapter + ?Sized>(
-    adapter: &A,
-    config: &ShellConfig,
-    invocation: &ShellInvocation,
-) -> Result<CommandLine, ShellInvocationError> {
-    match invocation {
-        ShellInvocation::Interactive { args } => adapter
-            .build_interactive(config, args)
-            .map_err(|source| ShellInvocationError::Build { source }),
-        ShellInvocation::Login { args } => adapter
-            .build_login(config, args)
-            .map_err(|source| ShellInvocationError::Build { source }),
-        ShellInvocation::Command { script } => adapter
-            .build_command(config, script)
-            .map_err(|source| ShellInvocationError::Build { source }),
+    pub const fn is_command(&self) -> bool {
+        matches!(self, Self::Command { .. })
+    }
+
+    pub fn build<A: ShellAdapter + ?Sized>(
+        &self,
+        adapter: &A,
+        config: &ShellConfig,
+    ) -> Result<CommandLine, ShellInvocationError> {
+        match self {
+            Self::Interactive { args } => adapter
+                .build_interactive(config, args)
+                .map_err(|source| ShellInvocationError::Build { source }),
+            Self::Login { args } => adapter
+                .build_login(config, args)
+                .map_err(|source| ShellInvocationError::Build { source }),
+            Self::Command { script } => adapter
+                .build_command(config, script)
+                .map_err(|source| ShellInvocationError::Build { source }),
+        }
     }
 }
 

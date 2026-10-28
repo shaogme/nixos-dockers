@@ -1,4 +1,4 @@
-use container_init_backend::{BackendClient, BackendClientError};
+use container_init_backend::{BackendClient, BackendClientError, PrepareOptions};
 use container_init_bootstrap_loader::LoaderError;
 use container_init_bootstrap_model::{ModelError, SourceKind};
 use container_init_cli::{Cli, CliCommand, CliError};
@@ -40,7 +40,15 @@ fn fake_ssh_keygen(root: &Path) -> PathBuf {
     path
 }
 
-fn profile_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+struct ProfileFixture {
+    _temp: TempDir,
+    profiles: PathBuf,
+    workspace: PathBuf,
+    marker: PathBuf,
+    handoff: PathBuf,
+}
+
+fn profile_fixture() -> ProfileFixture {
     let temp = TempDir::new().expect("temporary directory should be created");
     let profiles = temp.path().join("profiles");
     let workspace = temp.path().join("workspace");
@@ -80,7 +88,13 @@ run_as = "root"
         marker.display()
     );
     fs::write(profiles.join("fixture.toml"), profile).unwrap();
-    (temp, profiles, workspace, marker, handoff)
+    ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        marker,
+        handoff,
+    }
 }
 
 fn common_args(profiles: &Path, workspace: &Path, lock: &Path) -> Vec<String> {
@@ -147,9 +161,10 @@ fn parser_keeps_command_arguments_after_double_dash() {
         "value",
     ])
     .unwrap();
-    assert_eq!(cli.options.profiles_dir, Some(PathBuf::from("/profiles")));
+    let (options, command) = cli.into_parts();
+    assert_eq!(options.profiles_dir, Some(PathBuf::from("/profiles")));
     assert_eq!(
-        cli.command,
+        command,
         CliCommand::Run {
             command: vec![
                 "tool".to_owned(),
@@ -165,7 +180,13 @@ fn plan_is_side_effect_free_and_json_contains_provenance() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (temp, profiles, workspace, marker, _) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        marker,
+        ..
+    } = profile_fixture();
     let lock = temp.path().join("lock");
     let output = Command::new(binary())
         .args(common_args(&profiles, &workspace, &lock))
@@ -190,7 +211,13 @@ fn doctor_checks_the_real_handoff_and_workspace_without_mutation() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (temp, profiles, workspace, marker, _) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        marker,
+        ..
+    } = profile_fixture();
     let lock = temp.path().join("lock");
     let output = Command::new(binary())
         .args(common_args(&profiles, &workspace, &lock))
@@ -219,7 +246,13 @@ fn run_executes_actions_then_handoffs_to_the_declared_runtime() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (temp, profiles, workspace, marker, handoff) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        marker,
+        handoff,
+    } = profile_fixture();
     let lock = temp.path().join("lock");
     let receipt = temp.path().join("receipt.json");
     let script = format!("printf 'handoff\\n' > {}", handoff.display());
@@ -327,12 +360,13 @@ fn parser_parses_exec_command_with_double_dash_and_arguments() {
         "value",
     ])
     .unwrap();
+    let (options, command) = cli.into_parts();
     assert_eq!(
-        cli.options.backend_socket,
+        options.backend_socket,
         Some(PathBuf::from("/run/container-init/backend.sock"))
     );
     assert_eq!(
-        cli.command,
+        command,
         CliCommand::Exec {
             command: vec!["tool".to_owned(), "--flag".to_owned(), "value".to_owned(),]
         }
@@ -344,7 +378,13 @@ fn exec_hands_off_through_the_running_backend() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (temp, profiles, workspace, marker, handoff) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        marker,
+        handoff,
+    } = profile_fixture();
     let socket = temp.path().join("backend.sock");
     let mut backend = start_backend(
         &profiles,
@@ -376,7 +416,12 @@ fn exec_accepts_the_37543_byte_argument_through_preflight_and_handoff() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (_temp, profiles, workspace, _, _) = profile_fixture();
+    let ProfileFixture {
+        _temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
     let socket = _temp.path().join("backend.sock");
     let mut backend = start_backend(
         &profiles,
@@ -477,13 +522,13 @@ depends_on = ["resolve"]
     )]);
     let deadline = client.deadline().unwrap();
     let prepared = client
-        .prepare_until(
-            vec!["true".to_owned()],
-            workspace.clone(),
-            inputs.clone(),
-            &BTreeMap::new(),
+        .prepare_until(PrepareOptions {
+            argv: vec!["true".to_owned()],
+            cwd: workspace.clone(),
+            inputs: inputs.clone(),
+            ambient_environment: &BTreeMap::new(),
             deadline,
-        )
+        })
         .unwrap();
     assert!(
         !deferred_home.exists(),
@@ -502,13 +547,13 @@ depends_on = ["resolve"]
 
     let deadline = client.deadline().unwrap();
     let prepared = client
-        .prepare_until(
-            vec!["true".to_owned()],
-            workspace,
+        .prepare_until(PrepareOptions {
+            argv: vec!["true".to_owned()],
+            cwd: workspace,
             inputs,
-            &BTreeMap::new(),
+            ambient_environment: &BTreeMap::new(),
             deadline,
-        )
+        })
         .unwrap();
     let committed = client.commit_until(&prepared.prepare_id, deadline).unwrap();
     assert!(committed.receipt_summary.succeeded);
@@ -529,13 +574,13 @@ depends_on = ["resolve"]
     )]);
     let short_deadline = Instant::now() + Duration::from_millis(500);
     let expired = client
-        .prepare_until(
-            vec!["true".to_owned()],
-            temp.path().join("workspace"),
-            expired_inputs,
-            &BTreeMap::new(),
-            short_deadline,
-        )
+        .prepare_until(PrepareOptions {
+            argv: vec!["true".to_owned()],
+            cwd: temp.path().join("workspace"),
+            inputs: expired_inputs,
+            ambient_environment: &BTreeMap::new(),
+            deadline: short_deadline,
+        })
         .unwrap();
     thread::sleep(Duration::from_millis(650));
     let result_deadline = client.deadline().unwrap();
@@ -566,7 +611,12 @@ fn exec_supports_parallel_execution_without_lock_contention() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (temp, profiles, workspace, _, _) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
     let socket = temp.path().join("backend.sock");
     let mut backend = start_backend(
         &profiles,
@@ -606,7 +656,13 @@ fn duplicate_run_uses_the_existing_backend_without_reloading_config() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (temp, profiles, workspace, marker, _) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        marker,
+        ..
+    } = profile_fixture();
     let socket = temp.path().join("backend.sock");
     let mut backend = start_backend(
         &profiles,
@@ -894,7 +950,12 @@ content = "ssh-ed25519 AAAAcli-test\n"
 
 #[test]
 fn undeclared_runtime_input_is_a_configuration_error() {
-    let (temp, profiles, workspace, _, _) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
     let lock = temp.path().join("lock");
     let output = Command::new(binary())
         .args(common_args(&profiles, &workspace, &lock))
@@ -907,7 +968,12 @@ fn undeclared_runtime_input_is_a_configuration_error() {
 
 #[test]
 fn default_profile_file_is_used_when_no_profile_flag_is_given() {
-    let (temp, profiles, workspace, _, _) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
     let default_profile = temp.path().join("default-profile");
     fs::write(&default_profile, "fixture\n").unwrap();
     let output = Command::new(binary())
@@ -953,7 +1019,12 @@ fn cli_plans_cgroup_v2_init_action() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
-    let (temp, profiles, workspace, _, _) = profile_fixture();
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
     let lock = temp.path().join("lock");
     let cgroup_dir = temp.path().join("cgroup");
     fs::create_dir_all(&cgroup_dir).unwrap();

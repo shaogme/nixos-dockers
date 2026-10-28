@@ -1,55 +1,33 @@
 use dev_env_model::EffectiveIdentity;
-use std::collections::HashSet;
-use std::io::{self, Read};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use libc::c_int;
+use std::{
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+    fs::{read_dir, read_to_string},
+    io::{self, Read},
+    path::{Path, PathBuf},
+    process::{id, Child, Command, Stdio},
+    ptr::null_mut,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Once, OnceLock,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
-#[derive(Clone, Debug)]
-pub struct CommandRequest {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: PathBuf,
-    pub environment: std::collections::BTreeMap<String, String>,
-    pub timeout: Option<Duration>,
-    pub max_stdout_bytes: usize,
-    pub max_stderr_bytes: usize,
-}
+#[cfg(target_os = "linux")]
+use libc::{c_uint, prctl, syscall, SYS_pidfd_open, PR_SET_CHILD_SUBREAPER};
 
-impl CommandRequest {
-    pub fn new(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-            cwd: cwd.into(),
-            environment: Default::default(),
-            timeout: None,
-            max_stdout_bytes: 1024 * 1024,
-            max_stderr_bytes: 64 * 1024,
-        }
-    }
+#[cfg(unix)]
+use libc::{
+    close, fcntl, geteuid, gid_t, kill, pid_t, setgid, setgroups, setpgid, setuid, waitpid,
+    F_GETFL, F_SETFL, O_NONBLOCK, SIGKILL, SIGTERM, WNOHANG,
+};
 
-    pub fn validate(&self) -> Result<(), CommandError> {
-        if self.program.is_empty() || self.program.contains('\0') {
-            return Err(CommandError::InvalidProgram);
-        }
-        if self.args.iter().any(|argument| argument.contains('\0')) {
-            return Err(CommandError::InvalidArgument);
-        }
-        if self.environment.iter().any(|(name, value)| {
-            name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0')
-        }) {
-            return Err(CommandError::InvalidEnvironment);
-        }
-        if self.timeout.is_some_and(|timeout| timeout.is_zero()) {
-            return Err(CommandError::InvalidTimeout);
-        }
-        Ok(())
-    }
-}
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputStream {
@@ -81,8 +59,100 @@ pub enum CommandError {
     },
 }
 
-impl std::fmt::Display for CommandError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+#[derive(Clone, Debug)]
+pub struct CommandRequest {
+    program: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+    environment: BTreeMap<String, String>,
+    timeout: Option<Duration>,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+}
+
+impl CommandRequest {
+    pub fn new(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            cwd: cwd.into(),
+            environment: Default::default(),
+            timeout: None,
+            max_stdout_bytes: 1024 * 1024,
+            max_stderr_bytes: 64 * 1024,
+        }
+    }
+
+    pub fn with_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
+        self.args = args.into_iter().collect();
+        self
+    }
+
+    pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_output_limits(mut self, stdout: usize, stderr: usize) -> Self {
+        self.max_stdout_bytes = stdout;
+        self.max_stderr_bytes = stderr;
+        self
+    }
+
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    pub fn max_stdout_bytes(&self) -> usize {
+        self.max_stdout_bytes
+    }
+
+    pub fn max_stderr_bytes(&self) -> usize {
+        self.max_stderr_bytes
+    }
+
+    pub fn validate(&self) -> Result<(), CommandError> {
+        if self.program.is_empty() || self.program.contains('\0') {
+            return Err(CommandError::InvalidProgram);
+        }
+        if self.args.iter().any(|argument| argument.contains('\0')) {
+            return Err(CommandError::InvalidArgument);
+        }
+        if self.environment.iter().any(|(name, value)| {
+            name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0')
+        }) {
+            return Err(CommandError::InvalidEnvironment);
+        }
+        if self.timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(CommandError::InvalidTimeout);
+        }
+        Ok(())
+    }
+}
+
+impl Display for CommandError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::InvalidProgram => formatter.write_str("provider program is invalid"),
             Self::InvalidArgument => formatter.write_str("provider argv contains NUL"),
@@ -103,8 +173,8 @@ impl std::fmt::Display for CommandError {
     }
 }
 
-impl std::error::Error for CommandError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for CommandError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Spawn { source }
             | Self::Wait { source }
@@ -124,13 +194,22 @@ impl std::error::Error for CommandError {
 /// a String, and shellenv parsing can then enforce UTF-8 explicitly.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandOutput {
-    pub status: Option<i32>,
-    pub timed_out: bool,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    status: Option<i32>,
+    timed_out: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 impl CommandOutput {
+    pub fn new(status: Option<i32>, timed_out: bool, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        Self {
+            status,
+            timed_out,
+            stdout,
+            stderr,
+        }
+    }
+
     pub fn success(stdout: impl Into<Vec<u8>>) -> Self {
         Self {
             status: Some(0),
@@ -142,6 +221,22 @@ impl CommandOutput {
 
     pub fn succeeded(&self) -> bool {
         !self.timed_out && self.status == Some(0)
+    }
+
+    pub fn status(&self) -> Option<i32> {
+        self.status
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
     }
 }
 
@@ -259,24 +354,23 @@ impl ProcessExecutor {
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command, identity: Option<&EffectiveIdentity>) {
-    use std::os::unix::process::CommandExt;
     let identity = identity.cloned();
     unsafe {
         command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
+            if setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             if let Some(identity) = &identity {
-                if identity.uid != 0 && libc::geteuid() == 0 {
+                if identity.uid() != 0 && geteuid() == 0 {
                     let groups = identity
-                        .supplementary_groups
+                        .supplementary_groups()
                         .iter()
-                        .map(|group| *group as libc::gid_t)
+                        .map(|group| *group as gid_t)
                         .collect::<Vec<_>>();
-                    if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+                    if setgroups(groups.len(), groups.as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::setgid(identity.gid) != 0 || libc::setuid(identity.uid) != 0 {
+                    if setgid(identity.gid()) != 0 || setuid(identity.uid()) != 0 {
                         return Err(io::Error::last_os_error());
                     }
                 }
@@ -291,13 +385,13 @@ fn configure_process_group(_command: &mut Command, _identity: Option<&EffectiveI
 
 #[cfg(unix)]
 fn terminate_process_group(pid: u32) {
-    let process_group = -(pid as libc::pid_t);
+    let process_group = -(pid as pid_t);
     unsafe {
-        let _ = libc::kill(process_group, libc::SIGTERM);
+        let _ = kill(process_group, SIGTERM);
     }
     thread::sleep(Duration::from_millis(5));
     unsafe {
-        let _ = libc::kill(process_group, libc::SIGKILL);
+        let _ = kill(process_group, SIGKILL);
     }
 }
 
@@ -307,7 +401,7 @@ fn terminate_process_group(_pid: u32) {}
 #[cfg(unix)]
 fn reap_adopted_children() {
     loop {
-        let result = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        let result = unsafe { waitpid(-1, null_mut(), WNOHANG) };
         if result <= 0 {
             break;
         }
@@ -319,7 +413,7 @@ fn reap_adopted_children() {}
 
 #[cfg(target_os = "linux")]
 fn process_ids() -> HashSet<u32> {
-    std::fs::read_dir("/proc")
+    read_dir("/proc")
         .ok()
         .into_iter()
         .flat_map(|entries| entries.filter_map(Result::ok))
@@ -333,17 +427,17 @@ fn process_ids() -> HashSet<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn adopted_children(baseline: &HashSet<u32>) -> Vec<libc::pid_t> {
-    let current = std::process::id();
+fn adopted_children(baseline: &HashSet<u32>) -> Vec<pid_t> {
+    let current = id();
     process_ids()
         .difference(baseline)
         .filter_map(|pid| {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let stat = read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let parenthesized = stat.rfind(')')?;
             let mut fields = stat[parenthesized + 1..].split_whitespace();
             let _state = fields.next()?;
             let parent = fields.next()?.parse::<u32>().ok()?;
-            (parent == current).then_some(*pid as libc::pid_t)
+            (parent == current).then_some(*pid as pid_t)
         })
         .collect()
 }
@@ -357,13 +451,13 @@ fn terminate_new_adopted_children(baseline: &HashSet<u32>) {
         }
         for pid in &children {
             unsafe {
-                let _ = libc::kill(*pid, libc::SIGTERM);
+                let _ = kill(*pid, SIGTERM);
             }
         }
         thread::sleep(Duration::from_millis(5));
         for pid in adopted_children(baseline) {
             unsafe {
-                let _ = libc::kill(pid, libc::SIGKILL);
+                let _ = kill(pid, SIGKILL);
             }
         }
         reap_adopted_children();
@@ -375,15 +469,15 @@ fn terminate_new_adopted_children(_baseline: &HashSet<u32>) {}
 
 static SUBREAPER_ONCE: Once = Once::new();
 
-struct PidFd(Option<libc::c_int>);
+struct PidFd(Option<c_int>);
 
 impl PidFd {
     fn open(pid: u32) -> Self {
         #[cfg(target_os = "linux")]
         {
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_uint, 0) };
+            let fd = unsafe { syscall(SYS_pidfd_open, pid as c_uint, 0) };
             if fd >= 0 {
-                return Self(Some(fd as libc::c_int));
+                return Self(Some(fd as c_int));
             }
         }
         Self(None)
@@ -395,7 +489,7 @@ impl Drop for PidFd {
         if let Some(fd) = self.0.take() {
             #[cfg(unix)]
             unsafe {
-                let _ = libc::close(fd);
+                let _ = close(fd);
             }
         }
     }
@@ -410,7 +504,7 @@ fn install_subreaper() {
     #[cfg(target_os = "linux")]
     SUBREAPER_ONCE.call_once(|| unsafe {
         // Provider descendants are reparented to the backend instead of PID 1.
-        let _ = libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+        let _ = prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
     });
 }
 
@@ -465,13 +559,13 @@ fn take_pipe(
 }
 
 #[cfg(unix)]
-fn set_nonblocking<P: std::os::fd::AsRawFd>(pipe: &P) -> io::Result<()> {
+fn set_nonblocking<P: AsRawFd>(pipe: &P) -> io::Result<()> {
     let fd = pipe.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let flags = unsafe { fcntl(fd, F_GETFL) };
     if flags == -1 {
         return Err(io::Error::last_os_error());
     }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

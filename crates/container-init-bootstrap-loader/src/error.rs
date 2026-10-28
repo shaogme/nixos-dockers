@@ -1,8 +1,5 @@
 use container_init_bootstrap_model::{ModelError, Origin, SourceKind};
-use std::error::Error;
-use std::fmt;
-use std::io;
-use std::path::PathBuf;
+use std::{error::Error, fmt, io, path::PathBuf};
 use toml::de::Error as TomlError;
 
 #[derive(Debug)]
@@ -81,10 +78,10 @@ impl fmt::Display for LoaderError {
             } => write!(
                 formatter,
                 "bootstrap conflict at {path:?}: {:?} ({:?}) conflicts with {:?} ({:?}); {remedy}",
-                previous.profile,
-                previous.source,
-                incoming.profile,
-                incoming.source
+                previous.profile(),
+                previous.source(),
+                incoming.profile(),
+                incoming.source()
             ),
             Self::TrustViolation {
                 profile,

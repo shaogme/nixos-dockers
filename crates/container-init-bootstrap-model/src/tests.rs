@@ -1,64 +1,52 @@
-use super::*;
 use std::collections::BTreeMap;
 
-fn config(actions: Vec<Action>) -> BootstrapConfig {
-    BootstrapConfig {
-        schema: BOOTSTRAP_SCHEMA_V1,
-        mode: BootstrapMode::Strict,
-        workspace_root: "/workspace".to_owned(),
-        allow_workspace_overlay: false,
-        non_interactive: NonInteractivePolicy::Deny,
-        identity: IdentityConfig {
-            default_user: Some("dev".to_owned()),
-            default_uid: Some(1000),
-            default_gid: Some(1000),
-            default_home: None,
-            auto_mapping: true,
-            run_as_root_input: Some("RUN_AS_ROOT".to_owned()),
-            uid_input: Some("HOST_UID".to_owned()),
-            gid_input: Some("HOST_GID".to_owned()),
-            home_input: Some("CONTAINER_HOME".to_owned()),
-        },
-        handoff: HandoffConfig {
-            runtime: "/usr/bin/runtime".to_owned(),
-            exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
-            initial_exec_prefix: vec!["exec".to_owned(), "--".to_owned()],
-            shell_prefix: vec!["shell".to_owned()],
-            root_service: false,
-            ssh_daemon: None,
-            login_shell: None,
-        },
-        policy: BootstrapPolicy::default(),
-        inputs: declared_inputs(),
-        actions,
-    }
+use crate::{
+    Action, ActionKind, BootstrapConfig, BootstrapInput, Condition, HandoffConfig, IdentityConfig,
+    InputNamespace, InputType, ModelError, Origin, ParsedInput, PathTemplate, PlanEffect,
+    PlanPhase, RunAs,
+};
+
+fn bootstrap_config(actions: Vec<Action>) -> BootstrapConfig {
+    let mut identity = IdentityConfig::new();
+    identity.set_default_user(Some("dev".to_owned()));
+    identity.set_default_uid(Some(1000));
+    identity.set_default_gid(Some(1000));
+    identity.set_auto_mapping(true);
+    identity.set_run_as_root_input(Some("RUN_AS_ROOT".to_owned()));
+    identity.set_uid_input(Some("HOST_UID".to_owned()));
+    identity.set_gid_input(Some("HOST_GID".to_owned()));
+    identity.set_home_input(Some("CONTAINER_HOME".to_owned()));
+    let mut handoff = HandoffConfig::new("/usr/bin/runtime");
+    handoff.set_exec_prefix(vec!["exec".to_owned(), "--".to_owned()]);
+    handoff.set_initial_exec_prefix(vec!["exec".to_owned(), "--".to_owned()]);
+    handoff.set_shell_prefix(vec!["shell".to_owned()]);
+    BootstrapConfig::new("/workspace", identity, handoff, declared_inputs(), actions)
 }
 
 fn declared_inputs() -> BTreeMap<String, BootstrapInput> {
     [
-        ("RUN_AS_ROOT", "identity.run_as_root", InputType::Bool),
-        ("HOST_UID", "identity.uid", InputType::UidPair),
-        ("HOST_GID", "identity.gid", InputType::Gid),
-        ("CONTAINER_HOME", "identity.home", InputType::Path),
+        (
+            "RUN_AS_ROOT",
+            input("identity.run_as_root", InputType::Bool),
+        ),
+        ("HOST_UID", input("identity.uid", InputType::UidPair)),
+        ("HOST_GID", input("identity.gid", InputType::Gid)),
+        ("CONTAINER_HOME", input("identity.home", InputType::Path)),
     ]
     .into_iter()
-    .map(|(name, target, input_type)| {
-        (
-            name.to_owned(),
-            BootstrapInput {
-                target: target.to_owned(),
-                input_type,
-                aliases: Vec::new(),
-                runtime: true,
-                format: None,
-                namespace: (input_type == InputType::UidPair || input_type == InputType::Gid)
-                    .then_some(InputNamespace::Host),
-                default: None,
-                allow_outside_workspace: input_type == InputType::Path,
-            },
-        )
-    })
+    .map(|(name, input)| (name.to_owned(), input))
     .collect()
+}
+
+fn input(target: &str, input_type: InputType) -> BootstrapInput {
+    let mut input = BootstrapInput::new(target, input_type);
+    input.set_runtime(true);
+    input.set_namespace(
+        (input_type == InputType::UidPair || input_type == InputType::Gid)
+            .then_some(InputNamespace::Host),
+    );
+    input.set_allow_outside_workspace(input_type == InputType::Path);
+    input
 }
 
 fn action(id: &str, kind: ActionKind) -> Action {
@@ -67,16 +55,11 @@ fn action(id: &str, kind: ActionKind) -> Action {
 
 #[test]
 fn uid_pair_and_typed_inputs_are_parsed_without_shell_logic() {
-    let input = BootstrapInput {
-        target: "identity.uid".to_owned(),
-        input_type: InputType::UidPair,
-        aliases: vec!["HOST_UID".to_owned()],
-        runtime: true,
-        format: Some("uid[:gid]".to_owned()),
-        namespace: Some(InputNamespace::Host),
-        default: None,
-        allow_outside_workspace: false,
-    };
+    let mut input = BootstrapInput::new("identity.uid", InputType::UidPair);
+    input.set_aliases(vec!["HOST_UID".to_owned()]);
+    input.set_runtime(true);
+    input.set_format(Some("uid[:gid]".to_owned()));
+    input.set_namespace(Some(InputNamespace::Host));
     assert_eq!(
         input.parse_value("1000:1001").unwrap(),
         ParsedInput::UidPair {
@@ -94,17 +77,13 @@ fn uid_pair_and_typed_inputs_are_parsed_without_shell_logic() {
     assert!(input.parse_value("1000:1001:1002").is_err());
     assert!(input.parse_value("1000:bad").is_err());
 
-    let gid = BootstrapInput {
-        input_type: InputType::Gid,
-        ..input.clone()
-    };
+    let mut gid = input.clone();
+    gid.set_input_type(InputType::Gid);
     assert_eq!(gid.parse_value("42").unwrap(), ParsedInput::Gid(42));
     assert!(gid.parse_value("-1").is_err());
 
-    let boolean = BootstrapInput {
-        input_type: InputType::Bool,
-        ..input
-    };
+    let mut boolean = input;
+    boolean.set_input_type(InputType::Bool);
     assert_eq!(boolean.parse_value("1").unwrap(), ParsedInput::Bool(true));
     assert_eq!(
         boolean.parse_value("false").unwrap(),
@@ -115,15 +94,23 @@ fn uid_pair_and_typed_inputs_are_parsed_without_shell_logic() {
 
 #[test]
 fn identity_uid_gid_inputs_require_and_agree_on_namespace() {
-    let mut config = crate::tests::config(Vec::new());
-    config.inputs.get_mut("HOST_UID").unwrap().namespace = None;
+    let mut config = bootstrap_config(Vec::new());
+    config
+        .inputs_mut()
+        .get_mut("HOST_UID")
+        .unwrap()
+        .set_namespace(None);
     assert!(matches!(
         config.validate(),
         Err(ModelError::Invalid { location, .. }) if location.ends_with("HOST_UID.namespace")
     ));
 
-    let mut config = crate::tests::config(Vec::new());
-    config.inputs.get_mut("HOST_GID").unwrap().namespace = Some(InputNamespace::Container);
+    let mut config = bootstrap_config(Vec::new());
+    config
+        .inputs_mut()
+        .get_mut("HOST_GID")
+        .unwrap()
+        .set_namespace(Some(InputNamespace::Container));
     assert!(matches!(
         config.validate(),
         Err(ModelError::Invalid { location, .. }) if location == "bootstrap.identity"
@@ -132,16 +119,9 @@ fn identity_uid_gid_inputs_require_and_agree_on_namespace() {
 
 #[test]
 fn path_input_rejects_traversal_and_shell_fragments() {
-    let input = BootstrapInput {
-        target: "identity.home".to_owned(),
-        input_type: InputType::Path,
-        aliases: vec![],
-        runtime: true,
-        format: None,
-        namespace: None,
-        default: None,
-        allow_outside_workspace: true,
-    };
+    let mut input = BootstrapInput::new("identity.home", InputType::Path);
+    input.set_runtime(true);
+    input.set_allow_outside_workspace(true);
     assert_eq!(
         input.parse_value("/home/alice").unwrap(),
         ParsedInput::Path("/home/alice".to_owned())
@@ -170,9 +150,9 @@ fn condition_parser_only_accepts_restricted_forms() {
 #[test]
 fn startup_actions_reject_runtime_inputs_identity_and_environment() {
     let mut input_action = action("input-path", ActionKind::FilesystemEnsureDir);
-    input_action.path = Some("${input.CONTAINER_HOME}/cache".to_owned());
-    input_action.run_as = RunAs::Root;
-    let error = config(vec![input_action]).validate().unwrap_err();
+    input_action.set_path(Some("${input.CONTAINER_HOME}/cache".to_owned()));
+    input_action.set_run_as(RunAs::Root);
+    let error = bootstrap_config(vec![input_action]).validate().unwrap_err();
     assert!(matches!(
         error,
         ModelError::Invalid { ref location, ref message }
@@ -181,10 +161,12 @@ fn startup_actions_reject_runtime_inputs_identity_and_environment() {
     ));
 
     let mut identity_action = action("identity-owner", ActionKind::FilesystemEnsureDir);
-    identity_action.path = Some("/run/example".to_owned());
-    identity_action.owner = Some("identity.target".to_owned());
-    identity_action.run_as = RunAs::Root;
-    let error = config(vec![identity_action]).validate().unwrap_err();
+    identity_action.set_path(Some("/run/example".to_owned()));
+    identity_action.set_owner(Some("identity.target".to_owned()));
+    identity_action.set_run_as(RunAs::Root);
+    let error = bootstrap_config(vec![identity_action])
+        .validate()
+        .unwrap_err();
     assert!(matches!(
         error,
         ModelError::Invalid { ref location, ref message }
@@ -193,10 +175,12 @@ fn startup_actions_reject_runtime_inputs_identity_and_environment() {
     ));
 
     let mut environment_action = action("environment-condition", ActionKind::FilesystemEnsureDir);
-    environment_action.path = Some("/run/example".to_owned());
-    environment_action.when = Some("env.ENABLE == '1'".to_owned());
-    environment_action.run_as = RunAs::Root;
-    let error = config(vec![environment_action]).validate().unwrap_err();
+    environment_action.set_path(Some("/run/example".to_owned()));
+    environment_action.set_when(Some("env.ENABLE == '1'".to_owned()));
+    environment_action.set_run_as(RunAs::Root);
+    let error = bootstrap_config(vec![environment_action])
+        .validate()
+        .unwrap_err();
     assert!(matches!(
         error,
         ModelError::Invalid { ref location, ref message }
@@ -208,19 +192,19 @@ fn startup_actions_reject_runtime_inputs_identity_and_environment() {
 #[test]
 fn plan_adds_identity_dependency_and_orders_phases_deterministically() {
     let mut identity = action("identity", ActionKind::IdentityResolve);
-    identity.run_as = RunAs::Root;
+    identity.set_run_as(RunAs::Root);
     let mut link = action("link", ActionKind::FilesystemEnsureSymlink);
-    link.link = Some("${identity.home}/.config/app".to_owned());
-    link.target = Some("/data/app".to_owned());
-    link.run_as = RunAs::Target;
-    link.origin = Origin::workspace("workspace");
+    link.set_link(Some("${identity.home}/.config/app".to_owned()));
+    link.set_target(Some("/data/app".to_owned()));
+    link.set_run_as(RunAs::Target);
+    link.set_origin(Origin::workspace("workspace"));
     let mut workspace = action("workspace", ActionKind::FilesystemEnsureDir);
-    workspace.path = Some("/workspace".to_owned());
-    workspace.run_as = RunAs::Root;
-    let mut bootstrap = config(vec![link, workspace, identity]);
-    bootstrap.allow_workspace_overlay = true;
+    workspace.set_path(Some("/workspace".to_owned()));
+    workspace.set_run_as(RunAs::Root);
+    let mut bootstrap = bootstrap_config(vec![link, workspace, identity]);
+    bootstrap.set_allow_workspace_overlay(true);
     bootstrap
-        .policy
+        .policy_mut()
         .workspace_safe_action_kinds
         .insert(ActionKind::FilesystemEnsureSymlink);
     let plan = bootstrap.build_plan().unwrap();
@@ -234,30 +218,30 @@ fn plan_adds_identity_dependency_and_orders_phases_deterministically() {
 #[test]
 fn plan_rejects_missing_dependency_cycles_and_duplicate_ids() {
     let mut first = action("first", ActionKind::FilesystemEnsureDir);
-    first.path = Some("/workspace/one".to_owned());
-    first.depends_on = vec!["missing".to_owned()];
+    first.set_path(Some("/workspace/one".to_owned()));
+    first.set_depends_on(vec!["missing".to_owned()]);
     assert!(matches!(
-        config(vec![first]).build_plan(),
+        bootstrap_config(vec![first]).build_plan(),
         Err(ModelError::MissingDependency { .. })
     ));
 
     let mut a = action("a", ActionKind::FilesystemEnsureDir);
-    a.path = Some("/workspace/a".to_owned());
-    a.depends_on = vec!["b".to_owned()];
+    a.set_path(Some("/workspace/a".to_owned()));
+    a.set_depends_on(vec!["b".to_owned()]);
     let mut b = action("b", ActionKind::FilesystemEnsureDir);
-    b.path = Some("/workspace/b".to_owned());
-    b.depends_on = vec!["a".to_owned()];
+    b.set_path(Some("/workspace/b".to_owned()));
+    b.set_depends_on(vec!["a".to_owned()]);
     assert!(matches!(
-        config(vec![a, b]).build_plan(),
+        bootstrap_config(vec![a, b]).build_plan(),
         Err(ModelError::DependencyCycle(_))
     ));
 
     let mut duplicate = action("same", ActionKind::FilesystemEnsureDir);
-    duplicate.path = Some("/workspace/two".to_owned());
+    duplicate.set_path(Some("/workspace/two".to_owned()));
     let mut duplicate_again = action("same", ActionKind::FilesystemEnsureDir);
-    duplicate_again.path = Some("/workspace/three".to_owned());
+    duplicate_again.set_path(Some("/workspace/three".to_owned()));
     assert!(matches!(
-        config(vec![duplicate, duplicate_again]).build_plan(),
+        bootstrap_config(vec![duplicate, duplicate_again]).build_plan(),
         Err(ModelError::DuplicateActionId(_))
     ));
 }
@@ -265,22 +249,22 @@ fn plan_rejects_missing_dependency_cycles_and_duplicate_ids() {
 #[test]
 fn workspace_actions_are_limited_to_safe_target_user_actions() {
     let mut workspace = action("workspace", ActionKind::FilesystemEnsureDir);
-    workspace.origin = Origin::workspace("repo");
-    workspace.path = Some("/workspace/.cache".to_owned());
-    workspace.run_as = RunAs::Target;
-    let mut bootstrap = config(vec![workspace]);
-    bootstrap.allow_workspace_overlay = true;
+    workspace.set_origin(Origin::workspace("repo"));
+    workspace.set_path(Some("/workspace/.cache".to_owned()));
+    workspace.set_run_as(RunAs::Target);
+    let mut bootstrap = bootstrap_config(vec![workspace]);
+    bootstrap.set_allow_workspace_overlay(true);
     bootstrap
-        .policy
+        .policy_mut()
         .workspace_safe_action_kinds
         .insert(ActionKind::FilesystemEnsureDir);
     assert!(bootstrap.build_plan().is_ok());
 
     let mut root = action("root", ActionKind::FilesystemEnsureDir);
-    root.origin = Origin::workspace("repo");
-    root.path = Some("/etc/unsafe".to_owned());
-    root.run_as = RunAs::Root;
-    bootstrap.actions = vec![root];
+    root.set_origin(Origin::workspace("repo"));
+    root.set_path(Some("/etc/unsafe".to_owned()));
+    root.set_run_as(RunAs::Root);
+    bootstrap.set_actions(vec![root]);
     assert!(matches!(
         bootstrap.build_plan(),
         Err(ModelError::TrustViolation { .. })
@@ -303,15 +287,15 @@ fn rendered_paths_are_revalidated_after_interpolation() {
 #[test]
 fn privilege_drop_and_handoff_are_terminal_and_ordered() {
     let mut identity = action("identity", ActionKind::IdentityResolve);
-    identity.run_as = RunAs::Root;
+    identity.set_run_as(RunAs::Root);
     let mut directory = action("directory", ActionKind::FilesystemEnsureDir);
-    directory.path = Some("/var/lib/app".to_owned());
-    directory.run_as = RunAs::Root;
+    directory.set_path(Some("/var/lib/app".to_owned()));
+    directory.set_run_as(RunAs::Root);
     let mut drop = action("drop", ActionKind::ProcessDropPrivileges);
-    drop.run_as = RunAs::Root;
+    drop.set_run_as(RunAs::Root);
     let handoff = action("handoff", ActionKind::HandoffExec);
 
-    let plan = config(vec![handoff, drop, directory, identity])
+    let plan = bootstrap_config(vec![handoff, drop, directory, identity])
         .build_plan()
         .unwrap();
     assert_eq!(
@@ -325,16 +309,16 @@ fn privilege_drop_and_handoff_are_terminal_and_ordered() {
 #[test]
 fn ssh_prepare_is_a_root_capability_with_identity_dependency_and_safe_fields() {
     let mut identity = action("identity", ActionKind::IdentityResolve);
-    identity.run_as = RunAs::Root;
+    identity.set_run_as(RunAs::Root);
     let mut ssh = action("ssh", ActionKind::ServiceSshPrepare);
-    ssh.run_as = RunAs::Root;
-    ssh.host_key_dir = Some("/etc/ssh".to_owned());
-    ssh.authorized_keys_dir = Some("/home/user/.ssh".to_owned());
-    ssh.runtime_dir = Some("/run/sshd".to_owned());
-    ssh.host_key_types = Some(vec!["ed25519".to_owned()]);
-    ssh.content = Some("ssh-ed25519 AAAAfixture\n".to_owned());
+    ssh.set_run_as(RunAs::Root);
+    ssh.set_host_key_dir(Some("/etc/ssh".to_owned()));
+    ssh.set_authorized_keys_dir(Some("/home/user/.ssh".to_owned()));
+    ssh.set_runtime_dir(Some("/run/sshd".to_owned()));
+    ssh.set_host_key_types(Some(vec!["ed25519".to_owned()]));
+    ssh.set_content(Some("ssh-ed25519 AAAAfixture\n".to_owned()));
 
-    let plan = config(vec![ssh, identity])
+    let plan = bootstrap_config(vec![ssh, identity])
         .build_plan()
         .expect("SSH action should build a static plan");
     assert_eq!(plan.ids().collect::<Vec<_>>(), vec!["identity", "ssh"]);
@@ -355,25 +339,25 @@ fn ssh_prepare_is_a_root_capability_with_identity_dependency_and_safe_fields() {
 #[test]
 fn ssh_prepare_rejects_unsupported_key_types_and_conflicting_key_sources() {
     let mut ssh = action("ssh", ActionKind::ServiceSshPrepare);
-    ssh.run_as = RunAs::Root;
-    ssh.host_key_dir = Some("/etc/ssh".to_owned());
-    ssh.authorized_keys_dir = Some("/etc/ssh/authorized_keys".to_owned());
-    ssh.runtime_dir = Some("/run/sshd".to_owned());
-    ssh.host_key_types = Some(vec!["dsa".to_owned()]);
+    ssh.set_run_as(RunAs::Root);
+    ssh.set_host_key_dir(Some("/etc/ssh".to_owned()));
+    ssh.set_authorized_keys_dir(Some("/etc/ssh/authorized_keys".to_owned()));
+    ssh.set_runtime_dir(Some("/run/sshd".to_owned()));
+    ssh.set_host_key_types(Some(vec!["dsa".to_owned()]));
     assert!(matches!(
-        config(vec![ssh]).build_plan(),
+        bootstrap_config(vec![ssh]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("unsupported SSH host key type")
     ));
 
     let mut ssh = action("ssh", ActionKind::ServiceSshPrepare);
-    ssh.run_as = RunAs::Root;
-    ssh.host_key_dir = Some("/etc/ssh".to_owned());
-    ssh.authorized_keys_dir = Some("/etc/ssh/authorized_keys".to_owned());
-    ssh.runtime_dir = Some("/run/sshd".to_owned());
-    ssh.content = Some("key\n".to_owned());
-    ssh.authorized_keys_source = Some("/tmp/authorized_keys".to_owned());
+    ssh.set_run_as(RunAs::Root);
+    ssh.set_host_key_dir(Some("/etc/ssh".to_owned()));
+    ssh.set_authorized_keys_dir(Some("/etc/ssh/authorized_keys".to_owned()));
+    ssh.set_runtime_dir(Some("/run/sshd".to_owned()));
+    ssh.set_content(Some("key\n".to_owned()));
+    ssh.set_authorized_keys_source(Some("/tmp/authorized_keys".to_owned()));
     assert!(matches!(
-        config(vec![ssh]).build_plan(),
+        bootstrap_config(vec![ssh]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("mutually exclusive")
     ));
 }
@@ -381,13 +365,13 @@ fn ssh_prepare_rejects_unsupported_key_types_and_conflicting_key_sources() {
 #[test]
 fn cgroup_v2_init_action_model_and_plan_effects() {
     let mut cg = action("cg", ActionKind::CgroupV2Init);
-    cg.run_as = RunAs::Root;
-    cg.path = Some("/sys/fs/cgroup".to_owned());
-    cg.subgroup = Some("libpod_parent".to_owned());
-    cg.controllers = Some(vec!["cpu".to_owned(), "memory".to_owned()]);
-    cg.optional_controllers = Some(vec!["io".to_owned()]);
+    cg.set_run_as(RunAs::Root);
+    cg.set_path(Some("/sys/fs/cgroup".to_owned()));
+    cg.set_subgroup(Some("libpod_parent".to_owned()));
+    cg.set_controllers(Some(vec!["cpu".to_owned(), "memory".to_owned()]));
+    cg.set_optional_controllers(Some(vec!["io".to_owned()]));
 
-    let plan = config(vec![cg])
+    let plan = bootstrap_config(vec![cg])
         .build_plan()
         .expect("cgroup init action should build plan");
     assert_eq!(plan.ids().collect::<Vec<_>>(), vec!["cg"]);
@@ -409,10 +393,10 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
 
     // Tests bind_mount mode and shadow_path
     let mut cg_bind = action("cg_bind", ActionKind::CgroupV2Init);
-    cg_bind.run_as = RunAs::Root;
-    cg_bind.mount_mode = Some("bind_mount".to_owned());
-    cg_bind.shadow_path = Some("/run/cgroup".to_owned());
-    let plan_bind = config(vec![cg_bind])
+    cg_bind.set_run_as(RunAs::Root);
+    cg_bind.set_mount_mode(Some("bind_mount".to_owned()));
+    cg_bind.set_shadow_path(Some("/run/cgroup".to_owned()));
+    let plan_bind = bootstrap_config(vec![cg_bind])
         .build_plan()
         .expect("cgroup init with bind_mount should build plan");
     assert_eq!(
@@ -432,46 +416,46 @@ fn cgroup_v2_init_action_model_and_plan_effects() {
 
     // Rejects invalid mount_mode
     let mut cg_bad_mode = action("cg", ActionKind::CgroupV2Init);
-    cg_bad_mode.run_as = RunAs::Root;
-    cg_bad_mode.mount_mode = Some("invalid_mode".to_owned());
+    cg_bad_mode.set_run_as(RunAs::Root);
+    cg_bad_mode.set_mount_mode(Some("invalid_mode".to_owned()));
     assert!(matches!(
-        config(vec![cg_bad_mode]).build_plan(),
+        bootstrap_config(vec![cg_bad_mode]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("invalid mount_mode")
     ));
 
     // Rejects non-root
     let mut cg_user = action("cg", ActionKind::CgroupV2Init);
-    cg_user.run_as = RunAs::Target;
+    cg_user.set_run_as(RunAs::Target);
     assert!(matches!(
-        config(vec![cg_user]).build_plan(),
+        bootstrap_config(vec![cg_user]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("must run as root")
     ));
 
     // Rejects invalid subgroup names
     let mut cg_bad_subgroup = action("cg", ActionKind::CgroupV2Init);
-    cg_bad_subgroup.run_as = RunAs::Root;
-    cg_bad_subgroup.subgroup = Some("foo/bar".to_owned());
+    cg_bad_subgroup.set_run_as(RunAs::Root);
+    cg_bad_subgroup.set_subgroup(Some("foo/bar".to_owned()));
     assert!(matches!(
-        config(vec![cg_bad_subgroup]).build_plan(),
+        bootstrap_config(vec![cg_bad_subgroup]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("subgroup")
     ));
 
     // Rejects empty controllers list
     let mut cg_empty_controllers = action("cg", ActionKind::CgroupV2Init);
-    cg_empty_controllers.run_as = RunAs::Root;
-    cg_empty_controllers.controllers = Some(vec![]);
+    cg_empty_controllers.set_run_as(RunAs::Root);
+    cg_empty_controllers.set_controllers(Some(vec![]));
     assert!(matches!(
-        config(vec![cg_empty_controllers]).build_plan(),
+        bootstrap_config(vec![cg_empty_controllers]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("controllers")
     ));
 
     // Required and optional sets must not overlap.
     let mut cg_duplicate_controllers = action("cg", ActionKind::CgroupV2Init);
-    cg_duplicate_controllers.run_as = RunAs::Root;
-    cg_duplicate_controllers.controllers = Some(vec!["cpu".to_owned()]);
-    cg_duplicate_controllers.optional_controllers = Some(vec!["cpu".to_owned()]);
+    cg_duplicate_controllers.set_run_as(RunAs::Root);
+    cg_duplicate_controllers.set_controllers(Some(vec!["cpu".to_owned()]));
+    cg_duplicate_controllers.set_optional_controllers(Some(vec!["cpu".to_owned()]));
     assert!(matches!(
-        config(vec![cg_duplicate_controllers]).build_plan(),
+        bootstrap_config(vec![cg_duplicate_controllers]).build_plan(),
         Err(ModelError::Invalid { message, .. }) if message.contains("duplicate controller")
     ));
 }

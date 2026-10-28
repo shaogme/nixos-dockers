@@ -1,18 +1,55 @@
-use crate::error::CoreError;
-use crate::identity::ResolvedIdentity;
+use crate::{CoreError, ResolvedIdentity};
 use container_init_bootstrap_model::HandoffConfig;
+use libc::{getegid, geteuid, gid_t, setgid, setgroups, setuid};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    io::Error as IoError,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HandoffCommand {
-    pub program: PathBuf,
-    pub args: Vec<String>,
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+pub struct HandoffContext<'a> {
+    cwd: Option<&'a Path>,
+    login_environment: &'a BTreeMap<String, String>,
+}
+
+impl<'a> HandoffContext<'a> {
+    pub fn new(cwd: Option<&'a Path>, login_environment: &'a BTreeMap<String, String>) -> Self {
+        Self {
+            cwd,
+            login_environment,
+        }
+    }
 }
 
 impl HandoffCommand {
+    pub fn new(program: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+        }
+    }
+
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn into_parts(self) -> (PathBuf, Vec<String>) {
+        (self.program, self.args)
+    }
+
     pub(crate) fn from_config(
         handoff: &HandoffConfig,
         command: &[String],
@@ -20,9 +57,9 @@ impl HandoffCommand {
         Self::from_prefix(
             handoff,
             if command.is_empty() {
-                &handoff.shell_prefix
+                handoff.shell_prefix()
             } else {
-                &handoff.exec_prefix
+                handoff.exec_prefix()
             },
             command,
         )
@@ -35,9 +72,9 @@ impl HandoffCommand {
         Self::from_prefix(
             handoff,
             if command.is_empty() {
-                &handoff.shell_prefix
+                handoff.shell_prefix()
             } else {
-                &handoff.initial_exec_prefix
+                handoff.initial_exec_prefix()
             },
             command,
         )
@@ -59,7 +96,7 @@ impl HandoffCommand {
             args.push(argument.clone());
         }
         Ok(Self {
-            program: PathBuf::from(&handoff.runtime),
+            program: PathBuf::from(&handoff.runtime()),
             args,
         })
     }
@@ -84,7 +121,7 @@ impl HandoffCommand {
     /// so runtimes that resolve user configuration through HOME would otherwise
     /// continue looking under the old user's home directory.
     pub fn exec_with_identity(&self, identity: Option<&ResolvedIdentity>) -> Result<(), CoreError> {
-        let mut command = std::process::Command::new(&self.program);
+        let mut command = Command::new(&self.program);
         command.args(&self.args);
         if let Some(identity) = identity {
             command
@@ -104,7 +141,7 @@ impl HandoffCommand {
     /// daemon keeps root credentials, but receives a canonical root login
     /// environment instead of the target development user's environment.
     pub fn exec_as_root_service(&self) -> Result<(), CoreError> {
-        let mut command = std::process::Command::new(&self.program);
+        let mut command = Command::new(&self.program);
         command
             .args(&self.args)
             .env("HOME", "/root")
@@ -157,8 +194,7 @@ impl HandoffCommand {
             identity,
             supplemental_groups,
             root_service,
-            None,
-            &environment,
+            HandoffContext::new(None, &environment),
         )
     }
 
@@ -170,12 +206,15 @@ impl HandoffCommand {
         identity: &ResolvedIdentity,
         supplemental_groups: &[u32],
         root_service: bool,
-        cwd: Option<&std::path::Path>,
-        login_environment: &BTreeMap<String, String>,
+        context: HandoffContext<'_>,
     ) -> Result<(), CoreError> {
-        let current_uid = unsafe { libc::geteuid() };
-        let current_gid = unsafe { libc::getegid() };
-        let mut command = std::process::Command::new(&self.program);
+        let HandoffContext {
+            cwd,
+            login_environment,
+        } = context;
+        let current_uid = unsafe { geteuid() };
+        let current_gid = unsafe { getegid() };
+        let mut command = Command::new(&self.program);
         command.args(&self.args);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -194,20 +233,20 @@ impl HandoffCommand {
         if current_uid == 0 {
             let groups = supplemental_groups
                 .iter()
-                .map(|group| *group as libc::gid_t)
+                .map(|group| *group as gid_t)
                 .collect::<Vec<_>>();
             let uid = identity.uid;
             let gid = identity.gid;
             unsafe {
                 command.pre_exec(move || {
-                    if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
-                        return Err(std::io::Error::last_os_error());
+                    if setgroups(groups.len(), groups.as_ptr()) != 0 {
+                        return Err(IoError::last_os_error());
                     }
-                    if libc::setgid(gid) != 0 {
-                        return Err(std::io::Error::last_os_error());
+                    if setgid(gid) != 0 {
+                        return Err(IoError::last_os_error());
                     }
-                    if libc::setuid(uid) != 0 {
-                        return Err(std::io::Error::last_os_error());
+                    if setuid(uid) != 0 {
+                        return Err(IoError::last_os_error());
                     }
                     Ok(())
                 });

@@ -4,8 +4,11 @@ use container_init_bootstrap_model::{
     ActionKind, BootstrapConfig, Condition, ConditionValue, Plan,
 };
 use container_init_core::{CoreError, ExecutionOptions, ResolvedIdentity};
-use container_init_protocol::{BackendError, BackendState, BackendStatus};
+use container_init_protocol::{
+    BackendError, BackendState, BackendStatus, MAX_IN_FLIGHT_FRAME_BYTES,
+};
 use libc::{getegid, geteuid};
+use serde::Serialize;
 use serde_json::to_vec;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -18,6 +21,18 @@ use std::{
     },
 };
 use unix_frame::FrameBudget;
+
+#[derive(Serialize)]
+struct SnapshotDescription<'a> {
+    profile: &'a str,
+    config: &'a BootstrapConfig,
+    plan: &'a Plan,
+}
+
+pub(super) struct AllowedClientValues {
+    runtime_inputs: BTreeSet<String>,
+    environment_names: BTreeSet<String>,
+}
 
 pub(super) struct BackendRuntimeOptions {
     pub(super) profile: String,
@@ -48,11 +63,6 @@ pub(super) struct BackendRuntime {
     frame_budget: FrameBudget,
 }
 
-pub(super) struct AllowedClientValues {
-    runtime_inputs: BTreeSet<String>,
-    environment_names: BTreeSet<String>,
-}
-
 impl BackendRuntime {
     pub(super) fn new(options: BackendRuntimeOptions) -> Self {
         Self {
@@ -68,7 +78,7 @@ impl BackendRuntime {
             execution_options: options.execution_options,
             status: RwLock::new(options.status),
             active_connections: Arc::new(AtomicUsize::new(0)),
-            frame_budget: FrameBudget::new(container_init_protocol::MAX_IN_FLIGHT_FRAME_BYTES),
+            frame_budget: FrameBudget::new(MAX_IN_FLIGHT_FRAME_BYTES),
         }
     }
 
@@ -226,32 +236,36 @@ fn validate_lock_directory(metadata: &fs::Metadata, owner_uid: u32) -> io::Resul
 
 fn startup_config(config: &BootstrapConfig) -> BootstrapConfig {
     let mut startup = config.clone();
-    startup.actions.retain(|action| {
-        !action.origin.source.is_workspace()
+    startup.actions_mut().retain(|action| {
+        !action.origin().source().is_workspace()
             && !matches!(
-                action.kind,
+                action.kind(),
                 ActionKind::ProcessDropPrivileges | ActionKind::HandoffExec
             )
     });
     let action_ids = startup
-        .actions
+        .actions()
         .iter()
-        .map(|action| action.id.clone())
+        .map(|action| action.id().to_owned())
         .collect::<BTreeSet<_>>();
-    for action in &mut startup.actions {
-        action
-            .depends_on
-            .retain(|dependency| action_ids.contains(dependency));
+    for action in startup.actions_mut() {
+        let dependencies = action
+            .depends_on()
+            .iter()
+            .filter(|dependency| action_ids.contains(*dependency))
+            .cloned()
+            .collect();
+        action.set_depends_on(dependencies);
     }
     startup
 }
 
 fn request_config(config: &BootstrapConfig) -> BootstrapConfig {
     let mut request = config.clone();
-    request.actions.retain(|action| {
-        action.origin.source.is_workspace()
+    request.actions_mut().retain(|action| {
+        action.origin().source().is_workspace()
             || matches!(
-                action.kind,
+                action.kind(),
                 ActionKind::IdentityResolve
                     | ActionKind::IdentityMapUser
                     | ActionKind::IdentityEnsureHome
@@ -259,30 +273,34 @@ fn request_config(config: &BootstrapConfig) -> BootstrapConfig {
             )
     });
     let action_ids = request
-        .actions
+        .actions()
         .iter()
-        .map(|action| action.id.clone())
+        .map(|action| action.id().to_owned())
         .collect::<BTreeSet<_>>();
-    for action in &mut request.actions {
-        action
-            .depends_on
-            .retain(|dependency| action_ids.contains(dependency));
+    for action in request.actions_mut() {
+        let dependencies = action
+            .depends_on()
+            .iter()
+            .filter(|dependency| action_ids.contains(*dependency))
+            .cloned()
+            .collect();
+        action.set_depends_on(dependencies);
     }
     request
 }
 
 fn allowed_client_values(config: &BootstrapConfig) -> Result<AllowedClientValues, CoreError> {
     let mut runtime_inputs = BTreeSet::new();
-    for (name, input) in &config.inputs {
-        if input.runtime {
+    for (name, input) in config.inputs() {
+        if input.runtime() {
             runtime_inputs.insert(name.clone());
-            runtime_inputs.extend(input.aliases.iter().cloned());
+            runtime_inputs.extend(input.aliases().iter().cloned());
         }
     }
     let mut environment_names = runtime_inputs.clone();
-    for action in &config.actions {
+    for action in config.actions() {
         if matches!(
-            action.kind,
+            action.kind(),
             ActionKind::IdentityResolve
                 | ActionKind::IdentityMapUser
                 | ActionKind::IdentityEnsureHome
@@ -328,7 +346,12 @@ fn collect_environment_names(condition: &Condition, names: &mut BTreeSet<String>
 }
 
 fn snapshot_id(profile: &str, config: &BootstrapConfig, plan: &Plan) -> Result<String, CoreError> {
-    let bytes = to_vec(&(profile, config, plan)).map_err(|source| CoreError::Serialization {
+    let bytes = to_vec(&SnapshotDescription {
+        profile,
+        config,
+        plan,
+    })
+    .map_err(|source| CoreError::Serialization {
         operation: "serialize backend snapshot id".to_owned(),
         source,
     })?;

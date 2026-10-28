@@ -1,12 +1,10 @@
-use std::ffi::OsString;
-use std::path::PathBuf;
-use std::time::Duration;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Cli {
-    pub options: CliOptions,
-    pub command: CliCommand,
-}
+use std::{
+    error::Error,
+    ffi::OsString,
+    fmt::{Display, Formatter, Result as FmtResult},
+    path::PathBuf,
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CliOptions {
@@ -33,21 +31,31 @@ pub enum CliCommand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Cli {
+    options: CliOptions,
+    command: CliCommand,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseError {
     Invalid(String),
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ParseError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Invalid(message) => write!(formatter, "{message}"),
         }
     }
 }
 
-impl std::error::Error for ParseError {}
+impl Error for ParseError {}
 
 impl Cli {
+    pub fn into_parts(self) -> (CliOptions, CliCommand) {
+        (self.options, self.command)
+    }
+
     pub fn parse<I>(arguments: I) -> Result<Self, ParseError>
     where
         I: IntoIterator<Item = OsString>,
@@ -229,6 +237,10 @@ impl Cli {
         validate_command_options(&options, &command)?;
         Ok(Self { options, command })
     }
+
+    pub(crate) fn usage(reason: &str) -> String {
+        usage(reason)
+    }
 }
 
 fn parse_common_option(
@@ -350,7 +362,7 @@ fn is_help(argument: &str) -> bool {
     matches!(argument, "--help" | "-h")
 }
 
-pub(crate) fn usage(reason: &str) -> String {
+fn usage(reason: &str) -> String {
     let prefix = if reason.is_empty() {
         String::new()
     } else {

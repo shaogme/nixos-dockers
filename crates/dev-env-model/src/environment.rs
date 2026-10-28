@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::validation::{validate_concrete_path, validate_env_name};
-use crate::Condition;
-use crate::{ModelError, ModelErrorReason};
+use crate::{validation::StringValidation, Condition, ModelError, ModelErrorReason};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -25,14 +23,22 @@ pub enum PathMode {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentPath {
     #[serde(default)]
-    pub prepend: Vec<String>,
+    prepend: Vec<String>,
     #[serde(default)]
-    pub append: Vec<String>,
+    append: Vec<String>,
     #[serde(default)]
-    pub remove: Vec<String>,
+    remove: Vec<String>,
 }
 
 impl EnvironmentPath {
+    pub fn new(prepend: Vec<String>, append: Vec<String>, remove: Vec<String>) -> Self {
+        Self {
+            prepend,
+            append,
+            remove,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         for (kind, entries) in [
             ("prepend", &self.prepend),
@@ -40,7 +46,7 @@ impl EnvironmentPath {
             ("remove", &self.remove),
         ] {
             for (index, entry) in entries.iter().enumerate() {
-                validate_concrete_path(&format!("environment.path.{kind}[{index}]"), entry)?;
+                entry.validate_concrete_path(&format!("environment.path.{kind}[{index}]"))?;
             }
         }
         Ok(())
@@ -70,14 +76,21 @@ impl EnvironmentPath {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConditionalEnvironmentVariable {
-    pub value: String,
-    pub when: String,
+    value: String,
+    when: String,
 }
 
 impl ConditionalEnvironmentVariable {
+    pub fn new(value: impl Into<String>, when: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            when: when.into(),
+        }
+    }
+
     pub fn validate(&self, name: &str) -> Result<(), ModelError> {
         let location = format!("environment.conditional_variables.{name}");
-        validate_env_name(&location, name)?;
+        name.validate_env_name(&location)?;
         if self.value.contains('\0') {
             return Err(ModelError::InvalidEnvironmentValue {
                 location: format!("{location}.value"),
@@ -96,15 +109,15 @@ impl ConditionalEnvironmentVariable {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     #[serde(default = "default_true")]
-    pub inherit_process: bool,
+    inherit_process: bool,
     #[serde(default)]
-    pub configured_value_precedence: ConfiguredValuePrecedence,
+    configured_value_precedence: ConfiguredValuePrecedence,
     #[serde(default)]
-    pub variables: std::collections::BTreeMap<String, String>,
+    variables: BTreeMap<String, String>,
     #[serde(default)]
-    pub conditional_variables: std::collections::BTreeMap<String, ConditionalEnvironmentVariable>,
+    conditional_variables: BTreeMap<String, ConditionalEnvironmentVariable>,
     #[serde(default)]
-    pub path: EnvironmentPath,
+    path: EnvironmentPath,
 }
 
 fn default_true() -> bool {
@@ -124,9 +137,55 @@ impl Default for EnvironmentConfig {
 }
 
 impl EnvironmentConfig {
+    pub fn new(
+        inherit_process: bool,
+        configured_value_precedence: ConfiguredValuePrecedence,
+        variables: BTreeMap<String, String>,
+        conditional_variables: BTreeMap<String, ConditionalEnvironmentVariable>,
+        path: EnvironmentPath,
+    ) -> Self {
+        Self {
+            inherit_process,
+            configured_value_precedence,
+            variables,
+            conditional_variables,
+            path,
+        }
+    }
+
+    pub fn with_variables(mut self, variables: BTreeMap<String, String>) -> Self {
+        self.variables = variables;
+        self
+    }
+
+    pub fn with_conditional_variables(
+        mut self,
+        conditional_variables: BTreeMap<String, ConditionalEnvironmentVariable>,
+    ) -> Self {
+        self.conditional_variables = conditional_variables;
+        self
+    }
+
+    pub fn with_configured_value_precedence(
+        mut self,
+        precedence: ConfiguredValuePrecedence,
+    ) -> Self {
+        self.configured_value_precedence = precedence;
+        self
+    }
+
+    pub fn with_conditional_variable(
+        mut self,
+        name: impl Into<String>,
+        variable: ConditionalEnvironmentVariable,
+    ) -> Self {
+        self.conditional_variables.insert(name.into(), variable);
+        self
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         for (name, value) in &self.variables {
-            validate_env_name(&format!("environment.variables.{name}"), name)?;
+            name.validate_env_name(&format!("environment.variables.{name}"))?;
             if value.contains('\0') {
                 return Err(ModelError::InvalidEnvironmentValue {
                     location: format!("environment.variables.{name}"),
@@ -144,5 +203,51 @@ impl EnvironmentConfig {
             }
         }
         self.path.validate()
+    }
+}
+
+impl EnvironmentPath {
+    pub fn prepend(&self) -> &[String] {
+        &self.prepend
+    }
+
+    pub fn append(&self) -> &[String] {
+        &self.append
+    }
+
+    pub fn remove(&self) -> &[String] {
+        &self.remove
+    }
+}
+
+impl ConditionalEnvironmentVariable {
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn when(&self) -> &str {
+        &self.when
+    }
+}
+
+impl EnvironmentConfig {
+    pub fn inherit_process(&self) -> bool {
+        self.inherit_process
+    }
+
+    pub fn configured_value_precedence(&self) -> ConfiguredValuePrecedence {
+        self.configured_value_precedence
+    }
+
+    pub fn variables(&self) -> &BTreeMap<String, String> {
+        &self.variables
+    }
+
+    pub fn conditional_variables(&self) -> &BTreeMap<String, ConditionalEnvironmentVariable> {
+        &self.conditional_variables
+    }
+
+    pub fn path(&self) -> &EnvironmentPath {
+        &self.path
     }
 }

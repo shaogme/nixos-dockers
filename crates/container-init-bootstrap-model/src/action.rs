@@ -1,72 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::condition::Condition;
-use crate::config::BootstrapConfig;
-use crate::error::ModelError;
-use crate::plan::PlanPhase;
-use crate::provenance::Origin;
-use crate::validation::{
-    is_action_id, parse_mode, validate_executable, validate_owner, validate_path_template,
-    validate_user_name,
+use crate::{
+    condition::{Condition, PathTemplate},
+    error::ModelError,
+    input::BootstrapInput,
+    plan::PlanPhase,
 };
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionKind {
-    IdentityResolve,
-    IdentityMapUser,
-    IdentityEnsureHome,
-    FilesystemEnsureDir,
-    FilesystemEnsureFile,
-    FilesystemEnsureSymlink,
-    FilesystemChown,
-    FilesystemChmod,
-    ProcessSetUserShell,
-    ProcessDropPrivileges,
-    ServiceSshPrepare,
-    #[serde(alias = "cgroup_init")]
-    CgroupV2Init,
-    HandoffExec,
-}
-
-impl ActionKind {
-    pub fn idempotency(self) -> Idempotency {
-        match self {
-            Self::HandoffExec => Idempotency::NonIdempotent,
-            _ => Idempotency::Idempotent,
-        }
-    }
-
-    fn intrinsic_admin_only(self) -> bool {
-        matches!(
-            self,
-            Self::IdentityMapUser
-                | Self::ProcessSetUserShell
-                | Self::ProcessDropPrivileges
-                | Self::ServiceSshPrepare
-                | Self::CgroupV2Init
-                | Self::HandoffExec
-        )
-    }
-
-    fn phase(self, run_as: RunAs) -> PlanPhase {
-        match self {
-            Self::HandoffExec | Self::ProcessDropPrivileges => PlanPhase::Handoff,
-            Self::IdentityResolve | Self::IdentityMapUser | Self::IdentityEnsureHome
-                if run_as == RunAs::Root =>
-            {
-                PlanPhase::Root
-            }
-            Self::CgroupV2Init => PlanPhase::Root,
-            _ => match run_as {
-                RunAs::Root => PlanPhase::Root,
-                RunAs::Current => PlanPhase::Current,
-                RunAs::Target => PlanPhase::Target,
-            },
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,68 +41,210 @@ pub enum Idempotency {
     NonIdempotent,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    ImageProfile,
+    AdminProfile,
+    UserOverlay,
+    WorkspaceOverlay,
+    Runtime,
+    Cli,
+    Unknown,
+}
+
+impl SourceKind {
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, Self::ImageProfile | Self::AdminProfile)
+    }
+
+    pub fn is_workspace(&self) -> bool {
+        matches!(self, Self::WorkspaceOverlay)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct Origin {
+    profile: String,
+    source: SourceKind,
+    location: Option<String>,
+}
+
+impl Origin {
+    pub fn new(profile: impl Into<String>, source: SourceKind, location: Option<String>) -> Self {
+        Self {
+            profile: profile.into(),
+            source,
+            location,
+        }
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub fn set_profile(&mut self, profile: impl Into<String>) {
+        self.profile = profile.into();
+    }
+
+    pub fn source(&self) -> &SourceKind {
+        &self.source
+    }
+
+    pub fn set_source(&mut self, source: SourceKind) {
+        self.source = source;
+    }
+
+    pub fn location(&self) -> &Option<String> {
+        &self.location
+    }
+
+    pub fn set_location(&mut self, location: Option<String>) {
+        self.location = location;
+    }
+
+    pub fn image(profile: impl Into<String>) -> Self {
+        Self::new(profile, SourceKind::ImageProfile, None)
+    }
+
+    pub fn admin(profile: impl Into<String>) -> Self {
+        Self::new(profile, SourceKind::AdminProfile, None)
+    }
+
+    pub fn workspace(profile: impl Into<String>) -> Self {
+        Self::new(profile, SourceKind::WorkspaceOverlay, None)
+    }
+
+    pub fn unknown() -> Self {
+        Self::new("<unknown>", SourceKind::Unknown, None)
+    }
+}
+
+impl Default for Origin {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    IdentityResolve,
+    IdentityMapUser,
+    IdentityEnsureHome,
+    FilesystemEnsureDir,
+    FilesystemEnsureFile,
+    FilesystemEnsureSymlink,
+    FilesystemChown,
+    FilesystemChmod,
+    ProcessSetUserShell,
+    ProcessDropPrivileges,
+    ServiceSshPrepare,
+    #[serde(alias = "cgroup_init")]
+    CgroupV2Init,
+    HandoffExec,
+}
+
+impl ActionKind {
+    pub fn idempotency(self) -> Idempotency {
+        match self {
+            Self::HandoffExec => Idempotency::NonIdempotent,
+            _ => Idempotency::Idempotent,
+        }
+    }
+
+    pub(crate) fn intrinsic_admin_only(self) -> bool {
+        matches!(
+            self,
+            Self::IdentityMapUser
+                | Self::ProcessSetUserShell
+                | Self::ProcessDropPrivileges
+                | Self::ServiceSshPrepare
+                | Self::CgroupV2Init
+                | Self::HandoffExec
+        )
+    }
+
+    fn phase(self, run_as: RunAs) -> PlanPhase {
+        match self {
+            Self::HandoffExec | Self::ProcessDropPrivileges => PlanPhase::Handoff,
+            Self::IdentityResolve | Self::IdentityMapUser | Self::IdentityEnsureHome
+                if run_as == RunAs::Root =>
+            {
+                PlanPhase::Root
+            }
+            Self::CgroupV2Init => PlanPhase::Root,
+            _ => match run_as {
+                RunAs::Root => PlanPhase::Root,
+                RunAs::Current => PlanPhase::Current,
+                RunAs::Target => PlanPhase::Target,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Action {
-    pub id: String,
-    pub kind: ActionKind,
-    pub path: Option<String>,
-    pub link: Option<String>,
-    pub target: Option<String>,
-    pub mode: Option<String>,
-    pub parent_mode: Option<String>,
-    pub owner: Option<String>,
-    pub user: Option<String>,
-    pub shell: Option<String>,
-    pub content: Option<String>,
+    id: String,
+    kind: ActionKind,
+    path: Option<String>,
+    link: Option<String>,
+    target: Option<String>,
+    mode: Option<String>,
+    parent_mode: Option<String>,
+    owner: Option<String>,
+    user: Option<String>,
+    shell: Option<String>,
+    content: Option<String>,
     /// SSH service capability fields. These keep every service path in the
     /// profile instead of introducing container-init-wide SSH defaults.
     #[serde(alias = "ssh_host_key_dir")]
-    pub host_key_dir: Option<String>,
+    host_key_dir: Option<String>,
     #[serde(alias = "ssh_authorized_keys_dir")]
-    pub authorized_keys_dir: Option<String>,
+    authorized_keys_dir: Option<String>,
     #[serde(alias = "ssh_authorized_keys_source", alias = "authorized_keys_file")]
-    pub authorized_keys_source: Option<String>,
+    authorized_keys_source: Option<String>,
     #[serde(alias = "ssh_runtime_dir")]
-    pub runtime_dir: Option<String>,
+    runtime_dir: Option<String>,
     #[serde(alias = "key_types")]
-    pub host_key_types: Option<Vec<String>>,
+    host_key_types: Option<Vec<String>>,
     #[serde(alias = "keygen")]
-    pub ssh_keygen: Option<String>,
+    ssh_keygen: Option<String>,
     #[serde(alias = "cgroup_subgroup", alias = "init_subgroup")]
-    pub subgroup: Option<String>,
+    subgroup: Option<String>,
     #[serde(
         alias = "cgroup_controllers",
         alias = "required_controllers",
         alias = "cgroup_required_controllers"
     )]
-    pub controllers: Option<Vec<String>>,
+    controllers: Option<Vec<String>>,
     #[serde(alias = "cgroup_optional_controllers")]
-    pub optional_controllers: Option<Vec<String>>,
+    optional_controllers: Option<Vec<String>>,
     /// Optional explicit configuration for the action's subgroup. These are
     /// kept separate from the controllers delegated at the hierarchy root.
-    pub subgroup_type: Option<String>,
-    pub subgroup_controllers: Option<Vec<String>>,
-    pub subgroup_controller_values: Option<BTreeMap<String, String>>,
+    subgroup_type: Option<String>,
+    subgroup_controllers: Option<Vec<String>>,
+    subgroup_controller_values: Option<BTreeMap<String, String>>,
     #[serde(alias = "cgroup_mount_mode")]
-    pub mount_mode: Option<String>,
+    mount_mode: Option<String>,
     #[serde(alias = "cgroup_shadow_path")]
-    pub shadow_path: Option<String>,
-    pub when: Option<String>,
+    shadow_path: Option<String>,
+    when: Option<String>,
     #[serde(default)]
-    pub failure: FailurePolicy,
+    failure: FailurePolicy,
     #[serde(default = "default_run_as")]
-    pub run_as: RunAs,
+    run_as: RunAs,
     #[serde(default)]
-    pub depends_on: Vec<String>,
-    pub reason: Option<String>,
+    depends_on: Vec<String>,
+    reason: Option<String>,
     #[serde(default)]
-    pub sensitivity: Sensitivity,
+    sensitivity: Sensitivity,
     #[serde(default)]
-    pub recursive: bool,
+    recursive: bool,
     /// Set by the profile loader; omitted from the flat Bootstrap DSL.
     #[serde(skip)]
-    pub origin: Origin,
+    origin: Origin,
 }
 
 fn default_run_as() -> RunAs {
@@ -206,6 +288,273 @@ impl Action {
             recursive: false,
             origin,
         }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    pub fn kind(&self) -> ActionKind {
+        self.kind
+    }
+
+    pub fn set_kind(&mut self, kind: ActionKind) {
+        self.kind = kind;
+    }
+
+    pub fn path(&self) -> &Option<String> {
+        &self.path
+    }
+
+    pub fn set_path(&mut self, path: Option<String>) {
+        self.path = path;
+    }
+
+    pub fn link(&self) -> &Option<String> {
+        &self.link
+    }
+
+    pub fn set_link(&mut self, link: Option<String>) {
+        self.link = link;
+    }
+
+    pub fn target(&self) -> &Option<String> {
+        &self.target
+    }
+
+    pub fn set_target(&mut self, target: Option<String>) {
+        self.target = target;
+    }
+
+    pub fn mode(&self) -> &Option<String> {
+        &self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Option<String>) {
+        self.mode = mode;
+    }
+
+    pub fn parent_mode(&self) -> &Option<String> {
+        &self.parent_mode
+    }
+
+    pub fn set_parent_mode(&mut self, parent_mode: Option<String>) {
+        self.parent_mode = parent_mode;
+    }
+
+    pub fn owner(&self) -> &Option<String> {
+        &self.owner
+    }
+
+    pub fn set_owner(&mut self, owner: Option<String>) {
+        self.owner = owner;
+    }
+
+    pub fn user(&self) -> &Option<String> {
+        &self.user
+    }
+
+    pub fn set_user(&mut self, user: Option<String>) {
+        self.user = user;
+    }
+
+    pub fn shell(&self) -> &Option<String> {
+        &self.shell
+    }
+
+    pub fn set_shell(&mut self, shell: Option<String>) {
+        self.shell = shell;
+    }
+
+    pub fn content(&self) -> &Option<String> {
+        &self.content
+    }
+
+    pub fn set_content(&mut self, content: Option<String>) {
+        self.content = content;
+    }
+
+    pub fn host_key_dir(&self) -> &Option<String> {
+        &self.host_key_dir
+    }
+
+    pub fn set_host_key_dir(&mut self, host_key_dir: Option<String>) {
+        self.host_key_dir = host_key_dir;
+    }
+
+    pub fn authorized_keys_dir(&self) -> &Option<String> {
+        &self.authorized_keys_dir
+    }
+
+    pub fn set_authorized_keys_dir(&mut self, authorized_keys_dir: Option<String>) {
+        self.authorized_keys_dir = authorized_keys_dir;
+    }
+
+    pub fn authorized_keys_source(&self) -> &Option<String> {
+        &self.authorized_keys_source
+    }
+
+    pub fn set_authorized_keys_source(&mut self, authorized_keys_source: Option<String>) {
+        self.authorized_keys_source = authorized_keys_source;
+    }
+
+    pub fn runtime_dir(&self) -> &Option<String> {
+        &self.runtime_dir
+    }
+
+    pub fn set_runtime_dir(&mut self, runtime_dir: Option<String>) {
+        self.runtime_dir = runtime_dir;
+    }
+
+    pub fn host_key_types(&self) -> &Option<Vec<String>> {
+        &self.host_key_types
+    }
+
+    pub fn set_host_key_types(&mut self, host_key_types: Option<Vec<String>>) {
+        self.host_key_types = host_key_types;
+    }
+
+    pub fn ssh_keygen(&self) -> &Option<String> {
+        &self.ssh_keygen
+    }
+
+    pub fn set_ssh_keygen(&mut self, ssh_keygen: Option<String>) {
+        self.ssh_keygen = ssh_keygen;
+    }
+
+    pub fn subgroup(&self) -> &Option<String> {
+        &self.subgroup
+    }
+
+    pub fn set_subgroup(&mut self, subgroup: Option<String>) {
+        self.subgroup = subgroup;
+    }
+
+    pub fn controllers(&self) -> &Option<Vec<String>> {
+        &self.controllers
+    }
+
+    pub fn set_controllers(&mut self, controllers: Option<Vec<String>>) {
+        self.controllers = controllers;
+    }
+
+    pub fn optional_controllers(&self) -> &Option<Vec<String>> {
+        &self.optional_controllers
+    }
+
+    pub fn set_optional_controllers(&mut self, optional_controllers: Option<Vec<String>>) {
+        self.optional_controllers = optional_controllers;
+    }
+
+    pub fn subgroup_type(&self) -> &Option<String> {
+        &self.subgroup_type
+    }
+
+    pub fn set_subgroup_type(&mut self, subgroup_type: Option<String>) {
+        self.subgroup_type = subgroup_type;
+    }
+
+    pub fn subgroup_controllers(&self) -> &Option<Vec<String>> {
+        &self.subgroup_controllers
+    }
+
+    pub fn set_subgroup_controllers(&mut self, subgroup_controllers: Option<Vec<String>>) {
+        self.subgroup_controllers = subgroup_controllers;
+    }
+
+    pub fn subgroup_controller_values(&self) -> &Option<BTreeMap<String, String>> {
+        &self.subgroup_controller_values
+    }
+
+    pub fn set_subgroup_controller_values(
+        &mut self,
+        subgroup_controller_values: Option<BTreeMap<String, String>>,
+    ) {
+        self.subgroup_controller_values = subgroup_controller_values;
+    }
+
+    pub fn mount_mode(&self) -> &Option<String> {
+        &self.mount_mode
+    }
+
+    pub fn set_mount_mode(&mut self, mount_mode: Option<String>) {
+        self.mount_mode = mount_mode;
+    }
+
+    pub fn shadow_path(&self) -> &Option<String> {
+        &self.shadow_path
+    }
+
+    pub fn set_shadow_path(&mut self, shadow_path: Option<String>) {
+        self.shadow_path = shadow_path;
+    }
+
+    pub fn when(&self) -> &Option<String> {
+        &self.when
+    }
+
+    pub fn set_when(&mut self, when: Option<String>) {
+        self.when = when;
+    }
+
+    pub fn failure(&self) -> FailurePolicy {
+        self.failure
+    }
+
+    pub fn set_failure(&mut self, failure: FailurePolicy) {
+        self.failure = failure;
+    }
+
+    pub fn run_as(&self) -> RunAs {
+        self.run_as
+    }
+
+    pub fn set_run_as(&mut self, run_as: RunAs) {
+        self.run_as = run_as;
+    }
+
+    pub fn depends_on(&self) -> &[String] {
+        &self.depends_on
+    }
+
+    pub fn set_depends_on(&mut self, depends_on: Vec<String>) {
+        self.depends_on = depends_on;
+    }
+
+    pub fn reason(&self) -> &Option<String> {
+        &self.reason
+    }
+
+    pub fn set_reason(&mut self, reason: Option<String>) {
+        self.reason = reason;
+    }
+
+    pub fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
+    }
+
+    pub fn set_sensitivity(&mut self, sensitivity: Sensitivity) {
+        self.sensitivity = sensitivity;
+    }
+
+    pub fn recursive(&self) -> bool {
+        self.recursive
+    }
+
+    pub fn set_recursive(&mut self, recursive: bool) {
+        self.recursive = recursive;
+    }
+
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    pub fn set_origin(&mut self, origin: Origin) {
+        self.origin = origin;
     }
 
     pub fn references_identity(&self) -> bool {
@@ -267,383 +616,101 @@ impl Action {
         self.host_key_types.as_deref().unwrap_or(&[])
     }
 
-    pub(crate) fn validate(&self, config: &BootstrapConfig) -> Result<(), ModelError> {
-        if self.id.is_empty() || !is_action_id(&self.id) {
-            return Err(ModelError::Invalid {
-                location: format!("bootstrap.actions[{}].id", self.id),
-                message: "action id must contain only letters, digits, '.', '_' or '-' and may not be empty".to_owned(),
-            });
-        }
-
-        if self.kind.intrinsic_admin_only() && !self.origin.source.is_trusted() {
-            return Err(ModelError::TrustViolation {
-                action: self.id.clone(),
-                source: self.origin.source.clone(),
-                message: "this action is restricted to an image or admin profile".to_owned(),
-            });
-        }
-        if config.policy.admin_only_action_kinds.contains(&self.kind)
-            && !self.origin.source.is_trusted()
-        {
-            return Err(ModelError::TrustViolation {
-                action: self.id.clone(),
-                source: self.origin.source.clone(),
-                message: "the configured policy marks this action kind admin-only".to_owned(),
-            });
-        }
-        if self.run_as == RunAs::Root && !self.origin.source.is_trusted() {
-            return Err(ModelError::TrustViolation {
-                action: self.id.clone(),
-                source: self.origin.source.clone(),
-                message: "root actions require an image or admin profile".to_owned(),
-            });
-        }
-        if self.origin.source.is_workspace() {
-            if !config.allow_workspace_overlay {
-                return Err(ModelError::WorkspaceOverlayDisabled(self.id.clone()));
-            }
-            if !config
-                .policy
-                .workspace_safe_action_kinds
-                .contains(&self.kind)
-            {
-                return Err(ModelError::TrustViolation {
-                    action: self.id.clone(),
-                    source: self.origin.source.clone(),
-                    message: "workspace overlays may use only workspace-safe action kinds"
-                        .to_owned(),
-                });
-            }
-            if self.run_as != RunAs::Target {
-                return Err(ModelError::TrustViolation {
-                    action: self.id.clone(),
-                    source: self.origin.source.clone(),
-                    message: "workspace actions must run as identity.target".to_owned(),
-                });
-            }
-        }
-        if !self.origin.source.is_trusted() && !self.origin.source.is_workspace() {
-            return Err(ModelError::TrustViolation {
-                action: self.id.clone(),
-                source: self.origin.source.clone(),
-                message: "bootstrap actions may originate only from an image, admin, or explicitly allowed workspace profile".to_owned(),
-            });
-        }
-
-        if matches!(
-            self.kind,
-            ActionKind::IdentityResolve
-                | ActionKind::IdentityMapUser
-                | ActionKind::IdentityEnsureHome
-                | ActionKind::ServiceSshPrepare
-                | ActionKind::ProcessDropPrivileges
-                | ActionKind::CgroupV2Init
-        ) && self.run_as != RunAs::Root
-        {
-            return Err(ModelError::Invalid {
-                location: format!("bootstrap.actions.{}.run_as", self.id),
-                message: "this action kind must run as root".to_owned(),
-            });
-        }
-
-        if let Some(when) = &self.when {
-            Condition::parse(when)?;
-        }
-        for field in [
-            ("path", self.path.as_deref()),
-            ("link", self.link.as_deref()),
-            ("target", self.target.as_deref()),
-            ("host_key_dir", self.host_key_dir.as_deref()),
-            ("authorized_keys_dir", self.authorized_keys_dir.as_deref()),
-            (
-                "authorized_keys_source",
-                self.authorized_keys_source.as_deref(),
-            ),
-            ("runtime_dir", self.runtime_dir.as_deref()),
-            ("shadow_path", self.shadow_path.as_deref()),
-        ] {
-            if let Some(value) = field.1 {
-                validate_path_template(
-                    &format!("bootstrap.actions.{}.{}", self.id, field.0),
-                    value,
-                )?;
-            }
-        }
-        if self.kind != ActionKind::CgroupV2Init {
-            if let Some(mode) = &self.mode {
-                parse_mode(mode).map_err(|message| ModelError::Invalid {
-                    location: format!("bootstrap.actions.{}.mode", self.id),
-                    message,
-                })?;
-            }
-        }
-        if let Some(mode) = &self.parent_mode {
-            parse_mode(mode).map_err(|message| ModelError::Invalid {
-                location: format!("bootstrap.actions.{}.parent_mode", self.id),
-                message,
-            })?;
-        }
-        if let Some(shell) = &self.shell {
-            validate_executable(&format!("bootstrap.actions.{}.shell", self.id), shell)?;
-        }
-        if let Some(keygen) = &self.ssh_keygen {
-            validate_executable(&format!("bootstrap.actions.{}.ssh_keygen", self.id), keygen)?;
-        }
-        if let Some(user) = &self.user {
-            if user != "identity.target" {
-                validate_user_name(&format!("bootstrap.actions.{}.user", self.id), user)?;
-            }
-        }
-        if let Some(owner) = &self.owner {
-            validate_owner(&format!("bootstrap.actions.{}.owner", self.id), owner)?;
-        }
-        if let Some(content) = &self.content {
-            if content.contains('\0') {
-                return Err(ModelError::Invalid {
-                    location: format!("bootstrap.actions.{}.content", self.id),
-                    message: "content may not contain NUL".to_owned(),
-                });
-            }
-        }
-        for dependency in &self.depends_on {
-            if !is_action_id(dependency) {
-                return Err(ModelError::Invalid {
-                    location: format!("bootstrap.actions.{}.depends_on", self.id),
-                    message: format!("invalid dependency id {dependency:?}"),
-                });
-            }
-        }
-
-        self.validate_kind_fields()
-    }
-
-    fn validate_kind_fields(&self) -> Result<(), ModelError> {
-        let require = |name: &str, value: Option<&String>| {
-            if value.is_none() {
-                Err(ModelError::Invalid {
-                    location: format!("bootstrap.actions.{}.{}", self.id, name),
-                    message: "field is required for this action kind".to_owned(),
-                })
-            } else {
-                Ok(())
-            }
-        };
-        match self.kind {
-            ActionKind::FilesystemEnsureDir => require("path", self.path.as_ref())?,
-            ActionKind::FilesystemEnsureFile => {
-                require("path", self.path.as_ref())?;
-                if self.content.is_none() && self.mode.is_none() {
-                    return Err(ModelError::Invalid {
-                        location: format!("bootstrap.actions.{}.content", self.id),
-                        message: "ensure_file requires content or mode".to_owned(),
-                    });
-                }
-            }
-            ActionKind::FilesystemEnsureSymlink => {
-                require("link", self.link.as_ref())?;
-                require("target", self.target.as_ref())?;
-            }
-            ActionKind::FilesystemChown => {
-                require("path", self.path.as_ref())?;
-                require("owner", self.owner.as_ref())?;
-            }
-            ActionKind::FilesystemChmod => {
-                require("path", self.path.as_ref())?;
-                require("mode", self.mode.as_ref())?;
-            }
-            ActionKind::ProcessSetUserShell => {
-                require("user", self.user.as_ref())?;
-                require("shell", self.shell.as_ref())?;
-            }
-            ActionKind::ServiceSshPrepare => {
-                // The generic path/link/target spellings are retained as a
-                // compatibility convenience for early Bootstrap DSL users:
-                // path = host-key dir, target = authorized-keys dir, and
-                // link = runtime dir. The named fields are canonical.
-                if self.host_key_dir.is_none() && self.path.is_none() {
-                    require("host_key_dir", None)?;
-                }
-                if self.authorized_keys_dir.is_none() && self.target.is_none() {
-                    require("authorized_keys_dir", None)?;
-                }
-                if self.runtime_dir.is_none() && self.link.is_none() {
-                    require("runtime_dir", None)?;
-                }
-                if let Some(types) = &self.host_key_types {
-                    if types.is_empty() {
-                        return Err(ModelError::Invalid {
-                            location: format!("bootstrap.actions.{}.host_key_types", self.id),
-                            message: "at least one host key type is required".to_owned(),
-                        });
-                    }
-                    let mut seen = std::collections::BTreeSet::new();
-                    for key_type in types {
-                        if !matches!(key_type.as_str(), "rsa" | "ed25519" | "ecdsa") {
-                            return Err(ModelError::Invalid {
-                                location: format!("bootstrap.actions.{}.host_key_types", self.id),
-                                message: format!("unsupported SSH host key type {key_type:?}"),
-                            });
-                        }
-                        if !seen.insert(key_type) {
-                            return Err(ModelError::Invalid {
-                                location: format!("bootstrap.actions.{}.host_key_types", self.id),
-                                message: format!("duplicate SSH host key type {key_type:?}"),
-                            });
-                        }
-                    }
-                }
-                if self.authorized_keys_source.is_some() && self.content.is_some() {
-                    return Err(ModelError::Invalid {
-                        location: format!("bootstrap.actions.{}", self.id),
-                        message: "authorized_keys_source and content are mutually exclusive"
-                            .to_owned(),
-                    });
-                }
-            }
-            ActionKind::CgroupV2Init => {
-                let resolved_mount_mode = self.mount_mode.as_deref().or(self.mode.as_deref());
-                if let Some(mode_str) = resolved_mount_mode {
-                    match mode_str {
-                        "default" | "direct" | "bind_mount" | "mount_shadow" | "shadow" => {}
-                        _ => {
-                            return Err(ModelError::Invalid {
-                                location: format!("bootstrap.actions.{}.mount_mode", self.id),
-                                message: format!(
-                                    "invalid mount_mode {mode_str:?}; expected 'default' or 'bind_mount'"
-                                ),
-                            });
-                        }
-                    }
-                }
-                if let Some(subgroup) = &self.subgroup {
-                    if subgroup.is_empty()
-                        || subgroup.contains('/')
-                        || subgroup.contains("..")
-                        || subgroup.contains('\0')
-                    {
-                        return Err(ModelError::Invalid {
-                            location: format!("bootstrap.actions.{}.subgroup", self.id),
-                            message: "subgroup must not be empty or contain '/', '..', or NUL"
-                                .to_owned(),
-                        });
-                    }
-                }
-                let mut seen = std::collections::BTreeSet::new();
-                for (field, controllers) in [
-                    ("controllers", self.controllers.as_ref()),
-                    ("optional_controllers", self.optional_controllers.as_ref()),
-                ] {
-                    let Some(controllers) = controllers else {
-                        continue;
-                    };
-                    if controllers.is_empty() {
-                        return Err(ModelError::Invalid {
-                            location: format!("bootstrap.actions.{}.{}", self.id, field),
-                            message: "controllers list may not be empty if specified".to_owned(),
-                        });
-                    }
-                    for controller in controllers {
-                        if controller.is_empty()
-                            || controller.contains(char::is_whitespace)
-                            || controller.contains('\0')
-                        {
-                            return Err(ModelError::Invalid {
-                                location: format!("bootstrap.actions.{}.{}", self.id, field),
-                                message: format!("invalid controller name {controller:?}"),
-                            });
-                        }
-                        if !seen.insert(controller) {
-                            return Err(ModelError::Invalid {
-                                location: format!("bootstrap.actions.{}.{}", self.id, field),
-                                message: format!("duplicate controller name {controller:?}"),
-                            });
-                        }
-                    }
-                }
-                if let Some(subgroup_type) = &self.subgroup_type {
-                    if self.subgroup.is_none()
-                        || subgroup_type.is_empty()
-                        || subgroup_type.contains(char::is_whitespace)
-                        || subgroup_type.contains('\0')
-                    {
-                        return Err(ModelError::Invalid {
-                            location: format!(
-                                "bootstrap.actions.{}.subgroup_type",
-                                self.id
-                            ),
-                            message: "subgroup_type requires a subgroup and must be a single non-empty token".to_owned(),
-                        });
-                    }
-                }
-                if let Some(controllers) = &self.subgroup_controllers {
-                    if self.subgroup.is_none() || controllers.is_empty() {
-                        return Err(ModelError::Invalid {
-                            location: format!("bootstrap.actions.{}.subgroup_controllers", self.id),
-                            message: "subgroup_controllers requires a non-empty subgroup list"
-                                .to_owned(),
-                        });
-                    }
-                    let mut seen = std::collections::BTreeSet::new();
-                    for controller in controllers {
-                        if controller.is_empty()
-                            || controller.contains(char::is_whitespace)
-                            || controller.contains('\0')
-                            || !seen.insert(controller)
-                        {
-                            return Err(ModelError::Invalid {
-                                location: format!(
-                                    "bootstrap.actions.{}.subgroup_controllers",
-                                    self.id
-                                ),
-                                message: format!(
-                                    "invalid or duplicate subgroup controller {controller:?}"
-                                ),
-                            });
-                        }
-                    }
-                }
-                if let Some(values) = &self.subgroup_controller_values {
-                    if self.subgroup.is_none() || values.is_empty() {
-                        return Err(ModelError::Invalid {
-                            location: format!(
-                                "bootstrap.actions.{}.subgroup_controller_values",
-                                self.id
-                            ),
-                            message: "subgroup_controller_values requires a non-empty subgroup"
-                                .to_owned(),
-                        });
-                    }
-                    for (target, source) in values {
-                        for (field, value) in [("target", target), ("source", source)] {
-                            if value.is_empty()
-                                || value.starts_with('/')
-                                || value.contains('/')
-                                || value.contains("..")
-                                || value.contains('\0')
-                            {
-                                return Err(ModelError::Invalid {
-                                    location: format!(
-                                        "bootstrap.actions.{}.subgroup_controller_values.{}",
-                                        self.id, field
-                                    ),
-                                    message: format!(
-                                        "{field} must be a single relative cgroup file name, got {value:?}"
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
     pub fn cgroup_mount_mode(&self) -> &str {
         match self.mount_mode.as_deref().or(self.mode.as_deref()) {
             Some("bind_mount" | "mount_shadow" | "shadow") => "bind_mount",
             _ => "default",
         }
+    }
+
+    pub(crate) fn is_action_id(value: &str) -> bool {
+        !value.is_empty()
+            && value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+            })
+    }
+
+    pub(crate) fn parse_mode(value: &str) -> Result<u32, String> {
+        if value.is_empty()
+            || value.len() > 4
+            || !value
+                .chars()
+                .all(|character| ('0'..='7').contains(&character))
+        {
+            return Err("mode must be an octal string containing at most four digits".to_owned());
+        }
+        u32::from_str_radix(value, 8).map_err(|_| "mode is outside the supported range".to_owned())
+    }
+
+    pub(crate) fn validate_executable(location: &str, value: &str) -> Result<(), ModelError> {
+        Self::validate_argv_value(location, value)?;
+        if value.contains("${") || value.chars().any(char::is_whitespace) {
+            return Err(ModelError::Invalid {
+                location: location.to_owned(),
+                message: "executable path must be a concrete single path".to_owned(),
+            });
+        }
+        PathTemplate::validate_template(location, value)?;
+        if !value.starts_with('/') {
+            return Err(ModelError::Invalid {
+                location: location.to_owned(),
+                message: "executable path must be absolute".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_argv_value(location: &str, value: &str) -> Result<(), ModelError> {
+        if value.is_empty() || value.contains('\0') || value.contains('\n') || value.contains('\r')
+        {
+            return Err(ModelError::Invalid {
+                location: location.to_owned(),
+                message: "argv value must be non-empty and contain no NUL/newline".to_owned(),
+            });
+        }
+        if value.contains("$(") || value.contains('`') || value.contains(';') || value.contains('|')
+        {
+            return Err(ModelError::Invalid {
+                location: location.to_owned(),
+                message: "shell expressions are not allowed in argv values".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_user_name(location: &str, value: &str) -> Result<(), ModelError> {
+        if value.is_empty()
+            || value.len() > 32
+            || !value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            return Err(ModelError::Invalid {
+                location: location.to_owned(),
+                message: format!("invalid POSIX user name {value:?}"),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_owner(location: &str, value: &str) -> Result<(), ModelError> {
+        if value == "root" || value == "identity.target" {
+            return Ok(());
+        }
+        let Some((uid, gid)) = value.split_once(':') else {
+            return Err(ModelError::Invalid {
+                location: location.to_owned(),
+                message: "owner must be root, identity.target, or uid:gid".to_owned(),
+            });
+        };
+        BootstrapInput::parse_id("uid", uid).map_err(|_| ModelError::Invalid {
+            location: location.to_owned(),
+            message: "owner uid:gid contains an invalid uid".to_owned(),
+        })?;
+        BootstrapInput::parse_id("gid", gid).map_err(|_| ModelError::Invalid {
+            location: location.to_owned(),
+            message: "owner uid:gid contains an invalid gid".to_owned(),
+        })?;
+        Ok(())
     }
 }

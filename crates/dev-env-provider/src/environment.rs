@@ -1,9 +1,12 @@
 use dev_env_model::{
     EnvValue, MaterializedEnv, Sensitivity, ShellEnvEntry, ShellEnvFormat, ShellEnvParseError,
 };
-use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use serde_json::{from_str, Error as SerdeError, Value};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DotenvParseError {
@@ -25,8 +28,8 @@ impl fmt::Display for DotenvParseError {
     }
 }
 
-impl std::error::Error for DotenvParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for DotenvParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Shell { source, .. } => Some(source),
             Self::InvalidLine { .. } => None,
@@ -36,7 +39,7 @@ impl std::error::Error for DotenvParseError {
 
 #[derive(Debug)]
 pub enum JsonEnvironmentError {
-    Parse { source: serde_json::Error },
+    Parse { source: SerdeError },
     RootNotObject,
     NonString { name: String },
     InvalidName { name: String },
@@ -60,8 +63,8 @@ impl fmt::Display for JsonEnvironmentError {
     }
 }
 
-impl std::error::Error for JsonEnvironmentError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for JsonEnvironmentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Parse { source } => Some(source),
             Self::RootNotObject | Self::NonString { .. } | Self::InvalidName { .. } => None,
@@ -86,8 +89,8 @@ impl fmt::Display for EnvironmentParseError {
     }
 }
 
-impl std::error::Error for EnvironmentParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for EnvironmentParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Shell { source } => Some(source),
             Self::Dotenv { source } => Some(source),
@@ -98,11 +101,39 @@ impl std::error::Error for EnvironmentParseError {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EnvironmentDelta {
-    pub set: BTreeMap<String, String>,
-    pub unset: BTreeSet<String>,
+    set: BTreeMap<String, String>,
+    unset: BTreeSet<String>,
 }
 
 impl EnvironmentDelta {
+    pub fn new(set: BTreeMap<String, String>, unset: BTreeSet<String>) -> Self {
+        Self { set, unset }
+    }
+
+    pub fn set(&self) -> &BTreeMap<String, String> {
+        &self.set
+    }
+
+    pub fn unset(&self) -> &BTreeSet<String> {
+        &self.unset
+    }
+
+    pub fn parse_output(
+        format: ShellEnvFormat,
+        output: &str,
+    ) -> Result<Vec<ShellEnvEntry>, EnvironmentParseError> {
+        match format {
+            ShellEnvFormat::Shell => ShellEnvEntry::parse(output)
+                .map_err(|source| EnvironmentParseError::Shell { source }),
+            ShellEnvFormat::Dotenv => {
+                parse_dotenv(output).map_err(|source| EnvironmentParseError::Dotenv { source })
+            }
+            ShellEnvFormat::Json => {
+                parse_json(output).map_err(|source| EnvironmentParseError::Json { source })
+            }
+        }
+    }
+
     pub fn from_entries(entries: impl IntoIterator<Item = ShellEnvEntry>) -> Self {
         let mut delta = Self::default();
         delta.apply_entries(entries);
@@ -144,35 +175,13 @@ impl EnvironmentDelta {
         sensitivity: Sensitivity,
     ) {
         for name in &self.unset {
-            environment.values.remove(name);
+            environment.remove(name);
         }
         for (name, value) in &self.set {
-            environment.values.insert(
+            environment.insert(
                 name.clone(),
-                EnvValue {
-                    value: value.clone(),
-                    origin: None,
-                    sensitivity,
-                    provider: Some(provider.to_owned()),
-                },
+                EnvValue::new(value.clone(), None, sensitivity, Some(provider.to_owned())),
             );
-        }
-    }
-}
-
-pub fn parse_output(
-    format: ShellEnvFormat,
-    output: &str,
-) -> Result<Vec<ShellEnvEntry>, EnvironmentParseError> {
-    match format {
-        ShellEnvFormat::Shell => {
-            ShellEnvEntry::parse(output).map_err(|source| EnvironmentParseError::Shell { source })
-        }
-        ShellEnvFormat::Dotenv => {
-            parse_dotenv(output).map_err(|source| EnvironmentParseError::Dotenv { source })
-        }
-        ShellEnvFormat::Json => {
-            parse_json(output).map_err(|source| EnvironmentParseError::Json { source })
         }
     }
 }
@@ -198,8 +207,7 @@ fn parse_dotenv(output: &str) -> Result<Vec<ShellEnvEntry>, DotenvParseError> {
 }
 
 fn parse_json(output: &str) -> Result<Vec<ShellEnvEntry>, JsonEnvironmentError> {
-    let value: Value =
-        serde_json::from_str(output).map_err(|source| JsonEnvironmentError::Parse { source })?;
+    let value: Value = from_str(output).map_err(|source| JsonEnvironmentError::Parse { source })?;
     let Value::Object(values) = value else {
         return Err(JsonEnvironmentError::RootNotObject);
     };

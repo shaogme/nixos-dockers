@@ -1,9 +1,17 @@
 use container_init_posix::{
-    is_writable, mode, parse_mountinfo, NamespaceMap, PosixIdentity, PosixLock, PosixSystem,
+    is_writable, mode, parse_mountinfo, set_mode, NamespaceMap, PosixIdentity, PosixLock,
+    PosixSystem,
 };
-use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use libc::{_exit, fork, waitpid};
+use std::{
+    fs,
+    io::ErrorKind,
+    os::unix::fs::MetadataExt,
+    path::Path,
+    sync::mpsc::channel,
+    thread::{sleep, spawn},
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 
 #[test]
@@ -119,7 +127,7 @@ fn ownership_modes_and_locking_use_real_posix_primitives() {
     let (uid, gid) = system.current_ids();
 
     system.chown(&file, uid, gid, true).unwrap();
-    container_init_posix::set_mode(&file, 0o640).unwrap();
+    set_mode(&file, 0o640).unwrap();
     assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o640);
     assert_eq!(fs::metadata(&file).unwrap().uid(), uid);
     assert_eq!(fs::metadata(&file).unwrap().gid(), gid);
@@ -139,20 +147,20 @@ fn ownership_modes_and_locking_use_real_posix_primitives() {
 fn posix_lock_retries_and_acquires_after_release() {
     let temp = TempDir::new().unwrap();
     let lock_path = temp.path().join("retry.lock");
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = channel();
     let thread_lock_path = lock_path.clone();
 
-    let handle = std::thread::spawn(move || {
+    let handle = spawn(move || {
         let lock = PosixLock::acquire(&thread_lock_path).unwrap();
         tx.send(()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        sleep(Duration::from_millis(50));
         drop(lock);
     });
 
     rx.recv().unwrap();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let lock = PosixLock::acquire(&lock_path).unwrap();
-    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+    assert!(started.elapsed() >= Duration::from_millis(30));
     drop(lock);
     handle.join().unwrap();
 }
@@ -162,11 +170,10 @@ fn posix_lock_times_out_when_held() {
     let temp = TempDir::new().unwrap();
     let lock_path = temp.path().join("timeout.lock");
     let lock = PosixLock::acquire(&lock_path).unwrap();
-    let started = std::time::Instant::now();
-    let error = PosixLock::acquire_with_timeout(&lock_path, std::time::Duration::from_millis(50))
-        .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-    assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+    let started = Instant::now();
+    let error = PosixLock::acquire_with_timeout(&lock_path, Duration::from_millis(50)).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    assert!(started.elapsed() >= Duration::from_millis(40));
     drop(lock);
 }
 
@@ -178,18 +185,18 @@ fn dropping_privileges_changes_uid_gid_and_is_irreversible() {
 
     // The child is essential: a successful setuid cannot be undone by this
     // test process, and the Rust test harness still needs root to clean up.
-    let child = unsafe { libc::fork() };
+    let child = unsafe { fork() };
     assert!(child >= 0, "fork should succeed");
     if child == 0 {
         let system = PosixSystem::new();
         let identity = PosixIdentity::new(65_534, 65_534, "nobody", "/nonexistent");
         let result = system.drop_privileges(&identity);
         let success = result.is_ok() && system.current_ids() == (65_534, 65_534);
-        unsafe { libc::_exit(if success { 0 } else { 1 }) };
+        unsafe { _exit(if success { 0 } else { 1 }) };
     }
 
     let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
 }

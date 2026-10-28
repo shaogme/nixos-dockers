@@ -36,14 +36,29 @@ pub enum Layer {
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Origin {
-    pub source: SourceId,
-    pub line: Option<u32>,
-    pub column: Option<u32>,
-    pub layer: Layer,
-    pub reason: Option<String>,
+    source: SourceId,
+    line: Option<u32>,
+    column: Option<u32>,
+    layer: Layer,
+    reason: Option<String>,
 }
 
 impl Origin {
+    pub fn new(source: SourceId, layer: Layer) -> Self {
+        Self {
+            source,
+            line: None,
+            column: None,
+            layer,
+            reason: None,
+        }
+    }
+
+    pub fn with_reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
+
     pub fn profile(id: impl Into<String>) -> Self {
         Self {
             source: SourceId::Profile(id.into()),
@@ -104,16 +119,16 @@ pub struct ConfigValue<T> {
     pub sensitivity: Sensitivity,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProvenanceIndex {
-    entries: BTreeMap<String, ProvenanceEntry>,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProvenanceEntry {
     pub path: String,
     pub origins: Vec<Origin>,
     pub sensitivity: Sensitivity,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProvenanceIndex {
+    entries: BTreeMap<String, ProvenanceEntry>,
 }
 
 impl ProvenanceIndex {
@@ -143,5 +158,27 @@ impl ProvenanceIndex {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+impl Origin {
+    pub fn source(&self) -> &SourceId {
+        &self.source
+    }
+
+    pub fn line(&self) -> Option<u32> {
+        self.line
+    }
+
+    pub fn column(&self) -> Option<u32> {
+        self.column
+    }
+
+    pub fn layer(&self) -> &Layer {
+        &self.layer
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 }

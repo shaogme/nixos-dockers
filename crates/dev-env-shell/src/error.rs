@@ -1,9 +1,7 @@
 use crate::command::CommandLineError;
 use dev_env_model::ModelError;
 use serde_json::Error as JsonError;
-use std::error::Error;
-use std::fmt;
-use std::path::PathBuf;
+use std::{error::Error, fmt, path::PathBuf};
 
 /// Errors raised while turning a validated shell declaration into argv.
 #[derive(Debug)]
@@ -63,31 +61,6 @@ impl Error for EnvironmentFormatError {
         match self {
             Self::Model { source } => Some(source),
             Self::Json { source } => Some(source),
-        }
-    }
-}
-
-/// Errors raised while selecting one of the configured shell invocation
-/// modes.
-#[derive(Debug)]
-pub enum ShellInvocationError {
-    Build { source: ShellBuildError },
-}
-
-impl fmt::Display for ShellInvocationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Build { source } => {
-                write!(formatter, "could not build shell invocation: {source}")
-            }
-        }
-    }
-}
-
-impl Error for ShellInvocationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Build { source } => Some(source),
         }
     }
 }
@@ -158,5 +131,11 @@ impl Error for ShimError {
             Self::CommandLine { source } => Some(source),
             Self::Recursive { .. } => None,
         }
+    }
+}
+
+impl From<CommandLineError> for ShimError {
+    fn from(source: CommandLineError) -> Self {
+        Self::CommandLine { source }
     }
 }

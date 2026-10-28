@@ -1,14 +1,43 @@
-use crate::config::{ResolvedConfig, WorkspaceSearch};
-use crate::identity::{EffectiveIdentity, IdentityError};
-use crate::input::InputSpec;
-use crate::provenance::ProvenanceIndex;
-use crate::provider::{MissingProviderPolicy, ProviderConfig};
-use crate::shell::ShellConfig;
+use crate::{
+    config::{ResolvedConfig, WorkspaceSearch},
+    identity::{EffectiveIdentity, IdentityError},
+    input::InputSpec,
+    provenance::ProvenanceIndex,
+    provider::{MissingProviderPolicy, ProviderConfig},
+    shell::ShellConfig,
+    ModelError,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{to_vec, Error as JsonError};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    error::Error as StdError,
+    fmt::{Display, Formatter, Result as FmtResult},
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
+
+#[derive(Debug)]
+pub enum SnapshotError {
+    Model(ModelError),
+    Fingerprint { source: JsonError },
+    GenerationExhausted,
+    InvalidWorkspaceRoot(PathBuf),
+    ProviderOrderMismatch,
+    DerivedStateMismatch,
+}
+
+#[derive(Debug)]
+pub enum MaterializationKeyError {
+    InvalidPath { name: &'static str, path: PathBuf },
+    CwdOutsideWorkspace,
+    InvalidShell,
+    InvalidEnvironmentName(String),
+    NulValue(String),
+    Identity(IdentityError),
+    Encoding { source: JsonError },
+}
 
 /// Monotonically increasing configuration generation owned by a backend.
 #[derive(
@@ -65,11 +94,11 @@ pub enum PreparePolicy {
 #[serde(deny_unknown_fields)]
 pub struct ProviderPolicy {
     #[serde(default)]
-    pub prepare: PreparePolicy,
+    prepare: PreparePolicy,
     #[serde(default = "default_true")]
-    pub cache_shellenv: bool,
+    cache_shellenv: bool,
     #[serde(default)]
-    pub missing: MissingProviderPolicy,
+    missing: MissingProviderPolicy,
 }
 
 impl Default for ProviderPolicy {
@@ -87,7 +116,7 @@ impl ProviderPolicy {
         Self {
             prepare: PreparePolicy::OncePerKey,
             cache_shellenv: true,
-            missing: config.missing,
+            missing: config.missing(),
         }
     }
 }
@@ -110,11 +139,11 @@ pub struct ExecutableResolutionRules {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceOverlayPolicy {
     #[serde(default = "default_true")]
-    pub enabled: bool,
+    enabled: bool,
     #[serde(default)]
-    pub search: WorkspaceSearch,
+    search: WorkspaceSearch,
     #[serde(default)]
-    pub allowed_paths: Vec<String>,
+    allowed_paths: Vec<String>,
 }
 
 impl Default for WorkspaceOverlayPolicy {
@@ -133,19 +162,19 @@ impl Default for WorkspaceOverlayPolicy {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigSnapshot {
-    pub generation: Generation,
-    pub config_fingerprint: [u8; 32],
-    pub profile_chain: Vec<String>,
-    pub resolved_config: ResolvedConfig,
-    pub source_provenance: ProvenanceIndex,
-    pub trust_fingerprint: [u8; 32],
-    pub shells: BTreeMap<String, ShellConfig>,
-    pub runtime_inputs: BTreeMap<String, InputSpec>,
-    pub provider_order: Vec<String>,
-    pub provider_policy: BTreeMap<String, ProviderPolicy>,
-    pub executable_resolution: ExecutableResolutionRules,
-    pub workspace_root: PathBuf,
-    pub workspace_overlay: WorkspaceOverlayPolicy,
+    generation: Generation,
+    config_fingerprint: [u8; 32],
+    profile_chain: Vec<String>,
+    resolved_config: ResolvedConfig,
+    source_provenance: ProvenanceIndex,
+    trust_fingerprint: [u8; 32],
+    shells: BTreeMap<String, ShellConfig>,
+    runtime_inputs: BTreeMap<String, InputSpec>,
+    provider_order: Vec<String>,
+    provider_policy: BTreeMap<String, ProviderPolicy>,
+    executable_resolution: ExecutableResolutionRules,
+    workspace_root: PathBuf,
+    workspace_overlay: WorkspaceOverlayPolicy,
 }
 
 pub type ConfigSnapshotRef = Arc<ConfigSnapshot>;
@@ -157,14 +186,16 @@ impl ConfigSnapshot {
         resolved_config: ResolvedConfig,
         source_provenance: ProvenanceIndex,
         trust_fingerprint: [u8; 32],
-        config_fingerprint: [u8; 32],
     ) -> Result<Self, SnapshotError> {
+        let encoded =
+            to_vec(&resolved_config).map_err(|source| SnapshotError::Fingerprint { source })?;
+        let config_fingerprint = sha256(&encoded);
         resolved_config.validate().map_err(SnapshotError::Model)?;
         let provider_order = resolved_config
             .provider_order()
             .map_err(SnapshotError::Model)?;
         let provider_policy = resolved_config
-            .providers
+            .providers()
             .iter()
             .map(|(id, config)| (id.clone(), ProviderPolicy::from_config(config)))
             .collect();
@@ -172,9 +203,9 @@ impl ConfigSnapshot {
             generation,
             config_fingerprint,
             profile_chain,
-            shells: resolved_config.shells.clone(),
-            runtime_inputs: resolved_config.inputs.clone(),
-            workspace_root: PathBuf::from(&resolved_config.workspace.root),
+            shells: resolved_config.shells().clone(),
+            runtime_inputs: resolved_config.inputs().clone(),
+            workspace_root: PathBuf::from(resolved_config.workspace().root()),
             resolved_config,
             source_provenance,
             trust_fingerprint,
@@ -194,16 +225,12 @@ impl ConfigSnapshot {
         source_provenance: ProvenanceIndex,
         trust_fingerprint: [u8; 32],
     ) -> Result<Self, SnapshotError> {
-        let encoded = serde_json::to_vec(&resolved_config)
-            .map_err(|source| SnapshotError::Fingerprint { source })?;
-        let fingerprint = sha256(&encoded);
         Self::new(
             generation,
             profile_chain,
             resolved_config,
             source_provenance,
             trust_fingerprint,
-            fingerprint,
         )
     }
 
@@ -222,13 +249,13 @@ impl ConfigSnapshot {
             .map_err(SnapshotError::Model)?;
         let expected_policies = self
             .resolved_config
-            .providers
+            .providers()
             .iter()
             .map(|(id, config)| (id.clone(), ProviderPolicy::from_config(config)))
             .collect::<BTreeMap<_, _>>();
         if self.provider_order != expected_order
-            || self.shells != self.resolved_config.shells
-            || self.runtime_inputs != self.resolved_config.inputs
+            || self.shells != *self.resolved_config.shells()
+            || self.runtime_inputs != *self.resolved_config.inputs()
             || self.provider_policy != expected_policies
         {
             return Err(SnapshotError::DerivedStateMismatch);
@@ -259,51 +286,81 @@ impl ConfigSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationKey {
-    pub generation: Generation,
-    pub config_fingerprint: [u8; 32],
-    pub workspace: PathBuf,
-    pub cwd: PathBuf,
-    pub shell: String,
-    pub identity: EffectiveIdentity,
+    generation: Generation,
+    config_fingerprint: [u8; 32],
+    workspace: PathBuf,
+    cwd: PathBuf,
+    shell: String,
+    identity: EffectiveIdentity,
     #[serde(default)]
-    pub runtime_inputs: BTreeMap<String, String>,
+    runtime_inputs: BTreeMap<String, String>,
     #[serde(default)]
-    pub ambient_environment: BTreeMap<String, String>,
+    ambient_environment: BTreeMap<String, String>,
     /// Maps provider id to the fingerprint of the files that affect detect.
     #[serde(default)]
-    pub provider_detect_fingerprints: BTreeMap<String, [u8; 32]>,
+    provider_detect_fingerprints: BTreeMap<String, [u8; 32]>,
 }
 
-impl MaterializationKey {
-    #[allow(clippy::too_many_arguments)]
+pub struct MaterializationKeyBuilder {
+    key: MaterializationKey,
+}
+
+impl MaterializationKeyBuilder {
     pub fn new(
         generation: Generation,
-        config_fingerprint: [u8; 32],
         workspace: impl Into<PathBuf>,
         cwd: impl Into<PathBuf>,
         shell: impl Into<String>,
         identity: EffectiveIdentity,
-        runtime_inputs: BTreeMap<String, String>,
-        ambient_environment: BTreeMap<String, String>,
-        provider_detect_fingerprints: BTreeMap<String, [u8; 32]>,
-    ) -> Result<Self, MaterializationKeyError> {
-        let workspace = normalize_absolute_path(&workspace.into());
-        let cwd = normalize_absolute_path(&cwd.into());
-        let key = Self {
-            generation,
-            config_fingerprint,
-            workspace,
-            cwd,
-            shell: shell.into(),
-            identity,
-            runtime_inputs,
-            ambient_environment,
-            provider_detect_fingerprints,
-        };
-        key.validate()?;
-        Ok(key)
+    ) -> Self {
+        Self {
+            key: MaterializationKey {
+                generation,
+                config_fingerprint: [0; 32],
+                workspace: normalize_absolute_path(&workspace.into()),
+                cwd: normalize_absolute_path(&cwd.into()),
+                shell: shell.into(),
+                identity,
+                runtime_inputs: BTreeMap::new(),
+                ambient_environment: BTreeMap::new(),
+                provider_detect_fingerprints: BTreeMap::new(),
+            },
+        }
     }
 
+    pub fn with_config_fingerprint(mut self, config_fingerprint: [u8; 32]) -> Self {
+        self.key.config_fingerprint = config_fingerprint;
+        self
+    }
+
+    pub fn with_runtime_inputs(mut self, runtime_inputs: BTreeMap<String, String>) -> Self {
+        self.key.runtime_inputs = runtime_inputs;
+        self
+    }
+
+    pub fn with_ambient_environment(
+        mut self,
+        ambient_environment: BTreeMap<String, String>,
+    ) -> Self {
+        self.key.ambient_environment = ambient_environment;
+        self
+    }
+
+    pub fn with_provider_detect_fingerprints(
+        mut self,
+        provider_detect_fingerprints: BTreeMap<String, [u8; 32]>,
+    ) -> Self {
+        self.key.provider_detect_fingerprints = provider_detect_fingerprints;
+        self
+    }
+
+    pub fn build(self) -> Result<MaterializationKey, MaterializationKeyError> {
+        self.key.validate()?;
+        Ok(self.key)
+    }
+}
+
+impl MaterializationKey {
     pub fn validate(&self) -> Result<(), MaterializationKeyError> {
         validate_absolute("workspace", &self.workspace)?;
         validate_absolute("cwd", &self.cwd)?;
@@ -324,8 +381,8 @@ impl MaterializationKey {
     /// Return the stable SHA-256 digest used by backend cache implementations.
     pub fn fingerprint(&self) -> Result<[u8; 32], MaterializationKeyError> {
         self.validate()?;
-        let encoded = serde_json::to_vec(self)
-            .map_err(|source| MaterializationKeyError::Encoding { source })?;
+        let encoded =
+            to_vec(self).map_err(|source| MaterializationKeyError::Encoding { source })?;
         Ok(sha256(&encoded))
     }
 
@@ -334,18 +391,8 @@ impl MaterializationKey {
     }
 }
 
-#[derive(Debug)]
-pub enum SnapshotError {
-    Model(crate::ModelError),
-    Fingerprint { source: serde_json::Error },
-    GenerationExhausted,
-    InvalidWorkspaceRoot(PathBuf),
-    ProviderOrderMismatch,
-    DerivedStateMismatch,
-}
-
-impl std::fmt::Display for SnapshotError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for SnapshotError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Model(source) => write!(formatter, "snapshot configuration is invalid: {source}"),
             Self::Fingerprint { source } => {
@@ -369,8 +416,8 @@ impl std::fmt::Display for SnapshotError {
     }
 }
 
-impl std::error::Error for SnapshotError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for SnapshotError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Model(source) => Some(source),
             Self::Fingerprint { source } => Some(source),
@@ -382,19 +429,8 @@ impl std::error::Error for SnapshotError {
     }
 }
 
-#[derive(Debug)]
-pub enum MaterializationKeyError {
-    InvalidPath { name: &'static str, path: PathBuf },
-    CwdOutsideWorkspace,
-    InvalidShell,
-    InvalidEnvironmentName(String),
-    NulValue(String),
-    Identity(IdentityError),
-    Encoding { source: serde_json::Error },
-}
-
-impl std::fmt::Display for MaterializationKeyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for MaterializationKeyError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::InvalidPath { name, path } => {
                 write!(
@@ -424,8 +460,8 @@ impl std::fmt::Display for MaterializationKeyError {
     }
 }
 
-impl std::error::Error for MaterializationKeyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for MaterializationKeyError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Identity(source) => Some(source),
             Self::Encoding { source } => Some(source),
@@ -490,4 +526,124 @@ fn validate_values(values: &BTreeMap<String, String>) -> Result<(), Materializat
         }
     }
     Ok(())
+}
+
+impl ProviderPolicy {
+    pub fn prepare(&self) -> PreparePolicy {
+        self.prepare
+    }
+
+    pub fn cache_shellenv(&self) -> bool {
+        self.cache_shellenv
+    }
+
+    pub fn missing(&self) -> MissingProviderPolicy {
+        self.missing
+    }
+}
+
+impl WorkspaceOverlayPolicy {
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn search(&self) -> WorkspaceSearch {
+        self.search
+    }
+
+    pub fn allowed_paths(&self) -> &Vec<String> {
+        &self.allowed_paths
+    }
+}
+
+impl ConfigSnapshot {
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    pub fn config_fingerprint(&self) -> [u8; 32] {
+        self.config_fingerprint
+    }
+
+    pub fn profile_chain(&self) -> &Vec<String> {
+        &self.profile_chain
+    }
+
+    pub fn resolved_config(&self) -> &ResolvedConfig {
+        &self.resolved_config
+    }
+
+    pub fn source_provenance(&self) -> &ProvenanceIndex {
+        &self.source_provenance
+    }
+
+    pub fn trust_fingerprint(&self) -> [u8; 32] {
+        self.trust_fingerprint
+    }
+
+    pub fn shells(&self) -> &BTreeMap<String, ShellConfig> {
+        &self.shells
+    }
+
+    pub fn runtime_inputs(&self) -> &BTreeMap<String, InputSpec> {
+        &self.runtime_inputs
+    }
+
+    pub fn provider_order(&self) -> &Vec<String> {
+        &self.provider_order
+    }
+
+    pub fn provider_policy(&self) -> &BTreeMap<String, ProviderPolicy> {
+        &self.provider_policy
+    }
+
+    pub fn executable_resolution(&self) -> &ExecutableResolutionRules {
+        &self.executable_resolution
+    }
+
+    pub fn workspace_root(&self) -> &PathBuf {
+        &self.workspace_root
+    }
+
+    pub fn workspace_overlay(&self) -> &WorkspaceOverlayPolicy {
+        &self.workspace_overlay
+    }
+}
+
+impl MaterializationKey {
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    pub fn config_fingerprint(&self) -> [u8; 32] {
+        self.config_fingerprint
+    }
+
+    pub fn workspace(&self) -> &PathBuf {
+        &self.workspace
+    }
+
+    pub fn cwd(&self) -> &PathBuf {
+        &self.cwd
+    }
+
+    pub fn shell(&self) -> &str {
+        &self.shell
+    }
+
+    pub fn identity(&self) -> &EffectiveIdentity {
+        &self.identity
+    }
+
+    pub fn runtime_inputs(&self) -> &BTreeMap<String, String> {
+        &self.runtime_inputs
+    }
+
+    pub fn ambient_environment(&self) -> &BTreeMap<String, String> {
+        &self.ambient_environment
+    }
+
+    pub fn provider_detect_fingerprints(&self) -> &BTreeMap<String, [u8; 32]> {
+        &self.provider_detect_fingerprints
+    }
 }

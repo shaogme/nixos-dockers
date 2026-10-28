@@ -1,23 +1,41 @@
 use crate::{
-    read_message, write_message, ClientMessage, ClientRequest, IdentityRequest, PreparedIdentity,
-    ServerMessage, ServerResponse, PROTOCOL_VERSION,
+    read_message, write_message, ClientMessage, ClientRequest, HelloInfo, IdentityRequest,
+    PreparedIdentity, ServerMessage, ServerResponse, PROTOCOL_VERSION,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+    net::Shutdown,
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Debug)]
-pub struct IdentityBrokerError(pub String);
+pub struct IdentityBrokerError {
+    message: String,
+}
 
-impl std::fmt::Display for IdentityBrokerError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+impl IdentityBrokerError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
-impl std::error::Error for IdentityBrokerError {}
+impl Display for IdentityBrokerError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for IdentityBrokerError {}
 
 #[derive(Clone, Debug)]
 pub struct IdentityBrokerClient {
@@ -41,18 +59,18 @@ impl IdentityBrokerClient {
         environment: BTreeMap<String, String>,
     ) -> Result<PreparedIdentity, IdentityBrokerError> {
         if !self.socket.is_absolute() || self.socket.to_string_lossy().contains('\0') {
-            return Err(IdentityBrokerError(
+            return Err(IdentityBrokerError::new(
                 "identity broker socket must be absolute".to_owned(),
             ));
         }
         let mut stream = UnixStream::connect(&self.socket).map_err(|error| {
-            IdentityBrokerError(format!("identity broker unavailable: {error}"))
+            IdentityBrokerError::new(format!("identity broker unavailable: {error}"))
         })?;
         stream
             .set_read_timeout(Some(self.timeout))
             .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
             .map_err(|error| {
-                IdentityBrokerError(format!("identity broker socket setup failed: {error}"))
+                IdentityBrokerError::new(format!("identity broker socket setup failed: {error}"))
             })?;
 
         write_message(
@@ -62,7 +80,9 @@ impl IdentityBrokerClient {
                 request: ClientRequest::Hello,
             },
         )
-        .map_err(|error| IdentityBrokerError(format!("identity broker write failed: {error}")))?;
+        .map_err(|error| {
+            IdentityBrokerError::new(format!("identity broker write failed: {error}"))
+        })?;
         let hello = expect_hello(&mut stream)?;
 
         let allowed_inputs = hello.runtime_inputs.into_iter().collect::<BTreeSet<_>>();
@@ -81,20 +101,22 @@ impl IdentityBrokerClient {
                 },
             },
         )
-        .map_err(|error| IdentityBrokerError(format!("identity broker write failed: {error}")))?;
+        .map_err(|error| {
+            IdentityBrokerError::new(format!("identity broker write failed: {error}"))
+        })?;
         let response = read_message::<ServerMessage>(&mut stream).map_err(|error| {
-            IdentityBrokerError(format!("identity broker response is invalid: {error}"))
+            IdentityBrokerError::new(format!("identity broker response is invalid: {error}"))
         })?;
         let _ = stream.shutdown(Shutdown::Both);
         if response.version != PROTOCOL_VERSION {
-            return Err(IdentityBrokerError(
+            return Err(IdentityBrokerError::new(
                 "identity broker returned an unsupported protocol version".to_owned(),
             ));
         }
         let identity = match response.response {
             ServerResponse::Identity(identity) => identity,
             ServerResponse::Error(error) => {
-                return Err(IdentityBrokerError(format!(
+                return Err(IdentityBrokerError::new(format!(
                     "{}: {}",
                     error.class, error.message
                 )))
@@ -106,7 +128,7 @@ impl IdentityBrokerClient {
             | ServerResponse::PlanPage(_)
             | ServerResponse::Doctor(_)
             | ServerResponse::Other => {
-                return Err(IdentityBrokerError(
+                return Err(IdentityBrokerError::new(
                     "identity broker returned an unexpected response".to_owned(),
                 ))
             }
@@ -116,18 +138,18 @@ impl IdentityBrokerClient {
     }
 }
 
-fn expect_hello(stream: &mut UnixStream) -> Result<crate::HelloInfo, IdentityBrokerError> {
+fn expect_hello(stream: &mut UnixStream) -> Result<HelloInfo, IdentityBrokerError> {
     let response = read_message::<ServerMessage>(stream).map_err(|error| {
-        IdentityBrokerError(format!("identity broker response is invalid: {error}"))
+        IdentityBrokerError::new(format!("identity broker response is invalid: {error}"))
     })?;
     if response.version != PROTOCOL_VERSION {
-        return Err(IdentityBrokerError(
+        return Err(IdentityBrokerError::new(
             "identity broker returned an unsupported protocol version".to_owned(),
         ));
     }
     match response.response {
         ServerResponse::Hello(hello) => Ok(hello),
-        ServerResponse::Error(error) => Err(IdentityBrokerError(format!(
+        ServerResponse::Error(error) => Err(IdentityBrokerError::new(format!(
             "{}: {}",
             error.class, error.message
         ))),
@@ -137,7 +159,7 @@ fn expect_hello(stream: &mut UnixStream) -> Result<crate::HelloInfo, IdentityBro
         | ServerResponse::Status(_)
         | ServerResponse::PlanPage(_)
         | ServerResponse::Doctor(_)
-        | ServerResponse::Other => Err(IdentityBrokerError(
+        | ServerResponse::Other => Err(IdentityBrokerError::new(
             "identity broker hello failed".to_owned(),
         )),
     }
@@ -164,7 +186,7 @@ fn validate_identity(identity: &PreparedIdentity) -> Result<(), IdentityBrokerEr
         || (identity.uid == 0 && identity.gid != 0)
         || (identity.run_as_root && identity.uid != 0)
     {
-        return Err(IdentityBrokerError(
+        return Err(IdentityBrokerError::new(
             "identity broker returned an invalid identity".to_owned(),
         ));
     }
@@ -175,14 +197,19 @@ fn validate_identity(identity: &PreparedIdentity) -> Result<(), IdentityBrokerEr
 mod tests {
     use super::IdentityBrokerClient;
     use crate::{
-        read_message, write_message, BackendState, ClientMessage, ClientRequest, IdentityRequest,
-        PreparedIdentity, ServerMessage, ServerResponse, PROTOCOL_VERSION,
+        read_message, write_message, BackendState, ClientMessage, ClientRequest, HelloInfo,
+        IdentityRequest, PreparedIdentity, ProtocolLimits, ServerMessage, ServerResponse,
+        PROTOCOL_VERSION,
     };
-    use std::collections::BTreeMap;
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
-    use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::{
+        collections::BTreeMap,
+        fs::remove_file,
+        os::unix::net::UnixListener,
+        path::{Path, PathBuf},
+        process::id,
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn identity_client_filters_runtime_values_and_decodes_the_shared_response() {
@@ -192,7 +219,7 @@ mod tests {
             .as_nanos();
         let socket = PathBuf::from(format!(
             "/tmp/container-init-protocol-{}-{nonce}.sock",
-            std::process::id()
+            id()
         ));
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -203,13 +230,13 @@ mod tests {
                 &mut stream,
                 &ServerMessage {
                     version: PROTOCOL_VERSION,
-                    response: ServerResponse::Hello(crate::HelloInfo {
+                    response: ServerResponse::Hello(HelloInfo {
                         state: BackendState::Ready,
                         profile: "profile".to_owned(),
                         snapshot_id: "snapshot".to_owned(),
                         runtime_inputs: vec!["HOST_UID".to_owned()],
                         environment_names: vec!["HOME".to_owned()],
-                        limits: crate::ProtocolLimits::current(),
+                        limits: ProtocolLimits::current(),
                     }),
                 },
             )
@@ -256,7 +283,7 @@ mod tests {
                     uid: 1000,
                     gid: 1000,
                 },
-                std::path::Path::new("/workspace"),
+                Path::new("/workspace"),
                 BTreeMap::from([
                     ("HOST_UID".to_owned(), "1000".to_owned()),
                     ("DEVBOX_AUTO_INIT".to_owned(), "1".to_owned()),
@@ -268,7 +295,7 @@ mod tests {
             )
             .unwrap();
         server.join().unwrap();
-        let _ = std::fs::remove_file(socket);
+        let _ = remove_file(socket);
         assert_eq!(identity.uid, 1000);
         assert_eq!(identity.user, "dev");
     }

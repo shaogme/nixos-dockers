@@ -1,13 +1,22 @@
-use crate::args::CliOptions;
-use crate::error::{CliError, ConfigurationError, IoOperation};
-use dev_env_core::RuntimeContext;
-use dev_env_loader::{LoadedConfig as LoaderConfig, ProfileLoader, ProfileSource, SourceKind};
-use dev_env_model::WorkspaceSearch;
-use std::collections::BTreeMap;
-use std::env;
-use std::fs;
-use std::io;
-use std::path::{Component, Path, PathBuf};
+use {
+    crate::{
+        args::CliOptions,
+        error::{CliError, ConfigurationError, DefaultProfileReason, IoOperation},
+    },
+    dev_env_core::RuntimeContext,
+    dev_env_loader::{
+        LoadedConfig as LoaderConfig, LoadedProfile, ProfileLoader, ProfileSource, SourceKind,
+    },
+    dev_env_model::{ResolvedConfig, WorkspaceSearch},
+    std::{
+        collections::BTreeMap,
+        env, fs, io,
+        path::{Component, Path, PathBuf},
+    },
+};
+
+#[cfg(unix)]
+use libc::geteuid;
 
 pub const DEFAULT_PROFILES_DIR: &str = "/etc/dev-env/profiles.d";
 pub const DEFAULT_PROFILE_FILE: &str = "/etc/dev-env/default-profile";
@@ -21,16 +30,39 @@ pub struct LoadedConfig {
     workspace_config_present: bool,
 }
 
+pub struct ConfigApi;
+
+impl ConfigApi {
+    pub fn load(options: &CliOptions) -> Result<LoadedConfig, CliError> {
+        load_inner(options)
+    }
+
+    pub fn runtime_context(
+        loaded: &LoadedConfig,
+        shell: Option<&str>,
+    ) -> Result<RuntimeContext, CliError> {
+        runtime_context_inner(loaded, shell)
+    }
+
+    pub fn ambient_environment() -> BTreeMap<String, String> {
+        ambient_environment_inner()
+    }
+
+    pub fn effective_user_id() -> u32 {
+        effective_user_id_inner()
+    }
+}
+
 impl LoadedConfig {
     pub fn profile(&self) -> &str {
         &self.profile
     }
 
-    pub fn config(&self) -> &dev_env_model::ResolvedConfig {
+    pub fn config(&self) -> &ResolvedConfig {
         self.loaded.config()
     }
 
-    pub fn profile_chain(&self) -> &[dev_env_loader::LoadedProfile] {
+    pub fn profile_chain(&self) -> &[LoadedProfile] {
         self.loaded.profile_chain()
     }
 
@@ -47,7 +79,7 @@ impl LoadedConfig {
     }
 }
 
-pub fn load(options: &CliOptions) -> Result<LoadedConfig, CliError> {
+fn load_inner(options: &CliOptions) -> Result<LoadedConfig, CliError> {
     let mut loader = ProfileLoader::new();
     let profiles_dir = options
         .profiles_dir
@@ -77,7 +109,7 @@ pub fn load(options: &CliOptions) -> Result<LoadedConfig, CliError> {
         .workspace
         .clone()
         .or_else(|| env_path("DEVENV_WORKSPACE"))
-        .unwrap_or_else(|| PathBuf::from(&base.config().workspace.root));
+        .unwrap_or_else(|| PathBuf::from(&base.config().workspace().root()));
     let workspace = resolve_path(Some(&workspace_source), &original_cwd);
     if !cwd.starts_with(&workspace) {
         return Err(ConfigurationError::CwdOutsideWorkspace { cwd, workspace }.into());
@@ -101,7 +133,7 @@ pub fn load(options: &CliOptions) -> Result<LoadedConfig, CliError> {
     let (workspace_overlays, workspace_config_present) = collect_workspace_overlays(
         &workspace,
         &cwd,
-        base.config().workspace.search,
+        base.config().workspace().search(),
         explicit_config.as_deref(),
     )?;
     overlays.extend(workspace_overlays);
@@ -114,7 +146,7 @@ pub fn load(options: &CliOptions) -> Result<LoadedConfig, CliError> {
         )?);
     }
 
-    let ambient = ambient_environment();
+    let ambient = ambient_environment_inner();
     let patches = options.patches.clone();
     let loaded =
         loader.load_with_overlays_runtime_and_cli(&profile, overlays.iter(), ambient, patches)?;
@@ -128,11 +160,11 @@ pub fn load(options: &CliOptions) -> Result<LoadedConfig, CliError> {
     })
 }
 
-pub fn runtime_context(
+fn runtime_context_inner(
     loaded: &LoadedConfig,
     shell: Option<&str>,
 ) -> Result<RuntimeContext, CliError> {
-    let process_environment = ambient_environment();
+    let process_environment = ambient_environment_inner();
     let context = match shell {
         Some(shell) => RuntimeContext::new(
             loaded.workspace.clone(),
@@ -147,7 +179,7 @@ pub fn runtime_context(
         ),
     };
     Ok(context
-        .with_user_id(effective_user_id())
+        .with_user_id(effective_user_id_inner())
         .with_workspace_config_present(loaded.workspace_config_present()))
 }
 
@@ -173,14 +205,14 @@ fn select_profile(options: &CliOptions) -> Result<String, CliError> {
     if profile.is_empty() {
         return Err(ConfigurationError::InvalidDefaultProfile {
             path,
-            reason: crate::error::DefaultProfileReason::Empty,
+            reason: DefaultProfileReason::Empty,
         }
         .into());
     }
     if values.len() != 1 {
         return Err(ConfigurationError::InvalidDefaultProfile {
             path,
-            reason: crate::error::DefaultProfileReason::MultipleLines,
+            reason: DefaultProfileReason::MultipleLines,
         }
         .into());
     }
@@ -387,7 +419,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
-pub(crate) fn ambient_environment() -> BTreeMap<String, String> {
+fn ambient_environment_inner() -> BTreeMap<String, String> {
     env::vars_os()
         // Docker and Podman commonly add lowercase metadata variables such as
         // `container`.  They are process metadata, not portable DSL inputs,
@@ -422,12 +454,12 @@ fn env_string(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn effective_user_id() -> u32 {
+fn effective_user_id_inner() -> u32 {
     #[cfg(unix)]
     {
         // libc is used only for this process fact; providers still receive it
         // through the typed RuntimeContext rather than reading it themselves.
-        unsafe { libc::geteuid() }
+        unsafe { geteuid() }
     }
     #[cfg(not(unix))]
     {
@@ -436,14 +468,10 @@ pub(crate) fn effective_user_id() -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{ambient_environment, is_environment_name};
+#[test]
+fn ambient_environment_excludes_nonportable_metadata_names() {
+    let environment = ambient_environment_inner();
 
-    #[test]
-    fn ambient_environment_excludes_nonportable_metadata_names() {
-        let environment = ambient_environment();
-
-        assert!(!environment.contains_key("container"));
-        assert!(environment.keys().all(|name| is_environment_name(name)));
-    }
+    assert!(!environment.contains_key("container"));
+    assert!(environment.keys().all(|name| is_environment_name(name)));
 }

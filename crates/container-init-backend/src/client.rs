@@ -1,12 +1,13 @@
 use crate::socket::BackendSocket;
 use container_init_core::{HandoffCommand, IdentitySource, ResolvedIdentity, WorkspaceStatus};
 use container_init_protocol::{
-    read_message_until, write_message_until, BackendError, BackendState, BackendStatus,
-    ClientMessage, ClientRequest, CommitResult as WireCommitResult, CwdObject,
-    ExecTransactionState, IdentitySource as WireIdentitySource, PlanPage,
-    PreparedHandoff as WirePreparedHandoff, ProtocolError, ReceiptSummary, ServerMessage,
-    ServerResponse, WorkspaceStatus as WireWorkspaceStatus, MAX_PLAN_PAGE_ACTIONS,
-    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
+    max_supplementary_groups, read_message_until, validate_argv, validate_message,
+    write_message_until, BackendError, BackendState, BackendStatus, ClientMessage, ClientRequest,
+    CommitResult as WireCommitResult, CwdObject, ExecTransactionState,
+    IdentitySource as WireIdentitySource, PlanPage, PreparedHandoff as WirePreparedHandoff,
+    ProtocolError, ProtocolLimits, ReceiptSummary, ServerMessage, ServerResponse,
+    WorkspaceStatus as WireWorkspaceStatus, MAX_PLAN_PAGE_ACTIONS, MAX_REQUEST_FRAME_BYTES,
+    MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use libc::{
     c_char, c_int, connect, getegid, geteuid, getgroups, getsockopt, gid_t, poll, pollfd,
@@ -50,6 +51,14 @@ pub struct PreparedHandoff {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitResult {
     pub receipt_summary: ReceiptSummary,
+}
+
+pub struct PrepareOptions<'a> {
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub inputs: BTreeMap<String, String>,
+    pub ambient_environment: &'a BTreeMap<String, String>,
+    pub deadline: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -181,34 +190,29 @@ impl BackendClient {
         inputs: BTreeMap<String, String>,
         ambient_environment: &BTreeMap<String, String>,
     ) -> Result<PreparedHandoff, BackendClientError> {
-        self.prepare_until(argv, cwd, inputs, ambient_environment, self.new_deadline()?)
+        self.prepare_until(PrepareOptions {
+            argv,
+            cwd,
+            inputs,
+            ambient_environment,
+            deadline: self.new_deadline()?,
+        })
     }
 
     pub fn prepare_until(
         &self,
-        argv: Vec<String>,
-        cwd: PathBuf,
-        inputs: BTreeMap<String, String>,
-        ambient_environment: &BTreeMap<String, String>,
-        deadline: Instant,
+        options: PrepareOptions<'_>,
     ) -> Result<PreparedHandoff, BackendClientError> {
-        container_init_protocol::validate_argv(&argv).map_err(BackendClientError::Protocol)?;
+        validate_argv(&options.argv).map_err(BackendClientError::Protocol)?;
         let caller = caller_credentials()?;
         let mut delay = Duration::from_millis(10);
         loop {
-            if Instant::now() >= deadline {
+            if Instant::now() >= options.deadline {
                 return Err(BackendClientError::TimedOut);
             }
-            match self.prepare_once_until(
-                argv.clone(),
-                cwd.clone(),
-                inputs.clone(),
-                ambient_environment,
-                deadline,
-                &caller,
-            ) {
+            match self.prepare_once_until(&options, &caller) {
                 Err(BackendClientError::Backend(error)) if error.retryable => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = options.deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(BackendClientError::TimedOut);
                     }
@@ -222,21 +226,22 @@ impl BackendClient {
 
     fn prepare_once_until(
         &self,
-        argv: Vec<String>,
-        cwd: PathBuf,
-        inputs: BTreeMap<String, String>,
-        ambient_environment: &BTreeMap<String, String>,
-        deadline: Instant,
+        options: &PrepareOptions<'_>,
         caller: &CallerCredentials,
     ) -> Result<PreparedHandoff, BackendClientError> {
-        let mut stream = self.connect_until(deadline)?;
+        let mut stream = self.connect_until(options.deadline)?;
         let hello = ClientMessage {
             version: PROTOCOL_VERSION,
             request: ClientRequest::Hello,
         };
-        write_message_until(&mut stream, &hello, deadline, MAX_REQUEST_FRAME_BYTES)
-            .map_err(|failure| protocol_client_error(failure.error))?;
-        let info = match read_server_response(&mut stream, deadline)? {
+        write_message_until(
+            &mut stream,
+            &hello,
+            options.deadline,
+            MAX_REQUEST_FRAME_BYTES,
+        )
+        .map_err(|failure| protocol_client_error(failure.error))?;
+        let info = match read_server_response(&mut stream, options.deadline)? {
             ServerResponse::Hello(info) => info,
             ServerResponse::Error(error) => return Err(BackendClientError::Backend(error)),
             _ => return Err(BackendClientError::UnexpectedResponse),
@@ -250,7 +255,7 @@ impl BackendClient {
                 path: None,
             }));
         }
-        if info.limits != container_init_protocol::ProtocolLimits::current() {
+        if info.limits != ProtocolLimits::current() {
             return Err(BackendClientError::Protocol(
                 ProtocolError::IncompatibleLimits,
             ));
@@ -258,7 +263,11 @@ impl BackendClient {
 
         let expected_snapshot = info.snapshot_id.clone();
         let allowed_inputs = info.runtime_inputs.into_iter().collect::<BTreeSet<_>>();
-        if inputs.keys().any(|name| !allowed_inputs.contains(name)) {
+        if options
+            .inputs
+            .keys()
+            .any(|name| !allowed_inputs.contains(name))
+        {
             return Err(BackendClientError::Backend(BackendError {
                 class: "invalid_input".to_owned(),
                 retryable: false,
@@ -268,7 +277,8 @@ impl BackendClient {
             }));
         }
         let allowed_environment = info.environment_names.into_iter().collect::<BTreeSet<_>>();
-        let environment = ambient_environment
+        let environment = options
+            .ambient_environment
             .iter()
             .filter(|(name, _)| allowed_environment.contains(*name))
             .map(|(name, value)| (name.clone(), value.clone()))
@@ -276,20 +286,26 @@ impl BackendClient {
         let exec = ClientMessage {
             version: PROTOCOL_VERSION,
             request: ClientRequest::PrepareExec {
-                argv,
-                cwd,
-                inputs: inputs.clone(),
+                argv: options.argv.clone(),
+                cwd: options.cwd.clone(),
+                inputs: options.inputs.clone(),
                 environment,
-                request_budget_ms: deadline
+                request_budget_ms: options
+                    .deadline
                     .saturating_duration_since(Instant::now())
                     .as_millis()
                     .clamp(1, 300_000) as u64,
             },
         };
-        container_init_protocol::validate_message(&exec).map_err(BackendClientError::Protocol)?;
-        write_message_until(&mut stream, &exec, deadline, MAX_REQUEST_FRAME_BYTES)
-            .map_err(|failure| protocol_client_error(failure.error))?;
-        match read_server_response(&mut stream, deadline) {
+        validate_message(&exec).map_err(BackendClientError::Protocol)?;
+        write_message_until(
+            &mut stream,
+            &exec,
+            options.deadline,
+            MAX_REQUEST_FRAME_BYTES,
+        )
+        .map_err(|failure| protocol_client_error(failure.error))?;
+        match read_server_response(&mut stream, options.deadline) {
             Ok(ServerResponse::PreparedExec(prepared)) => {
                 let prepared = from_wire_prepared(prepared);
                 let prepare_id = prepared.prepare_id.clone();
@@ -301,7 +317,7 @@ impl BackendClient {
                     }
                 });
                 if validated.is_err() && !prepare_id.is_empty() {
-                    let _ = self.abort_until(&prepare_id, deadline);
+                    let _ = self.abort_until(&prepare_id, options.deadline);
                 }
                 validated
             }
@@ -524,10 +540,7 @@ fn from_wire_prepared(prepared: WirePreparedHandoff) -> PreparedHandoff {
     PreparedHandoff {
         prepare_id: prepared.prepare_id,
         snapshot_id: prepared.snapshot_id,
-        command: HandoffCommand {
-            program: prepared.command.program,
-            args: prepared.command.args,
-        },
+        command: HandoffCommand::new(prepared.command.program, prepared.command.args),
         cwd: prepared.cwd,
         cwd_object: prepared.cwd_object,
         login_environment: prepared.login_environment,
@@ -700,10 +713,10 @@ fn validate_prepared(
         .login_environment
         .get("LOGNAME")
         .is_some_and(|user| user == &prepared.identity.user);
-    if !prepared.command.program.is_absolute()
+    if !prepared.command.program().is_absolute()
         || prepared
             .command
-            .args
+            .args()
             .iter()
             .any(|argument| argument.contains('\0'))
         || !prepared.cwd.is_absolute()
@@ -728,7 +741,7 @@ fn validate_prepared(
                     .is_some_and(|value| value == "root")))
         || !prepared.identity.home.is_absolute()
         || prepared.identity.user.contains('\0')
-        || prepared.supplemental_groups.len() > container_init_protocol::max_supplementary_groups()
+        || prepared.supplemental_groups.len() > max_supplementary_groups()
         || (!prepared.root_service
             && !prepared
                 .supplemental_groups
@@ -771,6 +784,63 @@ fn handoff_credentials_match(
             && caller.groups.as_deref() == Some(supplemental_groups))
 }
 
+#[cfg(test)]
+#[test]
+fn non_root_prepare_requires_matching_uid_gid_and_complete_groups() {
+    let identity = ResolvedIdentity {
+        uid: 1000,
+        gid: 100,
+        user: "dev".to_owned(),
+        home: "/home/dev".into(),
+        run_as_root: false,
+        uid_source: IdentitySource::Current,
+        gid_source: IdentitySource::Current,
+        workspace: WorkspaceStatus::Unavailable,
+    };
+    let caller = CallerCredentials {
+        uid: 1000,
+        gid: 100,
+        groups: Some(vec![100, 200]),
+    };
+    assert!(handoff_credentials_match(
+        &caller,
+        &identity,
+        &[100, 200],
+        false
+    ));
+
+    let mut wrong_uid = caller.clone();
+    wrong_uid.uid = 1001;
+    assert!(!handoff_credentials_match(
+        &wrong_uid,
+        &identity,
+        &[100, 200],
+        false
+    ));
+
+    let mut wrong_gid = caller.clone();
+    wrong_gid.gid = 101;
+    assert!(!handoff_credentials_match(
+        &wrong_gid,
+        &identity,
+        &[100, 200],
+        false
+    ));
+
+    assert!(!handoff_credentials_match(
+        &caller,
+        &identity,
+        &[100],
+        false
+    ));
+    assert!(!handoff_credentials_match(
+        &caller,
+        &identity,
+        &[100, 200],
+        true
+    ));
+}
+
 fn caller_credentials() -> Result<CallerCredentials, BackendClientError> {
     let uid = unsafe { geteuid() };
     let gid = unsafe { getegid() };
@@ -787,7 +857,7 @@ fn current_groups() -> Result<Vec<u32>, BackendClientError> {
     if count < 0 {
         return Err(BackendClientError::Io(io::Error::last_os_error()));
     }
-    if count as usize > container_init_protocol::max_supplementary_groups() {
+    if count as usize > max_supplementary_groups() {
         return Err(BackendClientError::Protocol(ProtocolError::invalid_frame(
             "caller supplementary groups exceed the platform limit",
         )));
@@ -806,12 +876,11 @@ fn current_groups() -> Result<Vec<u32>, BackendClientError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handoff_credentials_match, BackendClient, BackendClientError, CallerCredentials};
-    use container_init_core::{IdentitySource, ResolvedIdentity, WorkspaceStatus};
+    use super::{BackendClient, BackendClientError};
     use container_init_protocol::{
         read_message, write_message, BackendError, BackendState, ClientMessage, ClientRequest,
-        CommitResult as WireCommitResult, ExecTransactionState, HelloInfo, ReceiptSummary,
-        ServerMessage, ServerResponse, PROTOCOL_VERSION,
+        CommitResult as WireCommitResult, ExecTransactionState, HelloInfo, ProtocolLimits,
+        ReceiptSummary, ServerMessage, ServerResponse, PROTOCOL_VERSION,
     };
     use std::{
         collections::BTreeMap,
@@ -825,62 +894,6 @@ mod tests {
         time::{Duration, Instant},
     };
     use tempfile::TempDir;
-
-    #[test]
-    fn non_root_prepare_requires_matching_uid_gid_and_complete_groups() {
-        let identity = ResolvedIdentity {
-            uid: 1000,
-            gid: 100,
-            user: "dev".to_owned(),
-            home: "/home/dev".into(),
-            run_as_root: false,
-            uid_source: IdentitySource::Current,
-            gid_source: IdentitySource::Current,
-            workspace: WorkspaceStatus::Unavailable,
-        };
-        let caller = CallerCredentials {
-            uid: 1000,
-            gid: 100,
-            groups: Some(vec![100, 200]),
-        };
-        assert!(handoff_credentials_match(
-            &caller,
-            &identity,
-            &[100, 200],
-            false
-        ));
-
-        let mut wrong_uid = caller.clone();
-        wrong_uid.uid = 1001;
-        assert!(!handoff_credentials_match(
-            &wrong_uid,
-            &identity,
-            &[100, 200],
-            false
-        ));
-
-        let mut wrong_gid = caller.clone();
-        wrong_gid.gid = 101;
-        assert!(!handoff_credentials_match(
-            &wrong_gid,
-            &identity,
-            &[100, 200],
-            false
-        ));
-
-        assert!(!handoff_credentials_match(
-            &caller,
-            &identity,
-            &[100],
-            false
-        ));
-        assert!(!handoff_credentials_match(
-            &caller,
-            &identity,
-            &[100, 200],
-            true
-        ));
-    }
 
     #[test]
     fn prepare_timeout_includes_the_prepare_exchange() {
@@ -900,7 +913,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
-                        limits: container_init_protocol::ProtocolLimits::current(),
+                        limits: ProtocolLimits::current(),
                     }),
                 },
             )
@@ -1029,7 +1042,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
-                        limits: container_init_protocol::ProtocolLimits::current(),
+                        limits: ProtocolLimits::current(),
                     }),
                 },
             )
@@ -1080,7 +1093,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
-                        limits: container_init_protocol::ProtocolLimits::current(),
+                        limits: ProtocolLimits::current(),
                     }),
                 },
             )
@@ -1112,7 +1125,7 @@ mod tests {
                         snapshot_id: "snapshot".into(),
                         runtime_inputs: vec![],
                         environment_names: vec![],
-                        limits: container_init_protocol::ProtocolLimits::current(),
+                        limits: ProtocolLimits::current(),
                     }),
                 },
             )

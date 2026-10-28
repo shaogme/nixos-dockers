@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, VecDeque};
-use std::fs;
-use std::io;
-use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    fs, io,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PathScope {
@@ -111,17 +112,11 @@ impl ResourceKey {
     }
 }
 
-fn namespace_mask(namespace: ProcessNamespace) -> u8 {
-    match namespace {
-        ProcessNamespace::User => 0b01,
-        ProcessNamespace::Mount => 0b10,
-        ProcessNamespace::UserAndMount => 0b11,
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ResourceLockManager {
-    inner: Arc<LockInner>,
+#[derive(Debug, Default)]
+struct LockState {
+    next_ticket: u64,
+    waiting: VecDeque<(u64, Vec<ResourceKey>)>,
+    active: Vec<(u64, Vec<ResourceKey>)>,
 }
 
 #[derive(Debug, Default)]
@@ -130,11 +125,23 @@ struct LockInner {
     changed: Condvar,
 }
 
-#[derive(Debug, Default)]
-struct LockState {
-    next_ticket: u64,
-    waiting: VecDeque<(u64, Vec<ResourceKey>)>,
-    active: Vec<(u64, Vec<ResourceKey>)>,
+#[derive(Debug)]
+pub struct ResourceLockGuard {
+    inner: Arc<LockInner>,
+    ticket: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResourceLockManager {
+    inner: Arc<LockInner>,
+}
+
+fn namespace_mask(namespace: ProcessNamespace) -> u8 {
+    match namespace {
+        ProcessNamespace::User => 0b01,
+        ProcessNamespace::Mount => 0b10,
+        ProcessNamespace::UserAndMount => 0b11,
+    }
 }
 
 impl ResourceLockManager {
@@ -175,7 +182,7 @@ impl ResourceLockManager {
                 .inner
                 .changed
                 .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -187,12 +194,6 @@ impl ResourceLockManager {
     fn pending_count(&self) -> usize {
         lock_state(&self.inner.state).waiting.len()
     }
-}
-
-#[derive(Debug)]
-pub struct ResourceLockGuard {
-    inner: Arc<LockInner>,
-    ticket: u64,
 }
 
 impl Drop for ResourceLockGuard {
@@ -244,18 +245,13 @@ fn normalize_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn lock_state(state: &Mutex<LockState>) -> MutexGuard<'_, LockState> {
-    state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{PathScope, ProcessNamespace, ResourceKey, ResourceLockManager};
-    use std::path::PathBuf;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
+    use std::{path::PathBuf, sync::mpsc, thread, time::Duration};
     use tempfile::TempDir;
 
     fn exact(path: impl Into<PathBuf>) -> ResourceKey {

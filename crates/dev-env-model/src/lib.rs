@@ -23,12 +23,10 @@ mod validation;
 mod value;
 
 pub use backend::{
-    decode_backend_request, decode_backend_response, encode_backend_request,
-    encode_backend_response, read_backend_request, read_backend_response, write_backend_request,
-    write_backend_response, BackendError, BackendProtocolError, BackendRequest,
-    BackendRequestEnvelope, BackendRequestMessage, BackendResponse, BackendResponseEnvelope,
-    BackendResponseMessage, BackendState, BackendStatus, HelloInfo, PrepareResponse,
-    PreparedResponse, ProviderDiagnosticSummary, ReceiptSummary, ShellInvocation, TrustTarget,
+    BackendError, BackendProtocolError, BackendRequest, BackendRequestEnvelope,
+    BackendRequestMessage, BackendResponse, BackendResponseEnvelope, BackendResponseMessage,
+    BackendState, BackendStatus, HelloInfo, PrepareResponse, PreparedResponse,
+    ProviderDiagnosticSummary, ReceiptSummary, ShellInvocation, TrustTarget,
     BACKEND_PROTOCOL_VERSION, DEVENV_BACKEND_ERROR_VERSION, DEVENV_BACKEND_PROTOCOL_VERSION,
     MAX_BACKEND_FRAME_BYTES,
 };
@@ -62,8 +60,8 @@ pub use request::{PrepareRequest, RequestContext, RequestMode, RequestValidation
 pub use shell::{ShellArgError, ShellConfig, ShellEnvEntry, ShellEnvParseError, ShellKind};
 pub use snapshot::{
     ConfigSnapshot, ConfigSnapshotRef, ExecutableResolutionRules, Generation, MaterializationKey,
-    MaterializationKeyError, PreparePolicy, ProviderPolicy, SnapshotError, SnapshotGeneration,
-    WorkspaceOverlayPolicy,
+    MaterializationKeyBuilder, MaterializationKeyError, PreparePolicy, ProviderPolicy,
+    SnapshotError, SnapshotGeneration, WorkspaceOverlayPolicy,
 };
 pub use value::ValueTree;
 

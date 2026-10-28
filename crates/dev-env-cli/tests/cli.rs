@@ -1,12 +1,23 @@
-use dev_env_cli::{Cli, CliCommand, CliError, ParseError};
-use dev_env_loader::LoaderError;
-use dev_env_model::ModelError;
-use fs2::FileExt;
-use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use {
+    dev_env_cli::{Cli, CliCommand, CliError, ParseError},
+    dev_env_loader::LoaderError,
+    dev_env_model::ModelError,
+    fs2::FileExt,
+    serde_json::{from_slice, Value as JsonValue},
+    std::{
+        env::temp_dir,
+        error::Error,
+        ffi::OsString,
+        fs::{self, OpenOptions},
+        io::ErrorKind,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+        time::{SystemTime, UNIX_EPOCH},
+    },
+};
+
+#[cfg(unix)]
+use libc::geteuid;
 
 struct Fixture {
     root: PathBuf,
@@ -21,8 +32,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("dev-env-cli-test-{}-{suffix}", std::process::id()));
+        let root = temp_dir().join(format!("dev-env-cli-test-{}-{suffix}", std::process::id()));
         let profiles = root.join("profiles");
         fs::create_dir_all(&profiles).unwrap();
         let default_profile = root.join("default-profile");
@@ -111,9 +121,9 @@ fn parser_keeps_command_argv_and_supports_login_launcher() {
         "argument with spaces",
     ])
     .unwrap();
-    assert_eq!(cli.options.profile.as_deref(), Some("base"));
+    assert_eq!(cli.options().profile.as_deref(), Some("base"));
     assert!(matches!(
-        cli.command,
+        cli.command(),
         CliCommand::Exec { ref command }
             if command == &[
                 OsString::from("printf"),
@@ -123,11 +133,11 @@ fn parser_keeps_command_argv_and_supports_login_launcher() {
     ));
 
     let login = Cli::parse_strings(["/usr/bin/dev-env-login-shell", "-c", "printf ok"]).unwrap();
-    assert!(matches!(login.command, CliCommand::LoginShell { ref args } if args.len() == 2));
+    assert!(matches!(login.command(), CliCommand::LoginShell { args } if args.len() == 2));
 
     let bash = Cli::parse_strings(["/bin/bash", "-c", "printf ok"]).unwrap();
     assert!(matches!(
-        bash.command,
+        bash.command(),
         CliCommand::Shim { ref shell, ref real, ref args }
             if shell == "bash"
                 && real == std::path::Path::new("/usr/local/libexec/dev-env/real/bash")
@@ -244,7 +254,7 @@ fn backend_startup_failure_is_not_reported_as_success() {
     if let Ok(lock) = OpenOptions::new().read(true).write(true).open(lock_path) {
         match lock.try_lock_exclusive() {
             Ok(()) => lock.unlock().unwrap(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 eprintln!(
                     "skipping backend startup test because a runtime instance owns the fixed lock"
                 );
@@ -338,7 +348,7 @@ runtime = true
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let value: JsonValue = from_slice(&output.stdout).unwrap();
     assert_eq!(value["value"], "if-missing");
     assert_eq!(
         value["provenance"]["features.devbox.auto_init"]["origins"][1]["source"]["kind"],
@@ -461,7 +471,7 @@ fn explain_and_doctor_are_auditable_without_running_a_provider() {
         "{}",
         String::from_utf8_lossy(&explained.stderr)
     );
-    let value: serde_json::Value = serde_json::from_slice(&explained.stdout).unwrap();
+    let value: JsonValue = from_slice(&explained.stdout).unwrap();
     assert_eq!(value["value"], "base");
     assert_eq!(value["merge_policy"], "strict");
     assert_eq!(
@@ -475,7 +485,7 @@ fn explain_and_doctor_are_auditable_without_running_a_provider() {
         "{}",
         String::from_utf8_lossy(&doctor.stderr)
     );
-    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let report: JsonValue = from_slice(&doctor.stdout).unwrap();
     assert_eq!(report["ok"], true);
     assert!(report["checks"]
         .as_array()
@@ -517,7 +527,7 @@ fn cli_error_keeps_a_structured_loader_error_as_its_source() {
             shell: "missing".to_owned(),
         },
     });
-    let source = std::error::Error::source(&error).unwrap();
+    let source = Error::source(&error).unwrap();
     assert!(source.downcast_ref::<LoaderError>().is_some());
     assert!(source
         .source()
@@ -529,10 +539,12 @@ fn cli_error_keeps_a_structured_loader_error_as_its_source() {
 #[cfg(unix)]
 #[test]
 fn root_bash_shim_rebootstraps_with_original_argv_and_runtime_inputs() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        process::CommandExt,
+    };
 
-    if unsafe { libc::geteuid() } != 0 {
+    if unsafe { geteuid() } != 0 {
         return;
     }
 
@@ -591,38 +603,53 @@ fn root_bash_shim_rebootstraps_with_original_argv_and_runtime_inputs() {
 }
 
 #[cfg(unix)]
+struct InvalidBootstrapCase {
+    container_init: Option<&'static str>,
+    real_shell: Option<&'static str>,
+    expected: &'static str,
+}
+
+#[cfg(unix)]
 #[test]
 fn root_bash_shim_reports_invalid_bootstrap_configuration() {
     use std::os::unix::process::CommandExt;
 
-    if unsafe { libc::geteuid() } != 0 {
+    if unsafe { geteuid() } != 0 {
         return;
     }
 
     let fixture = Fixture::new();
     let cases = [
-        (
-            Some("relative/container-init"),
-            Some("/bin/sh"),
-            "must be absolute",
-        ),
-        (Some("/bin/sh"), None, "DEVENV_BOOTSTRAP_REAL_SHELL"),
-        (Some("/bin/sh"), Some("/bin/bash"), "public bash shim"),
+        InvalidBootstrapCase {
+            container_init: Some("relative/container-init"),
+            real_shell: Some("/bin/sh"),
+            expected: "must be absolute",
+        },
+        InvalidBootstrapCase {
+            container_init: Some("/bin/sh"),
+            real_shell: None,
+            expected: "DEVENV_BOOTSTRAP_REAL_SHELL",
+        },
+        InvalidBootstrapCase {
+            container_init: Some("/bin/sh"),
+            real_shell: Some("/bin/bash"),
+            expected: "public bash shim",
+        },
     ];
 
-    for (container_init, real_shell, expected) in cases {
+    for case in cases {
         let mut command = fixture.command();
         command.arg0("/bin/bash");
-        if let Some(container_init) = container_init {
+        if let Some(container_init) = case.container_init {
             command.env("DEVENV_CONTAINER_INIT", container_init);
         }
-        if let Some(real_shell) = real_shell {
+        if let Some(real_shell) = case.real_shell {
             command.env("DEVENV_BOOTSTRAP_REAL_SHELL", real_shell);
         }
         let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(65));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("DEVENV-E-BOOTSTRAP"), "{stderr}");
-        assert!(stderr.contains(expected), "{stderr}");
+        assert!(stderr.contains(case.expected), "{stderr}");
     }
 }

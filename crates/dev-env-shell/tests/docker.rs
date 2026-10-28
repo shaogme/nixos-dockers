@@ -2,9 +2,7 @@ use dev_env_model::{EnvValue, MaterializedEnv, ShellConfig, ShellKind};
 use dev_env_shell::{
     build_invocation, build_shim, CommandLine, ConfiguredShellAdapter, ShellInvocation,
 };
-use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::path::Path;
+use std::{collections::BTreeMap, env::temp_dir, ffi::OsString, path::Path, process::Output};
 
 fn environment() -> MaterializedEnv {
     MaterializedEnv::new(
@@ -25,16 +23,16 @@ fn environment() -> MaterializedEnv {
 }
 
 fn bash_config() -> ShellConfig {
-    ShellConfig {
-        command: "/bin/bash".to_owned(),
-        kind: ShellKind::Posix,
-        login_args: vec!["--login".to_owned()],
-        interactive_args: vec!["--interactive".to_owned()],
-        command_arg: Some("-c".to_owned()),
-    }
+    ShellConfig::new(
+        "/bin/bash",
+        ShellKind::Posix,
+        vec!["--login".to_owned()],
+        vec!["--interactive".to_owned()],
+        Some("-c".to_owned()),
+    )
 }
 
-fn assert_success(output: std::process::Output) -> Vec<u8> {
+fn assert_success(output: Output) -> Vec<u8> {
     assert!(
         output.status.success(),
         "child failed: {}",
@@ -92,7 +90,7 @@ fn runs_a_profile_login_invocation_in_a_real_bash() {
 
 #[test]
 fn executes_a_real_shell_shim_without_reparsing_forwarded_arguments() {
-    let marker = std::env::temp_dir().join(format!(
+    let marker = temp_dir().join(format!(
         "dev-env-shell-shim-{}-{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")

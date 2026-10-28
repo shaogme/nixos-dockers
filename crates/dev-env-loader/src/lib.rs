@@ -8,7 +8,6 @@ mod error;
 mod loader;
 mod merge;
 mod raw;
-mod runtime;
 mod source;
 
 pub use error::{ConflictRemedy, LoaderError, TrustViolationReason, ValueKind};

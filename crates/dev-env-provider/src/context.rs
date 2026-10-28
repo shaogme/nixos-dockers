@@ -1,30 +1,36 @@
 use dev_env_model::ValueTree;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs::metadata,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Runtime facts made available to provider argv templates and conditions.
 /// The map is the environment explicitly selected by the materializer; the
 /// provider runtime does not inspect or serialize a second environment source.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProviderContext {
-    pub workspace: PathBuf,
-    pub cwd: PathBuf,
-    pub shell: String,
+    workspace: PathBuf,
+    cwd: PathBuf,
+    shell: String,
     #[serde(default)]
-    pub environment: BTreeMap<String, String>,
+    environment: BTreeMap<String, String>,
     #[serde(default)]
-    pub config: ValueTree,
+    config: ValueTree,
     #[serde(default)]
-    pub workspace_writable: bool,
+    workspace_writable: bool,
     #[serde(default)]
-    pub workspace_config_present: bool,
+    workspace_config_present: bool,
     #[serde(default)]
-    pub user_id: u32,
+    user_id: u32,
     #[serde(default)]
-    pub config_fingerprint: [u8; 32],
+    config_fingerprint: [u8; 32],
     #[serde(default)]
-    pub provider_enabled: bool,
+    provider_enabled: bool,
 }
 
 impl ProviderContext {
@@ -90,6 +96,54 @@ impl ProviderContext {
         Some(value)
     }
 
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn shell(&self) -> &str {
+        &self.shell
+    }
+
+    pub fn shell_mut(&mut self) -> &mut String {
+        &mut self.shell
+    }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    pub fn environment_mut(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.environment
+    }
+
+    pub fn config(&self) -> &ValueTree {
+        &self.config
+    }
+
+    pub fn workspace_writable(&self) -> bool {
+        self.workspace_writable
+    }
+
+    pub fn workspace_config_present(&self) -> bool {
+        self.workspace_config_present
+    }
+
+    pub fn user_id(&self) -> u32 {
+        self.user_id
+    }
+
+    pub fn config_fingerprint(&self) -> [u8; 32] {
+        self.config_fingerprint
+    }
+
+    pub fn provider_enabled(&self) -> bool {
+        self.provider_enabled
+    }
+
     pub fn namespace_value(&self, namespace: &str, path: &str) -> Option<&ValueTree> {
         if let Some(value) = self.config_value(&format!("{namespace}.{path}")) {
             return Some(value);
@@ -118,13 +172,12 @@ impl ProviderContext {
 }
 
 fn directory_looks_writable(path: &Path) -> bool {
-    if let Ok(metadata) = std::fs::metadata(path) {
+    if let Ok(metadata) = metadata(path) {
         if metadata.permissions().readonly() {
             return false;
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             return metadata.permissions().mode() & 0o222 != 0;
         }
         #[cfg(not(unix))]

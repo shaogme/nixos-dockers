@@ -1,7 +1,11 @@
-use crate::command::{CommandLine, CommandLineError};
-use crate::error::{ShimError, ShimPathError};
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use crate::{
+    command::CommandLine,
+    error::{ShimError, ShimPathError},
+};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 /// A compatibility shim keeps the real shell path and original argv
 /// separate.  It does not add shell syntax or re-parse the arguments.
@@ -28,29 +32,25 @@ impl Shim {
         &self.real
     }
 
+    pub(crate) fn validate_configured_command(&self, configured: &Path) -> Result<(), ShimError> {
+        validate_real_path(&self.real)?;
+        if self.real == configured {
+            return Err(ShimError::Recursive {
+                real: self.real.clone(),
+                configured: configured.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn build(&self, args: &[OsString]) -> Result<CommandLine, ShimError> {
         validate_real_path(&self.real)?;
         if let Some(configured) = &self.configured_command {
-            validate_shim(&self.real, configured)?;
+            self.validate_configured_command(configured)?;
         }
         CommandLine::try_new(self.real.clone(), args.iter().cloned())
             .map_err(|source| ShimError::CommandLine { source })
     }
-}
-
-pub fn build_shim(real: impl AsRef<Path>, args: &[OsString]) -> Result<CommandLine, ShimError> {
-    Shim::new(real.as_ref().to_path_buf()).build(args)
-}
-
-pub fn validate_shim(real: &Path, configured: &Path) -> Result<(), ShimError> {
-    validate_real_path(real)?;
-    if real == configured {
-        return Err(ShimError::Recursive {
-            real: real.to_path_buf(),
-            configured: configured.to_path_buf(),
-        });
-    }
-    Ok(())
 }
 
 fn validate_real_path(path: &Path) -> Result<(), ShimError> {
@@ -81,11 +81,5 @@ fn contains_nul(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         path.as_os_str().to_string_lossy().contains('\0')
-    }
-}
-
-impl From<CommandLineError> for ShimError {
-    fn from(source: CommandLineError) -> Self {
-        Self::CommandLine { source }
     }
 }

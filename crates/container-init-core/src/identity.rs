@@ -1,12 +1,10 @@
-use crate::context::RuntimeContext;
-use crate::error::CoreError;
+use crate::{CoreError, RuntimeContext};
 use container_init_bootstrap_model::{
     BootstrapConfig, BootstrapInput, InputNamespace, InputValue, ParsedInput,
 };
 use container_init_posix::{PosixSystem, WorkspaceObservation};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 pub const DEFAULT_ROOT_HOME: &str = "/root";
 
@@ -52,18 +50,24 @@ pub struct ResolvedIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsedRuntimeInput {
+    UidPair { uid: u32, gid: Option<u32> },
+    Gid(u32),
+    Bool(bool),
+    Path(PathBuf),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeInput {
     pub name: String,
     pub raw: String,
     pub parsed: ParsedRuntimeInput,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ParsedRuntimeInput {
-    UidPair { uid: u32, gid: Option<u32> },
-    Gid(u32),
-    Bool(bool),
-    Path(PathBuf),
+#[derive(Clone, Copy)]
+struct UidPair {
+    uid: u32,
+    gid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -111,19 +115,19 @@ impl IdentityResolver {
         context: &RuntimeContext,
     ) -> Result<ResolvedInputs, CoreError> {
         let mut values = BTreeMap::new();
-        for (name, declaration) in &config.inputs {
+        for (name, declaration) in config.inputs() {
             let Some(raw) = declared_value(name, declaration, context) else {
                 continue;
             };
             let parsed = declaration.parse_value(&raw).map_err(CoreError::Model)?;
             let parsed = to_runtime_value(parsed);
             let input = RuntimeInput {
-                name: name.clone(),
+                name: name.to_owned(),
                 raw,
                 parsed,
             };
-            values.insert(name.clone(), input.clone());
-            for alias in &declaration.aliases {
+            values.insert(name.to_owned(), input.clone());
+            for alias in declaration.aliases() {
                 values.insert(alias.clone(), input.clone());
             }
         }
@@ -148,14 +152,14 @@ impl IdentityResolver {
         let run_as_root = input_bool(
             config,
             &inputs,
-            config.identity.run_as_root_input.as_deref(),
+            config.identity().run_as_root_input().as_deref(),
         )?
         .unwrap_or(false);
 
-        let configured_home = config.identity.default_home.as_deref();
+        let configured_home = config.identity().default_home().as_deref();
 
         if run_as_root {
-            let home = input_home(config, &inputs, config.identity.home_input.as_deref())?
+            let home = input_home(config, &inputs, config.identity().home_input().as_deref())?
                 .or_else(|| configured_home.map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT_HOME));
             return Ok(ResolvedIdentity {
@@ -170,13 +174,13 @@ impl IdentityResolver {
             });
         }
 
-        let uid_pair = input_uid_pair(config, &inputs, config.identity.uid_input.as_deref())?;
-        let explicit_gid = input_gid(config, &inputs, config.identity.gid_input.as_deref())?;
-        let configured_user = config.identity.default_user.clone();
+        let uid_pair = input_uid_pair(config, &inputs, config.identity().uid_input().as_deref())?;
+        let explicit_gid = input_gid(config, &inputs, config.identity().gid_input().as_deref())?;
+        let configured_user = config.identity().default_user().clone();
         if configured_user.as_deref() == Some("root") {
             let requested_uid = uid_pair.as_ref().map(|pair| pair.uid);
             if requested_uid
-                .or(config.identity.default_uid)
+                .or(config.identity().default_uid())
                 .is_some_and(|uid| uid != 0)
             {
                 return Err(CoreError::Identity {
@@ -206,7 +210,7 @@ impl IdentityResolver {
         let (pair, pair_namespace) = match uid_pair {
             Some(pair) => {
                 let namespace =
-                    input_namespace(config, &inputs, config.identity.uid_input.as_deref())?;
+                    input_namespace(config, &inputs, config.identity().uid_input().as_deref())?;
                 let uid = map_uid(&self.posix, pair.uid, namespace)?;
                 let gid = pair
                     .gid
@@ -222,17 +226,17 @@ impl IdentityResolver {
                 pair.uid,
                 source_for_namespace(pair_namespace.expect("pair namespace")),
             )
-        } else if config.identity.auto_mapping {
+        } else if config.identity().auto_mapping() {
             if let Some((uid, _)) = mounted_owner {
                 (uid, IdentitySource::WorkspaceMount)
-            } else if let Some(uid) = config.identity.default_uid {
+            } else if let Some(uid) = config.identity().default_uid() {
                 (uid, IdentitySource::ProfileDefault)
             } else if let Some(user) = &named_user {
                 (user.uid, IdentitySource::ProfileDefault)
             } else {
                 (self.posix.current_ids().0, IdentitySource::Current)
             }
-        } else if let Some(uid) = config.identity.default_uid {
+        } else if let Some(uid) = config.identity().default_uid() {
             (uid, IdentitySource::ProfileDefault)
         } else if let Some(user) = &named_user {
             (user.uid, IdentitySource::ProfileDefault)
@@ -241,7 +245,8 @@ impl IdentityResolver {
         };
 
         let (gid, gid_source) = if let Some(gid) = explicit_gid {
-            let namespace = input_namespace(config, &inputs, config.identity.gid_input.as_deref())?;
+            let namespace =
+                input_namespace(config, &inputs, config.identity().gid_input().as_deref())?;
             (
                 map_gid(&self.posix, gid, namespace)?,
                 source_for_namespace(namespace),
@@ -251,17 +256,17 @@ impl IdentityResolver {
                 gid,
                 source_for_namespace(pair_namespace.expect("pair namespace")),
             )
-        } else if config.identity.auto_mapping {
+        } else if config.identity().auto_mapping() {
             if let Some((_, gid)) = mounted_owner {
                 (gid, IdentitySource::WorkspaceMount)
-            } else if let Some(gid) = config.identity.default_gid {
+            } else if let Some(gid) = config.identity().default_gid() {
                 (gid, IdentitySource::ProfileDefault)
             } else if let Some(user) = &named_user {
                 (user.gid, IdentitySource::ProfileDefault)
             } else {
                 (self.posix.current_ids().1, IdentitySource::Current)
             }
-        } else if let Some(gid) = config.identity.default_gid {
+        } else if let Some(gid) = config.identity().default_gid() {
             (gid, IdentitySource::ProfileDefault)
         } else if let Some(user) = &named_user {
             (user.gid, IdentitySource::ProfileDefault)
@@ -312,7 +317,7 @@ impl IdentityResolver {
             }
         }
 
-        let home = input_home(config, &inputs, config.identity.home_input.as_deref())?
+        let home = input_home(config, &inputs, config.identity().home_input().as_deref())?
             .or_else(|| configured_home.map(PathBuf::from))
             .or_else(|| {
                 if uid == 0 {
@@ -350,18 +355,18 @@ fn declared_value(
     declaration: &BootstrapInput,
     context: &RuntimeContext,
 ) -> Option<String> {
-    if !declaration.runtime {
-        return declaration.default.as_ref().map(input_value_string);
+    if !declaration.runtime() {
+        return declaration.default().as_ref().map(input_value_string);
     }
-    let mut names = Vec::with_capacity(1 + declaration.aliases.len());
+    let mut names = Vec::with_capacity(1 + declaration.aliases().len());
     names.push(name);
-    names.extend(declaration.aliases.iter().map(String::as_str));
+    names.extend(declaration.aliases().iter().map(String::as_str));
     names
         .iter()
         .find_map(|name| context.cli_input(name))
         .or_else(|| names.iter().find_map(|name| context.env(name)))
         .map(str::to_owned)
-        .or_else(|| declaration.default.as_ref().map(input_value_string))
+        .or_else(|| declaration.default().as_ref().map(input_value_string))
 }
 
 fn input_value_string(value: &InputValue) -> String {
@@ -391,9 +396,9 @@ fn find_input<'a>(
         return Some(input);
     }
     config
-        .inputs
+        .inputs()
         .iter()
-        .find(|(_, declaration)| declaration.aliases.iter().any(|alias| alias == name))
+        .find(|(_, declaration)| declaration.aliases().iter().any(|alias| alias == name))
         .and_then(|(canonical, _)| inputs.get(canonical))
 }
 
@@ -402,11 +407,11 @@ fn input_declaration<'a>(
     name: Option<&str>,
 ) -> Option<&'a BootstrapInput> {
     let name = name?;
-    config.inputs.get(name).or_else(|| {
+    config.inputs().get(name).or_else(|| {
         config
-            .inputs
+            .inputs()
             .values()
-            .find(|declaration| declaration.aliases.iter().any(|alias| alias == name))
+            .find(|declaration| declaration.aliases().iter().any(|alias| alias == name))
     })
 }
 
@@ -421,7 +426,7 @@ fn input_namespace(
         });
     };
     input_declaration(config, Some(&input.name))
-        .and_then(|declaration| declaration.namespace)
+        .and_then(|declaration| declaration.namespace())
         .ok_or_else(|| CoreError::Identity {
             message: format!("input {} has no declared namespace", input.name),
         })
@@ -522,8 +527,8 @@ fn input_home(
         });
     };
     let declaration = input_declaration(config, Some(&input.name));
-    if declaration.is_some_and(|declaration| !declaration.allow_outside_workspace)
-        && !path.starts_with(&config.workspace_root)
+    if declaration.is_some_and(|declaration| !declaration.allow_outside_workspace())
+        && !path.starts_with(config.workspace_root())
     {
         return Err(CoreError::Identity {
             message: format!(
@@ -533,10 +538,4 @@ fn input_home(
         });
     }
     Ok(Some(path.clone()))
-}
-
-#[derive(Clone, Copy)]
-struct UidPair {
-    uid: u32,
-    gid: Option<u32>,
 }

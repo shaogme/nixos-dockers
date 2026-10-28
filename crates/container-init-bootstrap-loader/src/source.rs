@@ -1,9 +1,6 @@
-use crate::error::LoaderError;
-use crate::raw::parse_profile;
-use container_init_bootstrap_model::{BootstrapConfig, Plan, SourceKind};
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use crate::{error::LoaderError, raw::RawProfileParser};
+use container_init_bootstrap_model::{BootstrapConfig, ModelError, Plan, SourceKind};
+use std::{fs::File, io::Read, path::Path};
 
 const MAX_PROFILE_FILE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -11,10 +8,10 @@ const MAX_PROFILE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// Image and admin profiles are trusted; workspace and user profiles are not.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileSource {
-    pub(crate) id: String,
-    pub(crate) source: SourceKind,
-    pub(crate) location: Option<String>,
-    pub(crate) contents: String,
+    id: String,
+    source: SourceKind,
+    location: Option<String>,
+    contents: String,
 }
 
 impl ProfileSource {
@@ -68,7 +65,7 @@ impl ProfileSource {
                 ),
             });
         }
-        let raw = parse_profile(&contents, path.display().to_string())?;
+        let raw = RawProfileParser::parse_profile(&contents, path.display().to_string())?;
         Ok(Self {
             id: raw.id,
             source,
@@ -88,6 +85,10 @@ impl ProfileSource {
     pub fn location(&self) -> Option<&str> {
         self.location.as_deref()
     }
+
+    pub(crate) fn contents(&self) -> &str {
+        &self.contents
+    }
 }
 
 /// A profile that participated in a successful load, in parent-to-child
@@ -102,11 +103,18 @@ pub struct LoadedProfile {
 /// The result of projecting and merging the bootstrap namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedBootstrap {
-    pub(crate) config: BootstrapConfig,
-    pub(crate) profile_chain: Vec<LoadedProfile>,
+    config: BootstrapConfig,
+    profile_chain: Vec<LoadedProfile>,
 }
 
 impl LoadedBootstrap {
+    pub(crate) fn new(config: BootstrapConfig, profile_chain: Vec<LoadedProfile>) -> Self {
+        Self {
+            config,
+            profile_chain,
+        }
+    }
+
     pub fn config(&self) -> &BootstrapConfig {
         &self.config
     }
@@ -121,7 +129,7 @@ impl LoadedBootstrap {
 
     /// Build the static action plan after loading. This remains side-effect
     /// free; runtime input resolution belongs to the executor layer.
-    pub fn build_plan(&self) -> Result<Plan, container_init_bootstrap_model::ModelError> {
+    pub fn build_plan(&self) -> Result<Plan, ModelError> {
         self.config.build_plan()
     }
 }

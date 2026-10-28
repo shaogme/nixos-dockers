@@ -1,8 +1,17 @@
 use dev_env_model::ProviderConfig;
-use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    env::{split_paths, var_os},
+    error::Error,
+    ffi::OsString,
+    fmt::{Display, Formatter, Result as FmtResult},
+    fs::{metadata, read_dir, symlink_metadata},
+    io,
+    path::{Path, PathBuf, MAIN_SEPARATOR},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Debug)]
 pub enum DetectionError {
@@ -16,8 +25,8 @@ pub enum DetectionError {
     },
 }
 
-impl std::fmt::Display for DetectionError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for DetectionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::ReadWorkspace { path, source } => {
                 write!(formatter, "could not inspect {}: {source}", path.display())
@@ -29,8 +38,8 @@ impl std::fmt::Display for DetectionError {
     }
 }
 
-impl std::error::Error for DetectionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for DetectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ReadWorkspace { source, .. } | Self::LocateExecutable { source, .. } => {
                 Some(source)
@@ -57,6 +66,9 @@ pub trait ExecutableLocator: Send + Sync {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemExecutableLocator;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProviderDetection;
+
 impl ExecutableLocator for SystemExecutableLocator {
     fn locate(
         &self,
@@ -70,11 +82,11 @@ impl ExecutableLocator for SystemExecutableLocator {
         let path = environment
             .get("PATH")
             .map(OsString::from)
-            .or_else(|| std::env::var_os("PATH"));
+            .or_else(|| var_os("PATH"));
         let Some(path) = path else {
             return Ok(None);
         };
-        for directory in std::env::split_paths(&path) {
+        for directory in split_paths(&path) {
             let directory = if directory.as_os_str().is_empty() {
                 PathBuf::from(".")
             } else {
@@ -89,34 +101,36 @@ impl ExecutableLocator for SystemExecutableLocator {
     }
 }
 
-pub fn detect(
-    config: &ProviderConfig,
-    workspace: &Path,
-    environment: &BTreeMap<String, String>,
-    locator: &dyn ExecutableLocator,
-) -> Result<DetectionResult, DetectionError> {
-    let matched_files = detect_files(workspace, &config.detect_files)?;
-    // A file-gated provider is simply not applicable outside a matching
-    // workspace.  This is distinct from an applicable provider whose binary
-    // is missing and must follow `missing = error|warn|ignore`.
-    if !config.detect_files.is_empty() && matched_files.is_empty() {
-        return Ok(DetectionResult {
-            executable: None,
+impl ProviderDetection {
+    pub fn detect(
+        config: &ProviderConfig,
+        workspace: &Path,
+        environment: &BTreeMap<String, String>,
+        locator: &dyn ExecutableLocator,
+    ) -> Result<DetectionResult, DetectionError> {
+        let matched_files = detect_files(workspace, config.detect_files())?;
+        // A file-gated provider is simply not applicable outside a matching
+        // workspace.  This is distinct from an applicable provider whose binary
+        // is missing and must follow `missing = error|warn|ignore`.
+        if !config.detect_files().is_empty() && matched_files.is_empty() {
+            return Ok(DetectionResult {
+                executable: None,
+                matched_files,
+                applicable: false,
+            });
+        }
+        let executable = locator
+            .locate(config.executable(), environment)
+            .map_err(|source| DetectionError::LocateExecutable {
+                executable: config.executable().to_owned(),
+                source,
+            })?;
+        Ok(DetectionResult {
+            applicable: executable.is_some(),
+            executable,
             matched_files,
-            applicable: false,
-        });
+        })
     }
-    let executable = locator
-        .locate(&config.executable, environment)
-        .map_err(|source| DetectionError::LocateExecutable {
-            executable: config.executable.clone(),
-            source,
-        })?;
-    Ok(DetectionResult {
-        applicable: executable.is_some(),
-        executable,
-        matched_files,
-    })
 }
 
 fn detect_files(workspace: &Path, patterns: &[String]) -> Result<Vec<PathBuf>, DetectionError> {
@@ -151,9 +165,7 @@ fn detect_files(workspace: &Path, patterns: &[String]) -> Result<Vec<PathBuf>, D
             let Ok(relative) = path.strip_prefix(workspace) else {
                 return false;
             };
-            let relative = relative
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
+            let relative = relative.to_string_lossy().replace(MAIN_SEPARATOR, "/");
             patterns
                 .iter()
                 .any(|pattern| glob_matches(pattern, &relative))
@@ -162,7 +174,7 @@ fn detect_files(workspace: &Path, patterns: &[String]) -> Result<Vec<PathBuf>, D
 }
 
 fn walk_workspace(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), DetectionError> {
-    let entries = std::fs::read_dir(directory).map_err(|source| DetectionError::ReadWorkspace {
+    let entries = read_dir(directory).map_err(|source| DetectionError::ReadWorkspace {
         path: directory.to_path_buf(),
         source,
     })?;
@@ -172,11 +184,10 @@ fn walk_workspace(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), Det
             source,
         })?;
         let path = entry.path();
-        let metadata =
-            std::fs::symlink_metadata(&path).map_err(|source| DetectionError::ReadWorkspace {
-                path: path.clone(),
-                source,
-            })?;
+        let metadata = symlink_metadata(&path).map_err(|source| DetectionError::ReadWorkspace {
+            path: path.clone(),
+            source,
+        })?;
         if metadata.is_dir() {
             walk_workspace(&path, output)?;
         } else if metadata.is_file() {
@@ -242,7 +253,7 @@ fn component_matches(pattern: &str, value: &str) -> bool {
 }
 
 fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let Ok(metadata) = metadata(path) else {
         return false;
     };
     if !metadata.is_file() {
@@ -250,7 +261,6 @@ fn is_executable(path: &Path) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]

@@ -1,26 +1,34 @@
-use dev_env_loader::CliPatch;
-use dev_env_model::{OverrideOperation, OverrideSpec, ValueTree};
-use std::ffi::OsString;
-use std::path::PathBuf;
+use {
+    dev_env_loader::CliPatch,
+    dev_env_model::{OverrideOperation, OverrideSpec, ValueTree},
+    std::{
+        env::var_os,
+        error::Error,
+        ffi::OsString,
+        fmt::{Display, Formatter, Result as FmtResult},
+        path::{Path, PathBuf},
+    },
+};
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Cli {
-    pub options: CliOptions,
-    pub command: CliCommand,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendInitial {
+    Shell,
+    Exec(Vec<OsString>),
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct CliOptions {
-    pub profile: Option<String>,
-    pub profiles_dir: Option<PathBuf>,
-    pub admin_profiles_dir: Option<PathBuf>,
-    pub default_profile_file: Option<PathBuf>,
-    pub workspace: Option<PathBuf>,
-    pub cwd: Option<PathBuf>,
-    pub config: Option<PathBuf>,
-    pub patches: Vec<CliPatch>,
-    pub show_secrets: bool,
-    pub offline: bool,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendCommand {
+    Run { initial: BackendInitial },
+    Status { json: bool },
+    Reload { wait: bool },
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputFormat {
+    Dotenv,
+    Json,
+    Shell,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,25 +70,26 @@ pub enum CliCommand {
     Version,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BackendCommand {
-    Run { initial: BackendInitial },
-    Status { json: bool },
-    Reload { wait: bool },
-    Stop,
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CliOptions {
+    pub profile: Option<String>,
+    pub profiles_dir: Option<PathBuf>,
+    pub admin_profiles_dir: Option<PathBuf>,
+    pub default_profile_file: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
+    pub config: Option<PathBuf>,
+    pub patches: Vec<CliPatch>,
+    pub show_secrets: bool,
+    pub offline: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BackendInitial {
-    Shell,
-    Exec(Vec<OsString>),
-}
+const DEFAULT_REAL_SHELL: &str = "/usr/local/libexec/dev-env/real/bash";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OutputFormat {
-    Dotenv,
-    Json,
-    Shell,
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cli {
+    options: CliOptions,
+    command: CliCommand,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,8 +107,8 @@ pub enum ParseError {
     MultipleArguments { command: String },
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ParseError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::MissingCommand => write!(formatter, "missing command\n\n{}", usage("")),
             Self::UnknownCommand { command } => {
@@ -137,9 +146,25 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl Error for ParseError {}
 
 impl Cli {
+    pub fn options(&self) -> &CliOptions {
+        &self.options
+    }
+
+    pub fn command(&self) -> &CliCommand {
+        &self.command
+    }
+
+    pub fn into_parts(self) -> (CliOptions, CliCommand) {
+        (self.options, self.command)
+    }
+
+    pub fn usage(reason: &str) -> String {
+        usage(reason)
+    }
+
     pub fn parse<I>(arguments: I) -> Result<Self, ParseError>
     where
         I: IntoIterator<Item = OsString>,
@@ -171,7 +196,7 @@ impl Cli {
 
 fn parse_os_arguments(arguments: &[OsString]) -> Result<Cli, ParseError> {
     let mut options = CliOptions::default();
-    match std::path::Path::new(&arguments[0])
+    match Path::new(&arguments[0])
         .file_name()
         .and_then(|name| name.to_str())
     {
@@ -188,7 +213,7 @@ fn parse_os_arguments(arguments: &[OsString]) -> Result<Cli, ParseError> {
                 options,
                 command: CliCommand::Shim {
                     shell: "bash".to_owned(),
-                    real: std::env::var_os("DEVENV_REAL_SHELL")
+                    real: var_os("DEVENV_REAL_SHELL")
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from(DEFAULT_REAL_SHELL)),
                     args: arguments[1..].to_vec(),
@@ -252,8 +277,6 @@ fn parse_os_arguments(arguments: &[OsString]) -> Result<Cli, ParseError> {
     };
     Ok(Cli { options, command })
 }
-
-const DEFAULT_REAL_SHELL: &str = "/usr/local/libexec/dev-env/real/bash";
 
 fn parse_backend(
     arguments: &[OsString],
@@ -657,24 +680,15 @@ fn parse_common_option(
             }
             options.patches.push(CliPatch::new(
                 path,
-                OverrideSpec {
-                    op: OverrideOperation::Set,
-                    value: Some(ValueTree::String(value.to_owned())),
-                    values: Vec::new(),
-                    reason: "command line --set".to_owned(),
-                },
+                OverrideSpec::new(OverrideOperation::Set, "command line --set")
+                    .with_value(ValueTree::String(value.to_owned())),
             ));
         }
         "--unset" => {
             let path = value(index)?;
             options.patches.push(CliPatch::new(
                 path,
-                OverrideSpec {
-                    op: OverrideOperation::Unset,
-                    value: None,
-                    values: Vec::new(),
-                    reason: "command line --unset".to_owned(),
-                },
+                OverrideSpec::new(OverrideOperation::Unset, "command line --unset"),
             ));
         }
         "--offline" => {
@@ -768,7 +782,7 @@ fn is_help(argument: &str) -> bool {
     matches!(argument, "-h" | "--help")
 }
 
-pub(crate) fn usage(reason: &str) -> String {
+fn usage(reason: &str) -> String {
     let prefix = if reason.is_empty() {
         String::new()
     } else {

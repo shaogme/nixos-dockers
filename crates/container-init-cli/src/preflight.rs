@@ -1,12 +1,13 @@
 use container_init_backend::PreparedHandoff;
 use container_init_core::{HandoffCommand, ResolvedIdentity};
 use container_init_protocol::{
-    CwdObject, MAX_ARGV_ITEMS, MAX_ARGV_ITEM_BYTES, MAX_ARGV_TOTAL_BYTES,
+    max_supplementary_groups, CwdObject, MAX_ARGV_ITEMS, MAX_ARGV_ITEM_BYTES, MAX_ARGV_TOTAL_BYTES,
 };
 use libc::{
-    c_int, c_short, chdir, dup2, fcntl, getegid, geteuid, getgroups, gid_t, kill, pid_t, poll,
-    pollfd, setgid, setgroups, setuid, sigaction, sigemptyset, EBADF, FD_CLOEXEC, F_GETFD, F_SETFD,
-    POLLERR, POLLHUP, POLLIN, POLLNVAL, SIGHUP, SIGINT, SIGQUIT, SIGTERM,
+    c_char, c_int, c_short, chdir, dup2, fcntl, getegid, geteuid, getgroups, gid_t, kill, pid_t,
+    poll, pollfd, setgid, setgroups, setuid, sigaction, sigemptyset, sysconf, _SC_ARG_MAX,
+    _SC_PAGESIZE, EBADF, FD_CLOEXEC, F_GETFD, F_SETFD, POLLERR, POLLHUP, POLLIN, POLLNVAL, SIGHUP,
+    SIGINT, SIGQUIT, SIGTERM,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_vec};
@@ -16,7 +17,7 @@ use std::{
     ffi::CString,
     fs::{self, Metadata},
     io::{self, Read, Write},
-    mem,
+    mem::{self, size_of},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::{ffi::OsStrExt, fs::MetadataExt, net::UnixStream, process::CommandExt},
@@ -37,7 +38,7 @@ static FORWARDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static HELPER_PID: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct HandoffSpec {
+pub(crate) struct HandoffSpec {
     command: HandoffCommand,
     identity: ResolvedIdentity,
     supplemental_groups: Vec<u32>,
@@ -48,7 +49,7 @@ struct HandoffSpec {
     environment: BTreeMap<String, String>,
 }
 
-pub struct PreflightChild {
+pub(crate) struct PreflightChild {
     child: Child,
     control: UnixStream,
 }
@@ -90,7 +91,7 @@ impl PreflightChild {
             .iter()
             .map(|group| *group as gid_t)
             .collect::<Vec<_>>();
-        if groups.len() > container_init_protocol::max_supplementary_groups() {
+        if groups.len() > max_supplementary_groups() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "handoff supplementary groups exceed the platform limit",
@@ -154,7 +155,7 @@ impl PreflightChild {
             let _ = child.wait();
             return Err(error);
         }
-        HELPER_PID.store(child.id() as i32, Ordering::SeqCst);
+        PreflightRunner::set_helper_pid(child.id() as i32);
         Ok(Self {
             child,
             control: parent_control,
@@ -180,7 +181,7 @@ impl PreflightChild {
     }
 
     pub fn abort(&mut self) {
-        HELPER_PID.store(0, Ordering::SeqCst);
+        PreflightRunner::clear_helper_pid();
         let _ = self.control.write_all(b"A");
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -202,10 +203,10 @@ impl PreflightChild {
     pub fn wait_for_runtime(&mut self) -> io::Result<ExitStatus> {
         loop {
             if let Some(status) = self.child.try_wait()? {
-                HELPER_PID.store(0, Ordering::SeqCst);
+                PreflightRunner::clear_helper_pid();
                 return Ok(status);
             }
-            let signal = FORWARDED_SIGNAL.swap(0, Ordering::SeqCst);
+            let signal = PreflightRunner::take_forwarded_signal();
             if signal != 0 {
                 unsafe {
                     kill(self.child.id() as pid_t, signal);
@@ -297,22 +298,44 @@ fn poll_until(fd: RawFd, events: c_short, deadline: Instant) -> io::Result<()> {
     }
 }
 
-pub fn run_helper() -> i32 {
-    match run_helper_inner() {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("container-init: handoff helper failed: {error}");
-            126
+pub(crate) struct PreflightRunner;
+
+impl PreflightRunner {
+    pub(crate) fn run_helper() -> i32 {
+        match run_helper_inner() {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("container-init: handoff helper failed: {error}");
+                126
+            }
         }
+    }
+
+    pub(crate) fn set_helper_pid(pid: i32) {
+        HELPER_PID.store(pid, Ordering::SeqCst);
+    }
+
+    pub(crate) fn clear_helper_pid() {
+        HELPER_PID.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_forwarded_signal() -> i32 {
+        FORWARDED_SIGNAL.swap(0, Ordering::SeqCst)
+    }
+
+    pub(crate) fn reset_forwarded_signal() {
+        FORWARDED_SIGNAL.store(0, Ordering::Relaxed);
     }
 }
 
 fn run_helper_inner() -> io::Result<i32> {
     let mut control = unsafe { UnixStream::from_raw_fd(CONTROL_FD) };
-    let spec_payload = read_spec_frame(&mut control)?;
+    let spec_payload = PreflightRunner::read_spec_frame(&mut control)?;
     let spec: HandoffSpec = from_slice(&spec_payload)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if let Err(error) = verify_child_state(&spec).and_then(|()| verify_exec_budget(&spec)) {
+    if let Err(error) =
+        verify_child_state(&spec).and_then(|()| PreflightRunner::verify_exec_budget(&spec))
+    {
         send_control_error(&mut control, &error.to_string());
         return Ok(126);
     }
@@ -323,9 +346,9 @@ fn run_helper_inner() -> io::Result<i32> {
         return Ok(125);
     }
     set_cloexec(CONTROL_FD)?;
-    let mut handoff = Command::new(&spec.command.program);
+    let mut handoff = Command::new(spec.command.program());
     handoff.env_clear();
-    handoff.args(&spec.command.args);
+    handoff.args(spec.command.args());
     for (name, value) in &spec.environment {
         handoff.env(name, value);
     }
@@ -335,143 +358,155 @@ fn run_helper_inner() -> io::Result<i32> {
     let source = handoff.exec();
     send_control_error(
         &mut control,
-        &format!("{}: {source}", spec.command.program.display()),
+        &format!("{}: {source}", spec.command.program().display()),
     );
     Ok(127)
 }
 
-fn read_spec_frame(control: &mut UnixStream) -> io::Result<Vec<u8>> {
-    let mut header = [0_u8; 4];
-    control.read_exact(&mut header)?;
-    let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > MAX_HANDOFF_SPEC_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
+impl PreflightRunner {
+    pub(crate) fn read_spec_frame(control: &mut UnixStream) -> io::Result<Vec<u8>> {
+        let mut header = [0_u8; 4];
+        control.read_exact(&mut header)?;
+        let length = u32::from_be_bytes(header) as usize;
+        if length == 0 || length > MAX_HANDOFF_SPEC_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
                 "handoff spec frame length {length} exceeds the {MAX_HANDOFF_SPEC_BYTES} byte limit"
             ),
-        ));
+            ));
+        }
+        let mut payload = vec![0_u8; length];
+        control.read_exact(&mut payload)?;
+        Ok(payload)
     }
-    let mut payload = vec![0_u8; length];
-    control.read_exact(&mut payload)?;
-    Ok(payload)
 }
 
-fn verify_exec_budget(spec: &HandoffSpec) -> io::Result<()> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let argument_limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
-    if page_size <= 0 || argument_limit <= 0 {
-        return Err(exec_budget_error("system argument limits are unavailable"));
-    }
-    let page_size = page_size as usize;
-    let argument_limit = argument_limit as usize;
-    let single_argument_limit = page_size.saturating_mul(32);
-    let mut argument_bytes = 0_usize;
-    let mut argument_count = 1_usize;
-    let program = spec.command.program.as_os_str().as_bytes();
-    if program.len() > MAX_ARGV_ITEM_BYTES {
-        return Err(exec_budget_error(format!(
-            "argv[0] is {} bytes; protocol maximum is {MAX_ARGV_ITEM_BYTES} bytes",
-            program.len()
-        )));
-    }
-    check_exec_string(
-        "argv[0]",
-        program,
-        single_argument_limit,
-        &mut argument_bytes,
-    )?;
-    for (index, argument) in spec.command.args.iter().enumerate() {
-        argument_count += 1;
-        check_exec_string(
-            &format!("argv[{}]", index + 1),
-            argument.as_bytes(),
+impl PreflightRunner {
+    pub(crate) fn verify_exec_budget(spec: &HandoffSpec) -> io::Result<()> {
+        let page_size = unsafe { sysconf(_SC_PAGESIZE) };
+        let argument_limit = unsafe { sysconf(_SC_ARG_MAX) };
+        if page_size <= 0 || argument_limit <= 0 {
+            return Err(exec_budget_error("system argument limits are unavailable"));
+        }
+        let page_size = page_size as usize;
+        let argument_limit = argument_limit as usize;
+        let single_argument_limit = page_size.saturating_mul(32);
+        let mut argument_bytes = 0_usize;
+        let mut argument_count = 1_usize;
+        let program = spec.command.program().as_os_str().as_bytes();
+        if program.len() > MAX_ARGV_ITEM_BYTES {
+            return Err(exec_budget_error(format!(
+                "argv[0] is {} bytes; protocol maximum is {MAX_ARGV_ITEM_BYTES} bytes",
+                program.len()
+            )));
+        }
+        Self::check_exec_string(
+            "argv[0]",
+            program,
             single_argument_limit,
             &mut argument_bytes,
         )?;
-    }
+        for (index, argument) in spec.command.args().iter().enumerate() {
+            argument_count += 1;
+            Self::check_exec_string(
+                &format!("argv[{}]", index + 1),
+                argument.as_bytes(),
+                single_argument_limit,
+                &mut argument_bytes,
+            )?;
+        }
 
-    if argument_count > MAX_ARGV_ITEMS
-        || spec
-            .command
-            .args
-            .iter()
-            .any(|argument| argument.len() > MAX_ARGV_ITEM_BYTES)
-    {
-        return Err(exec_budget_error(
-            "final handoff argv exceeds the protocol argument limits",
-        ));
-    }
-    let raw_argument_bytes =
-        program.len() + spec.command.args.iter().map(String::len).sum::<usize>();
-    if raw_argument_bytes > MAX_ARGV_TOTAL_BYTES {
-        return Err(exec_budget_error(format!(
-            "final handoff argv is {raw_argument_bytes} bytes; protocol maximum is {MAX_ARGV_TOTAL_BYTES} bytes"
-        )));
-    }
-
-    let mut environment = spec.environment.clone();
-    environment.extend(spec.login_environment.clone());
-    let mut environment_bytes = 0_usize;
-    for (name, value) in &environment {
-        if name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0') {
+        if argument_count > MAX_ARGV_ITEMS
+            || spec
+                .command
+                .args()
+                .iter()
+                .any(|argument| argument.len() > MAX_ARGV_ITEM_BYTES)
+        {
             return Err(exec_budget_error(
-                "handoff environment contains an invalid name or NUL",
+                "final handoff argv exceeds the protocol argument limits",
             ));
         }
-        let length = name
-            .len()
-            .checked_add(1)
-            .and_then(|bytes| bytes.checked_add(value.len()))
-            .and_then(|bytes| bytes.checked_add(1))
-            .ok_or_else(|| exec_budget_error("handoff environment size overflowed"))?;
-        if length > single_argument_limit {
+        let raw_argument_bytes =
+            program.len() + spec.command.args().iter().map(String::len).sum::<usize>();
+        if raw_argument_bytes > MAX_ARGV_TOTAL_BYTES {
             return Err(exec_budget_error(format!(
+            "final handoff argv is {raw_argument_bytes} bytes; protocol maximum is {MAX_ARGV_TOTAL_BYTES} bytes"
+        )));
+        }
+
+        let mut environment = spec.environment.clone();
+        environment.extend(spec.login_environment.clone());
+        let mut environment_bytes = 0_usize;
+        for (name, value) in &environment {
+            if name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0')
+            {
+                return Err(exec_budget_error(
+                    "handoff environment contains an invalid name or NUL",
+                ));
+            }
+            let length = name
+                .len()
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(value.len()))
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| exec_budget_error("handoff environment size overflowed"))?;
+            if length > single_argument_limit {
+                return Err(exec_budget_error(format!(
                 "environment.{name} is {length} bytes; operating system per-string limit is {single_argument_limit} bytes"
             )));
+            }
+            environment_bytes = environment_bytes
+                .checked_add(length)
+                .ok_or_else(|| exec_budget_error("handoff environment size overflowed"))?;
         }
-        environment_bytes = environment_bytes
-            .checked_add(length)
-            .ok_or_else(|| exec_budget_error("handoff environment size overflowed"))?;
-    }
 
-    let pointer_bytes = argument_count
-        .checked_add(environment.len())
-        .and_then(|count| count.checked_add(2))
-        .and_then(|count| count.checked_mul(std::mem::size_of::<*const libc::c_char>()))
-        .ok_or_else(|| exec_budget_error("handoff pointer table size overflowed"))?;
-    let total_bytes = argument_bytes
-        .checked_add(environment_bytes)
-        .and_then(|bytes| bytes.checked_add(pointer_bytes))
-        .ok_or_else(|| exec_budget_error("handoff exec size overflowed"))?;
-    let safety_margin = page_size.saturating_mul(4).max(8 * 1024);
-    let usable_limit = argument_limit.saturating_sub(safety_margin);
-    if total_bytes > usable_limit {
-        return Err(exec_budget_error(format!(
+        let pointer_bytes = argument_count
+            .checked_add(environment.len())
+            .and_then(|count| count.checked_add(2))
+            .and_then(|count| count.checked_mul(size_of::<*const c_char>()))
+            .ok_or_else(|| exec_budget_error("handoff pointer table size overflowed"))?;
+        let total_bytes = argument_bytes
+            .checked_add(environment_bytes)
+            .and_then(|bytes| bytes.checked_add(pointer_bytes))
+            .ok_or_else(|| exec_budget_error("handoff exec size overflowed"))?;
+        let safety_margin = page_size.saturating_mul(4).max(8 * 1024);
+        let usable_limit = argument_limit.saturating_sub(safety_margin);
+        if total_bytes > usable_limit {
+            return Err(exec_budget_error(format!(
             "argv and environment need {total_bytes} bytes including pointers; safe system limit is {usable_limit} bytes"
         )));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
-fn check_exec_string(field: &str, value: &[u8], limit: usize, total: &mut usize) -> io::Result<()> {
-    if value.contains(&0) {
-        return Err(exec_budget_error(format!("{field} contains NUL")));
+impl PreflightRunner {
+    pub(crate) fn check_exec_string(
+        field: &str,
+        value: &[u8],
+        limit: usize,
+        total: &mut usize,
+    ) -> io::Result<()> {
+        if value.contains(&0) {
+            return Err(exec_budget_error(format!("{field} contains NUL")));
+        }
+        let length = value
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| exec_budget_error("handoff argument size overflowed"))?;
+        if length > limit {
+            return Err(exec_budget_error(format!(
+                "{field} is {} bytes; operating system per-string limit is {limit} bytes",
+                value.len()
+            )));
+        }
+        *total = total
+            .checked_add(length)
+            .ok_or_else(|| exec_budget_error("handoff argv size overflowed"))?;
+        Ok(())
     }
-    let length = value
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| exec_budget_error("handoff argument size overflowed"))?;
-    if length > limit {
-        return Err(exec_budget_error(format!(
-            "{field} is {} bytes; operating system per-string limit is {limit} bytes",
-            value.len()
-        )));
-    }
-    *total = total
-        .checked_add(length)
-        .ok_or_else(|| exec_budget_error("handoff argv size overflowed"))?;
-    Ok(())
 }
 
 fn exec_budget_error(message: impl Into<String>) -> io::Error {
@@ -482,7 +517,7 @@ fn exec_budget_error(message: impl Into<String>) -> io::Error {
 }
 
 fn verify_child_state(spec: &HandoffSpec) -> io::Result<()> {
-    if spec.supplemental_groups.len() > container_init_protocol::max_supplementary_groups() {
+    if spec.supplemental_groups.len() > max_supplementary_groups() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "handoff supplementary groups exceed the platform limit",
@@ -508,7 +543,7 @@ fn verify_child_state(spec: &HandoffSpec) -> io::Result<()> {
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
-        if count as usize > container_init_protocol::max_supplementary_groups() {
+        if count as usize > max_supplementary_groups() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "current supplementary groups exceed the platform limit",
@@ -531,7 +566,7 @@ fn verify_child_state(spec: &HandoffSpec) -> io::Result<()> {
         }
     }
     let cwd = fs::metadata(".")?;
-    if !cwd_object_matches(spec.cwd_object, &cwd) {
+    if !PreflightRunner::cwd_object_matches(spec.cwd_object, &cwd) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "working directory changed between Prepare and Preflight",
@@ -540,8 +575,10 @@ fn verify_child_state(spec: &HandoffSpec) -> io::Result<()> {
     Ok(())
 }
 
-fn cwd_object_matches(expected: CwdObject, actual: &Metadata) -> bool {
-    actual.dev() == expected.device && actual.ino() == expected.inode
+impl PreflightRunner {
+    pub(crate) fn cwd_object_matches(expected: CwdObject, actual: &Metadata) -> bool {
+        actual.dev() == expected.device && actual.ino() == expected.inode
+    }
 }
 
 fn send_control_error(control: &mut UnixStream, message: &str) {
@@ -561,21 +598,23 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
     }
 }
 
-extern "C" fn signal_handler(signal: c_int) {
-    FORWARDED_SIGNAL.store(signal, Ordering::Relaxed);
-    let child = HELPER_PID.load(Ordering::Relaxed);
-    if child > 0 {
-        unsafe {
-            kill(child, signal);
+impl PreflightRunner {
+    pub(crate) extern "C" fn signal_handler(signal: c_int) {
+        FORWARDED_SIGNAL.store(signal, Ordering::Relaxed);
+        let child = HELPER_PID.load(Ordering::Relaxed);
+        if child > 0 {
+            unsafe {
+                kill(child, signal);
+            }
         }
     }
 }
 
 fn install_signal_forwarder() {
-    FORWARDED_SIGNAL.store(0, Ordering::Relaxed);
+    PreflightRunner::reset_forwarded_signal();
     for signal in [SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
         let mut action: sigaction = unsafe { mem::zeroed() };
-        action.sa_sigaction = signal_handler as *const () as usize;
+        action.sa_sigaction = PreflightRunner::signal_handler as *const () as usize;
         action.sa_flags = 0;
         unsafe {
             sigemptyset(&mut action.sa_mask);
@@ -586,13 +625,10 @@ fn install_signal_forwarder() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        check_exec_string, cwd_object_matches, read_spec_frame, signal_handler, verify_exec_budget,
-        HandoffSpec, FORWARDED_SIGNAL, HELPER_PID,
-    };
+    use super::{HandoffSpec, PreflightRunner};
     use container_init_core::{HandoffCommand, IdentitySource, ResolvedIdentity, WorkspaceStatus};
     use container_init_protocol::CwdObject;
-    use libc::SIGTERM;
+    use libc::{getegid, geteuid, sysconf, _SC_ARG_MAX, _SC_PAGESIZE, SIGTERM};
     use std::{
         collections::BTreeMap,
         fs,
@@ -601,12 +637,12 @@ mod tests {
         os::unix::{fs::MetadataExt, process::ExitStatusExt},
         path::PathBuf,
         process::Command,
-        sync::atomic::Ordering,
     };
+    use tempfile::TempDir;
 
     #[test]
     fn cwd_object_check_detects_path_replacement() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = TempDir::new().unwrap();
         let target = temp.path().join("cwd");
         let moved = temp.path().join("cwd-original");
         fs::create_dir(&target).unwrap();
@@ -618,18 +654,21 @@ mod tests {
         fs::rename(&target, &moved).unwrap();
         fs::create_dir(&target).unwrap();
         let replacement = fs::metadata(&target).unwrap();
-        assert!(!cwd_object_matches(expected, &replacement));
-        assert!(cwd_object_matches(expected, &fs::metadata(&moved).unwrap()));
+        assert!(!PreflightRunner::cwd_object_matches(expected, &replacement));
+        assert!(PreflightRunner::cwd_object_matches(
+            expected,
+            &fs::metadata(&moved).unwrap()
+        ));
     }
 
     #[test]
     fn signal_handler_forwards_signal_to_the_handoff_child() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        HELPER_PID.store(child.id() as i32, Ordering::SeqCst);
-        signal_handler(SIGTERM);
+        PreflightRunner::set_helper_pid(child.id() as i32);
+        PreflightRunner::signal_handler(SIGTERM);
         let status = child.wait().unwrap();
-        HELPER_PID.store(0, Ordering::SeqCst);
-        FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
+        PreflightRunner::clear_helper_pid();
+        PreflightRunner::reset_forwarded_signal();
         assert_eq!(status.signal(), Some(SIGTERM));
     }
 
@@ -641,7 +680,10 @@ mod tests {
             .write_all(&(payload.len() as u32).to_be_bytes())
             .unwrap();
         sender.write_all(payload).unwrap();
-        assert_eq!(read_spec_frame(&mut receiver).unwrap(), payload);
+        assert_eq!(
+            PreflightRunner::read_spec_frame(&mut receiver).unwrap(),
+            payload
+        );
     }
 
     #[test]
@@ -650,17 +692,18 @@ mod tests {
             vec!["-c".to_owned(), "true".to_owned(), "x".repeat(37_543)],
             BTreeMap::new(),
         );
-        verify_exec_budget(&regression).unwrap();
+        PreflightRunner::verify_exec_budget(&regression).unwrap();
 
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let argument_limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+        let page_size = unsafe { sysconf(_SC_PAGESIZE) } as usize;
+        let argument_limit = unsafe { sysconf(_SC_ARG_MAX) } as usize;
         let value = "x".repeat(page_size * 8);
         let entry_bytes = value.len() + 24;
         let entry_count = argument_limit / entry_bytes + 1;
         let environment = (0..entry_count)
             .map(|index| (format!("BUDGET_{index}"), value.clone()))
             .collect();
-        let result = verify_exec_budget(&test_spec(vec!["true".to_owned()], environment));
+        let result =
+            PreflightRunner::verify_exec_budget(&test_spec(vec!["true".to_owned()], environment));
         assert!(result
             .unwrap_err()
             .to_string()
@@ -670,22 +713,29 @@ mod tests {
     #[test]
     fn exec_string_check_counts_the_terminating_nul_byte() {
         let mut total = 0;
-        check_exec_string("argv[0]", &"x".repeat(127).into_bytes(), 128, &mut total).unwrap();
+        PreflightRunner::check_exec_string(
+            "argv[0]",
+            &"x".repeat(127).into_bytes(),
+            128,
+            &mut total,
+        )
+        .unwrap();
         assert_eq!(total, 128);
-        assert!(
-            check_exec_string("argv[0]", &"x".repeat(128).into_bytes(), 128, &mut total).is_err()
-        );
+        assert!(PreflightRunner::check_exec_string(
+            "argv[0]",
+            &"x".repeat(128).into_bytes(),
+            128,
+            &mut total
+        )
+        .is_err());
     }
 
     fn test_spec(args: Vec<String>, environment: BTreeMap<String, String>) -> HandoffSpec {
         HandoffSpec {
-            command: HandoffCommand {
-                program: PathBuf::from("/bin/sh"),
-                args,
-            },
+            command: HandoffCommand::new(PathBuf::from("/bin/sh"), args),
             identity: ResolvedIdentity {
-                uid: unsafe { libc::geteuid() },
-                gid: unsafe { libc::getegid() },
+                uid: unsafe { geteuid() },
+                gid: unsafe { getegid() },
                 user: "test".to_owned(),
                 home: PathBuf::from("/tmp"),
                 run_as_root: false,

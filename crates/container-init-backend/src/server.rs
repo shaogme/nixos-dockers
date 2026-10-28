@@ -1,3 +1,10 @@
+mod connection;
+mod identity;
+mod inspection;
+mod lifecycle;
+mod runtime;
+mod transaction;
+
 use self::{
     lifecycle::BackendSupervisor,
     runtime::{BackendRuntime, BackendRuntimeOptions},
@@ -23,13 +30,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-mod connection;
-mod identity;
-mod inspection;
-mod lifecycle;
-mod runtime;
-mod transaction;
-
 #[derive(Clone, Debug)]
 pub struct BackendPaths {
     pub socket_path: PathBuf,
@@ -37,14 +37,14 @@ pub struct BackendPaths {
     pub owner_uid: u32,
 }
 
-pub enum BackendClaim {
-    Acquired(BackendLease),
-    AlreadyRunning(BackendStatus),
-}
-
 pub struct BackendLease {
     paths: BackendPaths,
     _lock: InstanceLock,
+}
+
+pub enum BackendClaim {
+    Acquired(BackendLease),
+    AlreadyRunning(BackendStatus),
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +55,12 @@ pub struct BackendStartOptions {
     pub startup_context: RuntimeContext,
     pub command: Vec<String>,
     pub execution_options: ExecutionOptions,
+}
+
+#[derive(Debug)]
+pub enum BackendRunError {
+    Core(CoreError),
+    Io(io::Error),
 }
 
 impl BackendLease {
@@ -112,8 +118,8 @@ impl BackendLease {
         let startup = PlanExecutor::new(startup_config, options.startup_context.clone())
             .with_options(options.execution_options.clone())
             .execute_prevalidated(&startup_plan, &[])?;
-        let identity = startup.identity;
-        options.execution_options.receipt_path = None;
+        let identity = startup.identity().clone();
+        options.execution_options = options.execution_options.without_receipt_path();
         self._lock.allow_peer_group(identity.gid)?;
         let root_service = BackendSupervisor::is_root_service(
             &config,
@@ -197,12 +203,6 @@ impl BackendLease {
         BackendSupervisor::supervise(listener, child, &self.paths.socket_path, runtime)
             .map_err(BackendRunError::Io)
     }
-}
-
-#[derive(Debug)]
-pub enum BackendRunError {
-    Core(CoreError),
-    Io(io::Error),
 }
 
 impl fmt::Display for BackendRunError {

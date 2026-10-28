@@ -1,6 +1,6 @@
 use container_init_posix::{PosixIdentity, PosixSystem};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use libc::{_exit, fork, waitpid};
+use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
 
 #[test]
@@ -25,15 +25,15 @@ fn exercises_the_live_container_account_and_filesystem() {
     // Exercise the real container privilege boundary as a subprocess so the
     // test harness remains root for cleanup.
     let identity = PosixIdentity::new(65_534, 65_534, "nobody", "/nonexistent");
-    let child = unsafe { libc::fork() };
+    let child = unsafe { fork() };
     assert!(child >= 0, "fork should succeed");
     if child == 0 {
         let result = system.drop_privileges(&identity);
         let success = result.is_ok() && system.current_ids() == (65_534, 65_534);
-        unsafe { libc::_exit(if success { 0 } else { 1 }) };
+        unsafe { _exit(if success { 0 } else { 1 }) };
     }
     let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
 }
