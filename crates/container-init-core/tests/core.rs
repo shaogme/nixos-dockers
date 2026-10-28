@@ -727,7 +727,7 @@ fn cgroup_v2_init_delegates_controllers_and_moves_processes() {
     assert!(report.succeeded());
 
     // Verify subgroup was created
-    assert!(cgroup_dir.join("init").exists());
+    assert!(cgroup_dir.join("libpod_parent").exists());
 
     // Verify subtree_control has the requested controllers enabled
     let subtree_content = fs::read_to_string(cgroup_dir.join("cgroup.subtree_control")).unwrap();
@@ -953,7 +953,7 @@ fn cgroup_v2_init_bind_mount_mode_shadows_and_delegates() {
     assert!(report.succeeded());
 
     // Verify shadow subgroup created
-    assert!(shadow_dir.join("init").exists());
+    assert!(shadow_dir.join("libpod_parent").exists());
 
     // Verify shadow subtree_control
     let subtree = fs::read_to_string(shadow_dir.join("cgroup.subtree_control")).unwrap();
