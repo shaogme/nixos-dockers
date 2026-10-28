@@ -199,6 +199,26 @@ test_loaded_image() {
         'test "$USER" = root && test "$HOME" = /root && test "$(id -u)" = 0 && test "$(id -g)" = 0 && test "$(stat -c %u:%g /root)" = "0:0" && test "$(stat -c %U /root)" = root')"
     [[ -z "$root_output" ]]
 
+    echo "==> validating abstract backend transport from restricted working directories"
+    docker exec --user 0 "$exec_container" /bin/mkdir -p /tmp/dev-env-private
+    docker exec --user 0 "$exec_container" /bin/chown "$expected_uid:$expected_gid" /tmp/dev-env-private
+    docker exec --user 0 "$exec_container" /bin/chmod 0700 /tmp/dev-env-private
+    local transport_output
+    transport_output="$(docker exec --user "$expected_uid:$expected_gid" --workdir /tmp \
+        "$exec_container" /usr/bin/dev-env doctor --json)"
+    assert_contains "$transport_output" '"endpoint": "@dev-env.backend.v4"'
+    assert_contains "$transport_output" '"protocol": 4'
+    assert_contains "$transport_output" '"peer_authorized": true'
+    transport_output="$(docker exec --user "$expected_uid:$expected_gid" --workdir /tmp/dev-env-private \
+        "$exec_container" /usr/bin/dev-env doctor --json)"
+    assert_contains "$transport_output" '"peer_authorized": true'
+    if transport_output="$(docker exec --user "$expected_uid:$expected_gid" "$exec_container" \
+        /usr/bin/dev-env backend reload 2>&1)"; then
+        echo "non-root peer unexpectedly reloaded the backend" >&2
+        return 1
+    fi
+    assert_contains "$transport_output" 'unauthorized'
+
     exec_output="$(printf '%s\n' 'printf "%s" "nixos-docker stdin handoff"' | docker exec -i "$exec_container" bash)"
     [[ "$exec_output" == 'nixos-docker stdin handoff' ]]
 

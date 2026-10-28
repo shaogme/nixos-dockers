@@ -72,7 +72,7 @@ cd nixos-dockers
 ./crates/dev-env-cli/tests/docker.sh
 ```
 
-这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、检测文件、真实 shell 或 backend socket 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
+这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、检测文件、真实 shell 或 backend transport 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
 
 ## 4. 修改 DSL 的检查清单
 

@@ -96,18 +96,18 @@ fn spawn_handoff(
         .current_dir(cwd)
         .process_group(0);
     if identity.uid != 0 {
-        // handoff 运行时可能需要映射后的非 root 身份来设置自身 ACL；root 服务仍使用运行时配置的 peer ACL。
         command
             .env("CONTAINER_INIT_HANDOFF_UID", identity.uid.to_string())
             .env("CONTAINER_INIT_HANDOFF_GID", identity.gid.to_string());
     }
     if root_service {
         command
+            .env("CONTAINER_INIT_HANDOFF_UID", identity.uid.to_string())
             .env("HOME", "/root")
             .env("USER", "root")
             .env("LOGNAME", "root")
             // 初始运行时依据此值选择身份，使其与 container-init 已解析的身份一致，包括显式 RUN_AS_ROOT 请求。
-            .env("DEVENV_BACKEND_INITIAL_USER", &identity.user);
+            .env("CONTAINER_INIT_HANDOFF_USER", &identity.user);
     } else {
         command
             .env("HOME", &identity.home)

@@ -64,21 +64,10 @@ pub enum CliCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendCommand {
-    Run {
-        socket: Option<PathBuf>,
-        initial: BackendInitial,
-    },
-    Status {
-        socket: Option<PathBuf>,
-        json: bool,
-    },
-    Reload {
-        socket: Option<PathBuf>,
-        wait: bool,
-    },
-    Stop {
-        socket: Option<PathBuf>,
-    },
+    Run { initial: BackendInitial },
+    Status { json: bool },
+    Reload { wait: bool },
+    Stop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -278,7 +267,6 @@ fn parse_backend(
     }
     let subcommand = text_argument(arguments, index)?.to_owned();
     index += 1;
-    let mut socket = None;
     match subcommand.as_str() {
         "run" => {
             let mut initial = None;
@@ -311,10 +299,6 @@ fn parse_backend(
                     }
                     initial = Some(BackendInitial::Exec(arguments[index..].to_vec()));
                     index = arguments.len();
-                } else if argument == "--socket" || argument.starts_with("--socket=") {
-                    socket = Some(PathBuf::from(option_value(
-                        arguments, &mut index, "--socket",
-                    )?));
                 } else if is_common_option(argument) {
                     parse_common_option(arguments, &mut index, options)?;
                 } else if is_help(argument) {
@@ -330,7 +314,7 @@ fn parse_backend(
                 option: "--initial-shell or --initial-exec".to_owned(),
             })?;
             Ok(CliCommand::Backend {
-                command: BackendCommand::Run { socket, initial },
+                command: BackendCommand::Run { initial },
             })
         }
         "status" => {
@@ -338,10 +322,6 @@ fn parse_backend(
                 let argument = text_argument(arguments, index)?;
                 if argument == "--json" {
                     index += 1;
-                } else if argument == "--socket" || argument.starts_with("--socket=") {
-                    socket = Some(PathBuf::from(option_value(
-                        arguments, &mut index, "--socket",
-                    )?));
                 } else {
                     return Err(ParseError::UnexpectedArgument {
                         command: "backend status".to_owned(),
@@ -350,7 +330,7 @@ fn parse_backend(
                 }
             }
             Ok(CliCommand::Backend {
-                command: BackendCommand::Status { socket, json: true },
+                command: BackendCommand::Status { json: true },
             })
         }
         "reload" => {
@@ -360,10 +340,6 @@ fn parse_backend(
                 if argument == "--wait" {
                     wait = true;
                     index += 1;
-                } else if argument == "--socket" || argument.starts_with("--socket=") {
-                    socket = Some(PathBuf::from(option_value(
-                        arguments, &mut index, "--socket",
-                    )?));
                 } else {
                     return Err(ParseError::UnexpectedArgument {
                         command: "backend reload".to_owned(),
@@ -372,25 +348,18 @@ fn parse_backend(
                 }
             }
             Ok(CliCommand::Backend {
-                command: BackendCommand::Reload { socket, wait },
+                command: BackendCommand::Reload { wait },
             })
         }
         "stop" => {
-            while index < arguments.len() {
-                let argument = text_argument(arguments, index)?;
-                if argument == "--socket" || argument.starts_with("--socket=") {
-                    socket = Some(PathBuf::from(option_value(
-                        arguments, &mut index, "--socket",
-                    )?));
-                } else {
-                    return Err(ParseError::UnexpectedArgument {
-                        command: "backend stop".to_owned(),
-                        argument: argument.to_owned(),
-                    });
-                }
+            if index < arguments.len() {
+                return Err(ParseError::UnexpectedArgument {
+                    command: "backend stop".to_owned(),
+                    argument: text_argument(arguments, index)?.to_owned(),
+                });
             }
             Ok(CliCommand::Backend {
-                command: BackendCommand::Stop { socket },
+                command: BackendCommand::Stop,
             })
         }
         _ => Err(ParseError::UnknownCommand {

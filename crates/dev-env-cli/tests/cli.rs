@@ -1,9 +1,10 @@
 use dev_env_cli::{Cli, CliCommand, CliError, ParseError};
 use dev_env_loader::LoaderError;
 use dev_env_model::ModelError;
+use fs2::FileExt;
 use std::ffi::OsString;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,10 +74,6 @@ BASE = "base"
             .env("DEVENV_PROFILES_DIR", &self.profiles)
             .env("DEVENV_DEFAULT_PROFILE_FILE", &self.default_profile)
             .env("DEVENV_TRUST_FILE", &self.trust_file)
-            .env(
-                "DEVENV_BACKEND_SOCKET",
-                self.root.join("missing-backend.sock"),
-            )
             .current_dir(&self.root);
         command
     }
@@ -151,6 +148,10 @@ fn parser_rejects_malformed_cli_values_with_typed_errors() {
     assert!(matches!(
         Cli::parse_strings(["dev-env", "shim", "--shell", "sh"]),
         Err(ParseError::MissingRequiredOption { option, .. }) if option == "--real"
+    ));
+    assert!(matches!(
+        Cli::parse_strings(["dev-env", "backend", "status", "--socket", "/tmp/backend.sock"]),
+        Err(ParseError::UnexpectedArgument { argument, .. }) if argument == "--socket"
     ));
 }
 
@@ -239,23 +240,27 @@ fn client_does_not_fallback_to_profile_when_backend_is_unavailable() {
 
 #[test]
 fn backend_startup_failure_is_not_reported_as_success() {
+    let lock_path = Path::new("/run/dev-env/backend.lock");
+    if let Ok(lock) = OpenOptions::new().read(true).write(true).open(lock_path) {
+        match lock.try_lock_exclusive() {
+            Ok(()) => lock.unlock().unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                eprintln!(
+                    "skipping backend startup test because a runtime instance owns the fixed lock"
+                );
+                return;
+            }
+            Err(error) => panic!("could not probe backend instance lock: {error}"),
+        }
+    }
     let fixture = Fixture::new();
-    let socket = fixture.root.join("backend.sock");
     let output = fixture
         .command()
         .env(
             "DEVENV_IDENTITY_BROKER_SOCKET",
             fixture.root.join("missing-identity-broker.sock"),
         )
-        .args([
-            "backend",
-            "run",
-            "--socket",
-            socket.to_str().unwrap(),
-            "--initial-exec",
-            "--",
-            "/bin/true",
-        ])
+        .args(["backend", "run", "--initial-exec", "--", "/bin/true"])
         .output()
         .unwrap();
 

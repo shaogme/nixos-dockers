@@ -188,8 +188,8 @@ let
     id = "dev-env-runtime"
     kind = "filesystem.ensure_dir"
     path = "/run/dev-env"
-    mode = "0770"
-    owner = "0:${toString config.system.defaultGid}"
+    mode = "0700"
+    owner = "0:0"
     run_as = "root"
 
     [[bootstrap.actions]]
@@ -241,11 +241,8 @@ in
       DEVENV_BOOTSTRAP_REAL_SHELL = bootstrapRealShellPath;
       CONTAINER_INIT_PROFILE_DIR = "/etc/dev-env/profiles.d";
       CONTAINER_INIT_DEFAULT_PROFILE = "/etc/dev-env/default-profile";
-      DEVENV_BACKEND_SOCKET = "/run/dev-env/backend.sock";
       DEVENV_IDENTITY_BROKER_SOCKET = "/run/container-init/backend.sock";
-      DEVENV_BACKEND_SOCKET_GID = toString config.system.defaultGid;
-      DEVENV_BACKEND_ALLOWED_UID = toString config.system.defaultUid;
-      DEVENV_BACKEND_INITIAL_USER = config.system.defaultUser;
+      CONTAINER_INIT_HANDOFF_USER = config.system.defaultUser;
       DEVENV_BACKEND_SERVICE_COMMAND = lib.optionalString config.services.openssh.enable "/bin/sshd";
     };
     docker.extraContents = [ runtimeContents profile defaultProfile ];

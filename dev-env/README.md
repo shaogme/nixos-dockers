@@ -160,7 +160,7 @@ cargo clippy --workspace --all-targets --locked
 bootstrap namespace、UID/GID 解析、账户和目录 reconcile，并把 root supervisor handoff
 给唯一的 `dev-env backend`。backend 加载一次 profile snapshot，通过 container-init
 identity broker 为每个 request/provider 解析身份，再执行 provider。后续 `dev-env` client
-通过 `/run/dev-env/backend.sock` 请求环境。
+通过 Linux abstract endpoint `@dev-env.backend.v4` 请求环境。
 
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |

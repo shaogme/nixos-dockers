@@ -71,10 +71,6 @@ impl Fixture {
             .env("DEVENV_PROFILES_DIR", &self.profiles)
             .env("DEVENV_DEFAULT_PROFILE_FILE", &self.default_profile)
             .env("DEVENV_TRUST_FILE", &self.trust_file)
-            .env(
-                "DEVENV_BACKEND_SOCKET",
-                self.root.join("missing-backend.sock"),
-            )
             .current_dir(&self.cwd);
         command
     }

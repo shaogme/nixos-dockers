@@ -13,8 +13,8 @@
 ```text
 client 采集 cwd、shell、identity、runtime inputs 和允许的 ambient env
   ↓
-连接 /run/dev-env/backend.sock；身份通过 /run/container-init/backend.sock 的
-PrepareIdentity RPC 解析
+连接 Linux abstract endpoint @dev-env.backend.v4；身份通过独立的
+/run/container-init/backend.sock PrepareIdentity RPC 解析
   ↓
 backend 校验 peer 和 snapshot policy
   ↓
@@ -61,13 +61,20 @@ dev-env version
 ```
 
 `backend run` 在启动时一次加载并校验 profile，持有 `/run/dev-env/backend.lock`，并
-通过 `/run/dev-env/backend.sock` 提供 protocol v3 请求，错误 envelope 使用
-`error_version = 2`。runtime profile 为
-`/run/dev-env` 创建 `0770` 的 root/group 目录；socket 固定为 root、配置 group、`0660`，
-lock 文件使用相同 owner/group 和 `0660`。backend 退出时删除 socket，目录和锁文件由
-container-init 的 runtime action 保留到容器生命周期结束。第二个 `backend run` 只返回
-已有实例状态；它不会重新加载 profile 或抢占 socket。`backend reload` 成功后才替换
-snapshot 并递增 generation，失败时保留旧 snapshot。
+通过固定的 Linux abstract endpoint `@dev-env.backend.v4` 提供 protocol v4 请求，错误
+envelope 使用 `error_version = 2`。`/run/dev-env` 仅用于 root 管理的 `backend.lock`，目录
+模式为 `0700`，lock 文件模式为 `0600`；客户端连接不访问该目录，也不依赖 supplementary
+groups。abstract endpoint 随 backend 进程关闭而释放，不创建或清理 filesystem socket。
+第二个 `backend run` 只返回已有实例状态；若锁被占用但 endpoint 无法连接，则报告
+`BACKEND-INSTANCE-CONFLICT`。`backend reload` 成功后才替换 snapshot 并递增 generation，
+失败时保留旧 snapshot。
+
+服务端在读取 frame 前通过 Linux `SO_PEERCRED` 取得 peer UID。root 与启动时固定的
+`CONTAINER_INIT_HANDOFF_UID` 可以使用普通请求；`Trust`、`Reload` 和 `Stop` 仍仅允许 root。
+UID 不匹配时返回 `BACKEND-PEER-REJECTED`，不解析客户端 payload。无法建立连接时报告
+`BACKEND-TRANSPORT-UNAVAILABLE`；协议版本不符时报告 `BACKEND-PROTOCOL-MISMATCH`。
+`dev-env doctor` 的 `backend_transport` 字段显示 endpoint、v4 握手结果和当前 peer UID
+授权状态。identity broker 仍使用自己的 filesystem socket；其路径和配置与 dev-env
 
 通用选项可以放在 command 前，也可在支持它的子命令中使用：
 

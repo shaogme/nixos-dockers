@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// The dev-env backend protocol is deliberately independent from the
 /// container-init protocol number.
-pub const DEVENV_BACKEND_PROTOCOL_VERSION: u16 = 3;
+pub const DEVENV_BACKEND_PROTOCOL_VERSION: u16 = 4;
 pub const BACKEND_PROTOCOL_VERSION: u16 = DEVENV_BACKEND_PROTOCOL_VERSION;
 pub const DEVENV_BACKEND_ERROR_VERSION: u16 = 2;
 pub const MAX_BACKEND_FRAME_BYTES: usize = 1024 * 1024;

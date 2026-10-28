@@ -22,12 +22,10 @@ use dev_env_shell::{build_invocation, CommandLine, ConfiguredShellAdapter, Shell
 use fs2::FileExt;
 use std::collections::BTreeMap;
 use std::env;
-use std::ffi::CString;
-use std::fs::{self, OpenOptions};
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::PermissionsExt;
+use std::ffi::{CStr, CString};
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -35,72 +33,50 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-pub const DEFAULT_BACKEND_SOCKET: &str = "/run/dev-env/backend.sock";
+const BACKEND_RUNTIME_DIRECTORY: &str = "/run/dev-env";
+const BACKEND_LOCK_NAME: &[u8] = b"backend.lock\0";
+const BACKEND_ABSTRACT_ENDPOINT: &[u8] = b"\0dev-env.backend.v4";
+const ENDPOINT_DISPLAY: &str = "@dev-env.backend.v4";
+const MAX_ACTIVE_CONNECTIONS: usize = 32;
 const MAX_ACTIVE_REQUESTS: usize = 16;
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn dispatch(command: BackendCommand, options: CliOptions) -> Result<i32, CliError> {
     match command {
-        BackendCommand::Run { socket, initial } => run(socket, initial, options),
-        BackendCommand::Status { socket, json: _ } => {
-            let response = request(socket, BackendRequest::Status)?;
+        BackendCommand::Run { initial } => run(initial, options),
+        BackendCommand::Status { json: _ } => {
+            let response = request(BackendRequest::Status)?;
             print_response(response)?;
             Ok(0)
         }
-        BackendCommand::Reload { socket, wait } => {
-            let response = request(socket, BackendRequest::Reload { wait })?;
+        BackendCommand::Reload { wait } => {
+            let response = request(BackendRequest::Reload { wait })?;
             print_response(response)?;
             Ok(0)
         }
-        BackendCommand::Stop { socket } => {
-            let response = request(socket, BackendRequest::Stop)?;
+        BackendCommand::Stop => {
+            let response = request(BackendRequest::Stop)?;
             print_response(response)?;
             Ok(0)
         }
     }
 }
 
-fn run(
-    socket: Option<PathBuf>,
-    initial: BackendInitial,
-    options: CliOptions,
-) -> Result<i32, CliError> {
-    let socket = socket_path(socket)?;
-    let parent = socket.parent().unwrap_or_else(|| Path::new("/"));
-    fs::create_dir_all(parent).map_err(|source| {
-        CliError::Backend(format!(
-            "could not create backend runtime directory {}: {source}",
-            parent.display()
-        ))
-    })?;
-    let socket_gid = backend_socket_gid()?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o770)).map_err(|source| {
-        CliError::Backend(format!(
-            "could not set backend runtime directory permissions: {source}"
-        ))
-    })?;
-    set_owner(parent, unsafe { libc::geteuid() }, socket_gid)?;
-    let lock_path = parent.join("backend.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|source| {
-            CliError::Backend(format!("could not open {}: {source}", lock_path.display()))
-        })?;
-    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o660)).map_err(|source| {
-        CliError::Backend(format!("could not set backend lock permissions: {source}"))
-    })?;
-    set_owner(&lock_path, unsafe { libc::geteuid() }, socket_gid)?;
+fn run(initial: BackendInitial, options: CliOptions) -> Result<i32, CliError> {
+    let allowed_peer_uid = configured_allowed_peer_uid()?;
+    let lock = backend_lock()?;
     if let Err(source) = lock.try_lock_exclusive() {
-        if let Ok(response) = request(Some(socket.clone()), BackendRequest::Status) {
+        if source.kind() != io::ErrorKind::WouldBlock {
+            return Err(CliError::Backend(format!(
+                "could not acquire backend instance lock: {source}"
+            )));
+        }
+        if let Ok(response) = request(BackendRequest::Status) {
             print_response(response)?;
             return Ok(0);
         }
         return Err(CliError::Backend(format!(
-            "backend already running for {}: {source}",
-            socket.display()
+            "BACKEND-INSTANCE-CONFLICT: backend.lock is held but the abstract endpoint {ENDPOINT_DISPLAY} is unavailable"
         )));
     }
 
@@ -110,36 +86,21 @@ fn run(
     let loaded = config::load(&options)?;
     let snapshot = make_snapshot(&loaded, Generation::INITIAL)?;
 
-    if let Ok(metadata) = fs::symlink_metadata(&socket) {
-        if !metadata.file_type().is_socket() {
-            return Err(CliError::Backend(format!(
-                "refusing to replace non-socket backend path {}",
-                socket.display()
-            )));
-        }
-        fs::remove_file(&socket).map_err(|source| {
-            CliError::Backend(format!("could not remove stale backend socket: {source}"))
-        })?;
-    }
-    let listener = UnixListener::bind(&socket).map_err(|source| {
+    let listener = BackendTransport::bind().map_err(|source| {
         CliError::Backend(format!(
-            "could not bind backend socket {}: {source}",
-            socket.display()
+            "could not bind abstract backend endpoint {ENDPOINT_DISPLAY}: {source}"
         ))
     })?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).map_err(|source| {
-        CliError::Backend(format!(
-            "could not set backend socket permissions: {source}"
-        ))
-    })?;
-    set_owner(&socket, unsafe { libc::geteuid() }, socket_gid)?;
     listener.set_nonblocking(true).map_err(|source| {
-        CliError::Backend(format!("could not configure backend socket: {source}"))
+        CliError::Backend(format!(
+            "could not configure abstract backend endpoint: {source}"
+        ))
     })?;
 
     let runtime = Arc::new(BackendRuntime {
         snapshot: RwLock::new(Arc::new(snapshot)),
         options,
+        allowed_peer_uid,
         materialization: RwLock::new(Arc::new(MaterializationService::new(
             Materializer::try_new(loaded.config().clone()).map_err(CliError::Core)?,
         ))),
@@ -147,9 +108,9 @@ fn run(
         // prepared, but clients must not receive Prepare responses until the
         // initial handoff has successfully spawned.
         state: Mutex::new(BackendState::Starting),
+        active_connections: AtomicUsize::new(0),
         active_requests: AtomicUsize::new(0),
         stopping: AtomicBool::new(false),
-        socket: socket.clone(),
         initial_pid: Mutex::new(None),
         initial_exit_code: Mutex::new(None),
         failure: Mutex::new(None),
@@ -161,8 +122,18 @@ fn run(
     while !runtime.stopping.load(Ordering::Acquire) && !signal_requested() {
         match listener.accept() {
             Ok((stream, _)) => {
+                let active = runtime.active_connections.fetch_add(1, Ordering::AcqRel);
+                if active >= MAX_ACTIVE_CONNECTIONS {
+                    runtime.active_connections.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
+                let _ = stream.set_read_timeout(Some(CONNECTION_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(CONNECTION_TIMEOUT));
                 let runtime = Arc::clone(&runtime);
-                thread::spawn(move || serve_connection(runtime, stream));
+                thread::spawn(move || {
+                    serve_connection(Arc::clone(&runtime), stream);
+                    runtime.active_connections.fetch_sub(1, Ordering::AcqRel);
+                });
             }
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -177,7 +148,6 @@ fn run(
     runtime.stopping.store(true, Ordering::Release);
     *runtime.state.lock().expect("backend state lock poisoned") = BackendState::Stopping;
     runtime.stop_initial_runtime();
-    let _ = fs::remove_file(&runtime.socket);
     if let Some(failure) = runtime
         .failure
         .lock()
@@ -198,14 +168,185 @@ fn run(
 struct BackendRuntime {
     snapshot: RwLock<Arc<ConfigSnapshot>>,
     options: CliOptions,
+    allowed_peer_uid: u32,
     materialization: RwLock<Arc<MaterializationService>>,
     state: Mutex<BackendState>,
+    active_connections: AtomicUsize,
     active_requests: AtomicUsize,
     stopping: AtomicBool,
-    socket: PathBuf,
     initial_pid: Mutex<Option<u32>>,
     initial_exit_code: Mutex<Option<i32>>,
     failure: Mutex<Option<String>>,
+}
+
+struct BackendTransport;
+
+impl BackendTransport {
+    fn sockaddr_for(endpoint: &[u8]) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let path_capacity = std::mem::size_of_val(&address.sun_path);
+        if endpoint.first() != Some(&0)
+            || endpoint.len() > path_capacity
+            || endpoint[1..].contains(&0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "abstract backend endpoint has invalid Linux sockaddr_un encoding",
+            ));
+        }
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                endpoint.as_ptr().cast::<libc::c_char>(),
+                address.sun_path.as_mut_ptr(),
+                endpoint.len(),
+            );
+        }
+        let address_length =
+            (std::mem::size_of::<libc::sa_family_t>() + endpoint.len()) as libc::socklen_t;
+        Ok((address, address_length))
+    }
+
+    fn bind() -> io::Result<UnixListener> {
+        Self::bind_endpoint(BACKEND_ABSTRACT_ENDPOINT)
+    }
+
+    fn bind_endpoint(endpoint: &[u8]) -> io::Result<UnixListener> {
+        let (address, address_length) = Self::sockaddr_for(endpoint)?;
+        let descriptor =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let bound = unsafe {
+            libc::bind(
+                descriptor,
+                (&address as *const libc::sockaddr_un).cast(),
+                address_length,
+            )
+        };
+        if bound != 0 {
+            let source = io::Error::last_os_error();
+            unsafe { libc::close(descriptor) };
+            return Err(source);
+        }
+        if unsafe { libc::listen(descriptor, MAX_ACTIVE_CONNECTIONS as libc::c_int) } != 0 {
+            let source = io::Error::last_os_error();
+            unsafe { libc::close(descriptor) };
+            return Err(source);
+        }
+        Ok(unsafe { UnixListener::from_raw_fd(descriptor) })
+    }
+
+    fn connect() -> io::Result<UnixStream> {
+        Self::connect_endpoint(BACKEND_ABSTRACT_ENDPOINT)
+    }
+
+    fn connect_endpoint(endpoint: &[u8]) -> io::Result<UnixStream> {
+        let (address, address_length) = Self::sockaddr_for(endpoint)?;
+        let descriptor =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let connected = unsafe {
+            libc::connect(
+                descriptor,
+                (&address as *const libc::sockaddr_un).cast(),
+                address_length,
+            )
+        };
+        if connected != 0 {
+            let source = io::Error::last_os_error();
+            unsafe { libc::close(descriptor) };
+            return Err(source);
+        }
+        Ok(unsafe { UnixStream::from_raw_fd(descriptor) })
+    }
+}
+
+fn backend_lock() -> Result<File, CliError> {
+    fs::create_dir_all(BACKEND_RUNTIME_DIRECTORY).map_err(|source| {
+        CliError::Backend(format!(
+            "could not initialize root-managed backend runtime directory: {source}"
+        ))
+    })?;
+    let directory_path = CString::new(BACKEND_RUNTIME_DIRECTORY)
+        .expect("backend runtime directory has no embedded NUL");
+    let directory_descriptor = unsafe {
+        libc::open(
+            directory_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if directory_descriptor < 0 {
+        return Err(CliError::Backend(format!(
+            "could not open trusted backend runtime directory: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let directory = unsafe { File::from_raw_fd(directory_descriptor) };
+    if unsafe { libc::fchown(directory.as_raw_fd(), 0, 0) } != 0
+        || unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0
+    {
+        return Err(CliError::Backend(format!(
+            "could not secure backend runtime directory: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let lock_name = CStr::from_bytes_with_nul(BACKEND_LOCK_NAME)
+        .expect("backend lock name must be NUL terminated");
+    let lock_descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            lock_name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if lock_descriptor < 0 {
+        return Err(CliError::Backend(format!(
+            "could not open trusted backend instance lock: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let lock = unsafe { File::from_raw_fd(lock_descriptor) };
+    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(lock.as_raw_fd(), &mut metadata) } != 0 {
+        return Err(CliError::Backend(format!(
+            "could not inspect backend instance lock: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        || metadata.st_uid != 0
+        || metadata.st_nlink != 1
+    {
+        return Err(CliError::Backend(
+            "backend instance lock must be a root-owned regular file with one link".to_owned(),
+        ));
+    }
+    if unsafe { libc::fchmod(lock.as_raw_fd(), 0o600) } != 0 {
+        return Err(CliError::Backend(format!(
+            "could not secure backend instance lock: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(lock)
+}
+
+fn configured_allowed_peer_uid() -> Result<u32, CliError> {
+    match env::var_os("CONTAINER_INIT_HANDOFF_UID") {
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| {
+                CliError::Backend(
+                    "CONTAINER_INIT_HANDOFF_UID must be an unsigned integer".to_owned(),
+                )
+            }),
+        None => Ok(unsafe { libc::geteuid() }),
+    }
 }
 
 impl BackendRuntime {
@@ -277,9 +418,31 @@ impl BackendRuntime {
 }
 
 fn serve_connection(runtime: Arc<BackendRuntime>, mut stream: UnixStream) {
-    let request = match read_backend_request(&mut stream) {
+    let (request, peer) = match read_authenticated_request(&mut stream, runtime.allowed_peer_uid) {
         Ok(request) => request,
-        Err(_) => return,
+        Err(ConnectionRequestError::Unauthorized(peer)) => {
+            record_rejected_peer(peer.uid);
+            let response = runtime.error(
+                "peer-authentication",
+                "BACKEND-PEER-REJECTED",
+                format!(
+                    "peer uid {} is not allowed; configured peer uid is {}",
+                    peer.uid, runtime.allowed_peer_uid
+                ),
+                false,
+            );
+            let _ = write_backend_response(&mut stream, &response);
+            return;
+        }
+        Err(ConnectionRequestError::PeerCredentials(_source)) => return,
+        Err(ConnectionRequestError::Protocol(
+            dev_env_model::BackendProtocolError::UnsupportedVersion(version),
+        )) => {
+            let response = protocol_mismatch_response(version);
+            let _ = write_backend_response(&mut stream, &response);
+            return;
+        }
+        Err(ConnectionRequestError::Protocol(_source)) => return,
     };
     if runtime.active_requests.fetch_add(1, Ordering::AcqRel) >= MAX_ACTIVE_REQUESTS {
         runtime.active_requests.fetch_sub(1, Ordering::AcqRel);
@@ -292,24 +455,67 @@ fn serve_connection(runtime: Arc<BackendRuntime>, mut stream: UnixStream) {
         let _ = write_backend_response(&mut stream, &response);
         return;
     }
-    let peer = peer_credentials(&stream);
-    if !authorized_peer(peer) {
-        return;
-    }
     let response = handle_request(&runtime, &request, peer);
     runtime.active_requests.fetch_sub(1, Ordering::AcqRel);
     let _ = write_backend_response(&mut stream, &response);
 }
 
-fn authorized_peer(peer: dev_env_model::IdentityPeer) -> bool {
-    if peer.uid == 0 {
-        return true;
+enum ConnectionRequestError {
+    PeerCredentials(io::Error),
+    Unauthorized(dev_env_model::IdentityPeer),
+    Protocol(dev_env_model::BackendProtocolError),
+}
+
+fn read_authenticated_request(
+    stream: &mut UnixStream,
+    allowed_peer_uid: u32,
+) -> Result<(BackendRequestMessage, dev_env_model::IdentityPeer), ConnectionRequestError> {
+    let peer = peer_credentials(stream).map_err(ConnectionRequestError::PeerCredentials)?;
+    let request = read_request_for_peer(stream, peer, allowed_peer_uid)?;
+    Ok((request, peer))
+}
+
+fn read_request_for_peer(
+    reader: &mut impl Read,
+    peer: dev_env_model::IdentityPeer,
+    allowed_peer_uid: u32,
+) -> Result<BackendRequestMessage, ConnectionRequestError> {
+    if !peer_is_authorized(peer, allowed_peer_uid) {
+        return Err(ConnectionRequestError::Unauthorized(peer));
     }
-    let allowed = env::var("CONTAINER_INIT_HANDOFF_UID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| unsafe { libc::geteuid() });
-    peer.uid == allowed
+    read_backend_request(reader).map_err(ConnectionRequestError::Protocol)
+}
+
+fn peer_is_authorized(peer: dev_env_model::IdentityPeer, allowed_peer_uid: u32) -> bool {
+    peer.uid == 0 || peer.uid == allowed_peer_uid
+}
+
+fn protocol_mismatch_response(version: u16) -> BackendResponseMessage {
+    BackendResponseMessage::new(
+        "protocol-mismatch",
+        BackendResponse::Error(BackendError {
+            error_version: dev_env_model::DEVENV_BACKEND_ERROR_VERSION,
+            class: "BACKEND-PROTOCOL-MISMATCH".to_owned(),
+            retryable: false,
+            message: format!(
+                "received dev-env backend protocol v{version}; this backend requires v{}",
+                dev_env_model::DEVENV_BACKEND_PROTOCOL_VERSION
+            ),
+            generation: None,
+            provider_id: None,
+            operation: None,
+            request_id: None,
+        }),
+    )
+}
+
+static REJECTED_PEER_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn record_rejected_peer(uid: u32) {
+    let count = REJECTED_PEER_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count % 100 == 0 {
+        eprintln!("BACKEND-PEER-REJECTED: rejected peer uid {uid} ({count} rejected connections)");
+    }
 }
 
 fn handle_request(
@@ -358,7 +564,7 @@ fn handle_request(
         ),
         BackendRequest::Doctor => BackendResponseMessage::new(
             &request.request_id,
-            BackendResponse::Doctor(doctor_value(&snapshot)),
+            BackendResponse::Doctor(doctor_value(&snapshot, peer.uid, runtime.allowed_peer_uid)),
         ),
         BackendRequest::Prepare { context } => {
             handle_prepare(runtime, request, context, peer, false)
@@ -672,7 +878,7 @@ fn run_initial(runtime: Arc<BackendRuntime>, initial: BackendInitial) {
     let initial_user = if root_service {
         "root".to_owned()
     } else {
-        env::var("DEVENV_BACKEND_INITIAL_USER").unwrap_or_else(|_| "dev".to_owned())
+        env::var("CONTAINER_INIT_HANDOFF_USER").unwrap_or_else(|_| "dev".to_owned())
     };
     let context = dev_env_model::RequestContext::new(
         request_id,
@@ -842,7 +1048,7 @@ fn make_snapshot(
 pub(crate) fn prepare(
     context: dev_env_model::RequestContext,
 ) -> Result<PreparedResponse, CliError> {
-    let response = request(None, BackendRequest::Prepare { context })?;
+    let response = request(BackendRequest::Prepare { context })?;
     match response.response {
         BackendResponse::Prepared(prepared) => {
             if !prepared.cwd.is_absolute()
@@ -874,18 +1080,13 @@ pub(crate) fn prepare(
 }
 
 pub(crate) fn request_backend(message: BackendRequest) -> Result<BackendResponseMessage, CliError> {
-    request(None, message)
+    request(message)
 }
 
-fn request(
-    socket: Option<PathBuf>,
-    request: BackendRequest,
-) -> Result<BackendResponseMessage, CliError> {
-    let socket = socket_path(socket)?;
-    let mut stream = UnixStream::connect(&socket).map_err(|source| {
+fn request(request: BackendRequest) -> Result<BackendResponseMessage, CliError> {
+    let mut stream = BackendTransport::connect().map_err(|source| {
         CliError::BackendUnavailable(format!(
-            "backend unavailable at {}: {source}",
-            socket.display()
+            "BACKEND-TRANSPORT-UNAVAILABLE: cannot connect to {ENDPOINT_DISPLAY}: {source}"
         ))
     })?;
     let request_id = format!(
@@ -903,7 +1104,15 @@ fn request(
     let message = BackendRequestMessage::new(request_id, request);
     write_backend_request(&mut stream, &message)
         .map_err(|error| CliError::Backend(error.to_string()))?;
-    read_backend_response(&mut stream).map_err(|error| CliError::Backend(error.to_string()))
+    read_backend_response(&mut stream).map_err(|error| match error {
+        dev_env_model::BackendProtocolError::UnsupportedVersion(version) => CliError::Backend(
+            format!(
+                "BACKEND-PROTOCOL-MISMATCH: backend response uses protocol v{version}; expected v{}",
+                dev_env_model::DEVENV_BACKEND_PROTOCOL_VERSION
+            ),
+        ),
+        error => CliError::Backend(error.to_string()),
+    })
 }
 
 static REQUEST_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
@@ -919,40 +1128,6 @@ fn print_response(response: BackendResponseMessage) -> Result<(), CliError> {
         .map_err(|error| CliError::Backend(error.to_string()))?;
     crate::output::write_stdout(&format!("{output}\n"))
         .map_err(|error| CliError::Backend(error.to_string()))
-}
-
-fn socket_path(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    let path = path
-        .or_else(|| std::env::var_os("DEVENV_BACKEND_SOCKET").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_BACKEND_SOCKET));
-    if !path.is_absolute() || path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
-        return Err(CliError::Backend(
-            "backend socket must be an absolute path".to_owned(),
-        ));
-    }
-    Ok(path)
-}
-
-fn backend_socket_gid() -> Result<u32, CliError> {
-    if let Some(value) = env::var_os("CONTAINER_INIT_HANDOFF_GID") {
-        return value.to_string_lossy().parse::<u32>().map_err(|_| {
-            CliError::Backend("CONTAINER_INIT_HANDOFF_GID must be an integer".to_owned())
-        });
-    }
-    Ok(unsafe { libc::getegid() })
-}
-
-fn set_owner(path: &Path, uid: u32, gid: u32) -> Result<(), CliError> {
-    let encoded = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| CliError::Backend("backend path contains NUL".to_owned()))?;
-    if unsafe { libc::chown(encoded.as_ptr(), uid, gid) } != 0 {
-        return Err(CliError::Backend(format!(
-            "could not set backend ownership for {}: {}",
-            path.display(),
-            io::Error::last_os_error()
-        )));
-    }
-    Ok(())
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -992,7 +1167,11 @@ fn explain_value(snapshot: &ConfigSnapshot, path: Option<&str>) -> serde_json::V
     })
 }
 
-fn doctor_value(snapshot: &ConfigSnapshot) -> serde_json::Value {
+fn doctor_value(
+    snapshot: &ConfigSnapshot,
+    peer_uid: u32,
+    allowed_peer_uid: u32,
+) -> serde_json::Value {
     let workspace_ok = snapshot.workspace_root.is_dir();
     let shells = snapshot
         .shells
@@ -1024,6 +1203,14 @@ fn doctor_value(snapshot: &ConfigSnapshot) -> serde_json::Value {
         .count();
     serde_json::json!({
         "ok": workspace_ok && shells.values().all(|ok| *ok) && provider_failures == 0,
+        "backend_transport": {
+            "endpoint": ENDPOINT_DISPLAY,
+            "protocol": dev_env_model::DEVENV_BACKEND_PROTOCOL_VERSION,
+            "connected": true,
+            "peer_uid": peer_uid,
+            "allowed_peer_uid": allowed_peer_uid,
+            "peer_authorized": true,
+        },
         "workspace": { "path": snapshot.workspace_root, "is_directory": workspace_ok },
         "shells": shells,
         "providers": providers,
@@ -1112,9 +1299,7 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 #[cfg(unix)]
 fn peer_credentials_from_current_thread() -> dev_env_model::IdentityPeer {
-    // The request handler owns a UnixStream, but SO_PEERCRED is intentionally
-    // checked in the connection path below.  This fallback is the backend's
-    // own uid for the initial runtime and platforms without peer credentials.
+    // 初始 runtime 由 backend 自身启动，不经过客户端连接授权。
     dev_env_model::IdentityPeer {
         pid: std::process::id(),
         uid: unsafe { libc::geteuid() },
@@ -1123,7 +1308,7 @@ fn peer_credentials_from_current_thread() -> dev_env_model::IdentityPeer {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_credentials(stream: &UnixStream) -> dev_env_model::IdentityPeer {
+fn peer_credentials(stream: &UnixStream) -> io::Result<dev_env_model::IdentityPeer> {
     let mut credentials = libc::ucred {
         pid: 0,
         uid: 0,
@@ -1132,32 +1317,35 @@ fn peer_credentials(stream: &UnixStream) -> dev_env_model::IdentityPeer {
     let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let result = unsafe {
         libc::getsockopt(
-            std::os::fd::AsRawFd::as_raw_fd(stream),
+            stream.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             (&mut credentials as *mut libc::ucred).cast(),
             &mut length,
         )
     };
-    if result == 0 {
-        dev_env_model::IdentityPeer {
-            pid: credentials.pid as u32,
-            uid: credentials.uid,
-            gid: credentials.gid,
-        }
-    } else {
-        peer_credentials_from_current_thread()
+    if result != 0 {
+        return Err(io::Error::last_os_error());
     }
+    if length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERCRED returned an invalid credential size",
+        ));
+    }
+    Ok(dev_env_model::IdentityPeer {
+        pid: credentials.pid as u32,
+        uid: credentials.uid,
+        gid: credentials.gid,
+    })
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn peer_credentials(_stream: &UnixStream) -> dev_env_model::IdentityPeer {
-    peer_credentials_from_current_thread()
-}
-
-#[cfg(not(unix))]
-fn peer_credentials(_stream: &UnixStream) -> dev_env_model::IdentityPeer {
-    peer_credentials_from_current_thread()
+#[cfg(not(target_os = "linux"))]
+fn peer_credentials(_stream: &UnixStream) -> io::Result<dev_env_model::IdentityPeer> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "dev-env backend peer authorization requires Linux SO_PEERCRED",
+    ))
 }
 
 #[cfg(not(unix))]
@@ -1199,5 +1387,96 @@ fn signal_requested() -> bool {
     #[cfg(not(unix))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        peer_credentials, peer_is_authorized, protocol_mismatch_response, read_request_for_peer,
+        BackendTransport, ConnectionRequestError, BACKEND_ABSTRACT_ENDPOINT,
+    };
+    use dev_env_model::{BackendResponse, IdentityPeer, DEVENV_BACKEND_PROTOCOL_VERSION};
+    use std::io::{self, Read};
+
+    struct ReadCounter {
+        reads: usize,
+    }
+
+    impl Read for ReadCounter {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            buffer[0] = b'!';
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn abstract_endpoint_has_linux_abstract_namespace_encoding() {
+        let (address, length) = BackendTransport::sockaddr_for(BACKEND_ABSTRACT_ENDPOINT).unwrap();
+        let encoded = unsafe {
+            std::slice::from_raw_parts(
+                address.sun_path.as_ptr().cast::<u8>(),
+                BACKEND_ABSTRACT_ENDPOINT.len(),
+            )
+        };
+        assert_eq!(encoded, BACKEND_ABSTRACT_ENDPOINT);
+        assert_eq!(
+            length as usize,
+            std::mem::size_of::<libc::sa_family_t>() + BACKEND_ABSTRACT_ENDPOINT.len()
+        );
+        assert_eq!(DEVENV_BACKEND_PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn abstract_transport_connects_without_a_filesystem_socket() {
+        let endpoint = format!("\0dev-env-test-{}", std::process::id());
+        let listener = BackendTransport::bind_endpoint(endpoint.as_bytes()).unwrap();
+        let client = BackendTransport::connect_endpoint(endpoint.as_bytes()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert!(listener.local_addr().unwrap().as_pathname().is_none());
+        assert_eq!(peer_credentials(&server).unwrap().uid, unsafe {
+            libc::geteuid()
+        });
+        drop(client);
+    }
+
+    #[test]
+    fn uid_policy_does_not_depend_on_group_membership() {
+        let peer = IdentityPeer {
+            pid: 12,
+            uid: 1000,
+            gid: 4242,
+        };
+        assert!(peer_is_authorized(peer, 1000));
+        assert!(!peer_is_authorized(peer, 1001));
+        assert!(peer_is_authorized(IdentityPeer { uid: 0, ..peer }, 1001));
+    }
+
+    #[test]
+    fn unauthorized_peer_is_rejected_before_frame_read() {
+        let peer = IdentityPeer {
+            pid: 12,
+            uid: 1000,
+            gid: 4242,
+        };
+        let mut reader = ReadCounter { reads: 0 };
+        let result = read_request_for_peer(&mut reader, peer, 1001);
+        assert!(
+            matches!(result, Err(ConnectionRequestError::Unauthorized(found)) if found == peer)
+        );
+        assert_eq!(reader.reads, 0);
+    }
+
+    #[test]
+    fn legacy_protocol_version_gets_a_typed_mismatch() {
+        let response = protocol_mismatch_response(3);
+        assert_eq!(response.protocol, DEVENV_BACKEND_PROTOCOL_VERSION);
+        assert!(matches!(
+            response.response,
+            BackendResponse::Error(error)
+                if error.class == "BACKEND-PROTOCOL-MISMATCH"
+                    && error.message.contains("protocol v3")
+        ));
     }
 }

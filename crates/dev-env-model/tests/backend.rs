@@ -7,7 +7,7 @@ use dev_env_model::{
 use std::collections::BTreeMap;
 
 #[test]
-fn backend_v3_request_round_trips_and_rejects_invalid_context() {
+fn backend_v4_request_round_trips_and_rejects_invalid_context() {
     let context = RequestContext::new("request-1", RequestMode::Exec, "/workspace", "bash")
         .with_identity(IdentityRequest::Peer)
         .with_runtime_input("DEVBOX_AUTO_INIT", "never")
@@ -17,7 +17,7 @@ fn backend_v3_request_round_trips_and_rejects_invalid_context() {
     let decoded = decode_backend_request(&encoded).unwrap();
     assert_eq!(decoded, original);
     assert_eq!(decoded.protocol, DEVENV_BACKEND_PROTOCOL_VERSION);
-    assert_eq!(DEVENV_BACKEND_PROTOCOL_VERSION, 3);
+    assert_eq!(DEVENV_BACKEND_PROTOCOL_VERSION, 4);
 
     let invalid = BackendRequestMessage::new(
         "request-2",
