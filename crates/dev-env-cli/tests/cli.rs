@@ -12,12 +12,15 @@ use {
         io::ErrorKind,
         path::{Path, PathBuf},
         process::{Command, Output},
+        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     },
 };
 
 #[cfg(unix)]
 use libc::geteuid;
+
+static BACKEND_LIFECYCLE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Fixture {
     root: PathBuf,
@@ -237,6 +240,9 @@ fn print_exec_shell_login_and_shim_share_the_same_environment() {
 
 #[test]
 fn client_does_not_fallback_to_profile_when_backend_is_unavailable() {
+    let _backend_lifecycle = BACKEND_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("backend lifecycle test lock poisoned");
     let fixture = Fixture::new();
     let output = fixture.command().arg("print").output().unwrap();
     assert!(!output.status.success());
@@ -250,6 +256,9 @@ fn client_does_not_fallback_to_profile_when_backend_is_unavailable() {
 
 #[test]
 fn backend_startup_failure_is_not_reported_as_success() {
+    let _backend_lifecycle = BACKEND_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("backend lifecycle test lock poisoned");
     let lock_path = Path::new("/run/dev-env/backend.lock");
     if let Ok(lock) = OpenOptions::new().read(true).write(true).open(lock_path) {
         match lock.try_lock_exclusive() {
