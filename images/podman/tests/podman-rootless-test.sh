@@ -115,10 +115,12 @@ for attempt in {1..120}; do
         cat "$qemu_log" >&2 || true
         exit 1
     fi
+    # ssh joins remote command arguments into one shell command, so keep the
+    # Go template free of spaces and shell metacharacters.
     if ssh_guest true \
         && last_podman_info="$(ssh_guest_user env HOME=/home/podman XDG_RUNTIME_DIR=/run/user/1000 \
-            podman info --format '{{.Host.Security.Rootless}} {{.Store.GraphRoot}}' 2>&1)" \
-        && [[ "$last_podman_info" == "true /home/podman/.local/share/containers/storage" ]]; then
+            podman info --format '{{.Host.Security.Rootless}}:{{.Store.GraphRoot}}' 2>&1)" \
+        && [[ "$last_podman_info" == "true:/home/podman/.local/share/containers/storage" ]]; then
         break
     fi
     if [[ "$attempt" -eq 120 ]]; then

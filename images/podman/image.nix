@@ -1,9 +1,9 @@
-{ sources ? import ./npins
-, system ? builtins.currentSystem
-, pkgs ? import sources.nixpkgs { inherit system; config.allowUnfree = true; }
+{ system ? builtins.currentSystem
 , name ? "podman"
 }:
 let
+  sources = import ./npins;
+  pkgs = import sources.nixpkgs { inherit system; config.allowUnfree = true; };
   builder = import ../../modules { inherit pkgs sources system; };
   engine = builder.buildEngineImage {
     inherit name;
