@@ -30,7 +30,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: python3 scripts/test-workspace.py
 
   docker-test:
     name: ${{ matrix.target }} Docker tests
