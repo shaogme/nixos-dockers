@@ -1,0 +1,10 @@
+FROM docker.io/library/rust:1.85-bookworm
+
+WORKDIR /workspace/nixos-dockers
+COPY . .
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["python3", "scripts/test-workspace.py"]

@@ -107,6 +107,7 @@ ssh_guest_user() {
 }
 
 echo "==> waiting for rootless Podman guest"
+last_podman_info=""
 for attempt in {1..120}; do
     if ! kill -0 "$qemu_pid" 2>/dev/null; then
         echo "QEMU exited before the guest became ready" >&2
@@ -114,13 +115,17 @@ for attempt in {1..120}; do
         cat "$qemu_log" >&2 || true
         exit 1
     fi
+    # ssh joins remote command arguments into one shell command, so keep the
+    # Go template free of spaces and shell metacharacters.
     if ssh_guest true \
-        && ssh_guest_user env HOME=/home/podman XDG_RUNTIME_DIR=/run/user/1000 \
-            podman info --format '{{.Host.Security.Rootless}}' | grep -qx true; then
+        && last_podman_info="$(ssh_guest_user env HOME=/home/podman XDG_RUNTIME_DIR=/run/user/1000 \
+            podman info --format '{{.Host.Security.Rootless}}:{{.Store.GraphRoot}}' 2>&1)" \
+        && [[ "$last_podman_info" == "true:/home/podman/.local/share/containers/storage" ]]; then
         break
     fi
     if [[ "$attempt" -eq 120 ]]; then
         echo "timed out waiting for rootless Podman" >&2
+        echo "last Podman readiness result: $last_podman_info" >&2
         echo "==> complete QEMU log: $qemu_log" >&2
         cat "$qemu_log" >&2 || true
         exit 1
@@ -145,6 +150,9 @@ cd /workspace/nixos-dockers
 test "$(id -u)" = 1000
 test "$(id -g)" = 1000
 test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+rootless_graphroot="$(podman info --format '{{.Store.GraphRoot}}')"
+test "$rootless_graphroot" = /home/podman/.local/share/containers/storage
+test -w "$rootless_graphroot"
 exec bash images/podman/tests/common.sh
 GUEST_TEST
 

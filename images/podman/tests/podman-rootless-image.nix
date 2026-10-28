@@ -1,6 +1,7 @@
-{ system ? builtins.currentSystem
-, pkgs ? import <nixpkgs> { inherit system; }
-, output ? "image"
+{
+  system ? builtins.currentSystem,
+  pkgs ? import <nixpkgs> { inherit system; },
+  output ? "image",
 }:
 
 let
@@ -55,12 +56,11 @@ let
             runtime = "crun";
           };
         };
-        storage.settings = {
+        storage.rootless.settings = {
           storage = {
             driver = "overlay";
-            graphroot = "/var/lib/containers/storage";
-            runroot = "/run/containers/storage";
-            rootless_storage_path = "$HOME/.local/share/containers/storage";
+            graphroot = "/home/podman/.local/share/containers/storage";
+            runroot = "/run/user/1000/containers";
           };
           storage.options.overlay = {
             mount_program = "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs";
@@ -76,7 +76,10 @@ let
       # available so the test does not depend on the host's NIX_PATH.
       nix.enable = true;
       nix.nixPath = [ "nixpkgs=/etc/nixpkgs" ];
-      nix.settings.allowed-users = [ "root" "podman" ];
+      nix.settings.allowed-users = [
+        "root"
+        "podman"
+      ];
       environment.etc."nixpkgs".source = pkgs.path;
       # The test user runs nix-build directly. Give it access to the daemon
       # socket while retaining the normal non-root build permissions.
@@ -110,8 +113,7 @@ let
         createHome = true;
         shell = pkgs.bashInteractive;
         linger = true;
-        initialHashedPassword =
-          "$6$tEI3gQs0Btzt1Chd$se4yg0TbtA7DeNXG.H19YOVHTkc.4INnG5xpn4QX/EmH536zpQBbrR/Wp.BkzgnQdDF3OUvNl.rg7bMO.faLq1";
+        initialHashedPassword = "$6$tEI3gQs0Btzt1Chd$se4yg0TbtA7DeNXG.H19YOVHTkc.4INnG5xpn4QX/EmH536zpQBbrR/Wp.BkzgnQdDF3OUvNl.rg7bMO.faLq1";
         subUidRanges = [
           {
             startUid = 100000;
@@ -135,8 +137,7 @@ let
       };
 
       users.mutableUsers = false;
-      users.users.root.initialHashedPassword =
-        "$6$tEI3gQs0Btzt1Chd$se4yg0TbtA7DeNXG.H19YOVHTkc.4INnG5xpn4QX/EmH536zpQBbrR/Wp.BkzgnQdDF3OUvNl.rg7bMO.faLq1";
+      users.users.root.initialHashedPassword = "$6$tEI3gQs0Btzt1Chd$se4yg0TbtA7DeNXG.H19YOVHTkc.4INnG5xpn4QX/EmH536zpQBbrR/Wp.BkzgnQdDF3OUvNl.rg7bMO.faLq1";
 
       # Rootless Podman needs to pass these devices to the nested engine. The
       # VM has no other users, so making them readable is sufficient here.

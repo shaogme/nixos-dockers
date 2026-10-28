@@ -35,7 +35,6 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@master
         with:
-          nix_path: nixpkgs=channel:nixos-unstable
           extra_nix_config: |
             experimental-features = nix-command flakes
             extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
@@ -70,7 +69,6 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@master
         with:
-          nix_path: nixpkgs=channel:nixos-unstable
           extra_nix_config: |
             experimental-features = nix-command flakes
             extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
@@ -127,8 +125,6 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@master
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Load, Push and Create Manifests
         run: |

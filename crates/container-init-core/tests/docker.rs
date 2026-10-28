@@ -181,8 +181,8 @@ fn executes_real_cgroup_v2_init_as_root() {
     let report = runner.execute_plan(&plan).unwrap();
     assert!(report.succeeded());
 
-    // Verify /sys/fs/cgroup/init exists
-    assert!(cgroup_base.join("init").is_dir());
+    // Verify the configured subgroup exists
+    assert!(cgroup_base.join("libpod_parent").is_dir());
 
     // Verify controllers in subtree_control
     let controllers = fs::read_to_string(cgroup_base.join("cgroup.controllers")).unwrap();
@@ -263,8 +263,8 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
     assert!(report.succeeded());
 
     // Verify shadow_path and target_path both reflect the initialized subgroup and subtree_control
-    assert!(shadow_path.join("init").is_dir());
-    assert!(target_path.join("init").is_dir());
+    assert!(shadow_path.join("libpod_parent").is_dir());
+    assert!(target_path.join("libpod_parent").is_dir());
     let target_subtree = fs::read_to_string(target_path.join("cgroup.subtree_control")).unwrap();
     assert!(target_subtree.contains("pids"));
 }

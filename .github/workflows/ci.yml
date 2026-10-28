@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  workspace-test:
+    name: Rust workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run workspace tests
+        run: bash scripts/test-workspace.sh
+
+  docker-test:
+    name: ${{ matrix.target }} Docker tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: container-init-posix
+            script: crates/container-init-posix/tests/docker.sh
+          - target: container-init-core
+            script: crates/container-init-core/tests/docker.sh
+          - target: container-init-cli
+            script: crates/container-init-cli/tests/docker.sh
+          - target: dev-env-core
+            script: crates/dev-env-core/tests/docker.sh
+          - target: dev-env-provider
+            script: crates/dev-env-provider/tests/docker.sh
+          - target: dev-env-shell
+            script: crates/dev-env-shell/tests/docker.sh
+          - target: dev-env-cli
+            script: crates/dev-env-cli/tests/docker.sh
+          - target: mise
+            script: images/mise/tests/docker.sh
+          - target: npins
+            script: images/npins/tests/docker.sh
+          - target: rust
+            script: images/rust/tests/docker.sh
+          - target: podman
+            script: images/podman/tests/docker.sh
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@main
+
+      - name: Install Nix
+        if: contains(fromJSON('["mise", "npins", "rust", "podman"]'), matrix.target)
+        uses: cachix/install-nix-action@master
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-trusted-public-keys = mise-cache-1:wc5EMEDHcUyzRUTm6EuRKp0hhsJiKB2lfEi3ZOT1ahg=
+
+      - name: Setup NixCache for mise
+        if: matrix.target == 'mise'
+        uses: shaogme/nixcache-oci/setup@main
+        with:
+          repo: shaogme/mise-nixcache
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install QEMU tools
+        if: matrix.target == 'podman'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+
+      - name: Run Docker tests
+        run: bash "${{ matrix.script }}"
+
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    needs: [workspace-test, docker-test]
+    if: always()
+    steps:
+      - name: Check all test results
+        run: |
+          if [[ "${{ needs.workspace-test.result }}" == "success" && "${{ needs.docker-test.result }}" == "success" ]]; then
+            echo "All workspace and Docker tests passed."
+          else
+            echo "Workspace tests: ${{ needs.workspace-test.result }}"
+            echo "Docker tests: ${{ needs.docker-test.result }}"
+            exit 1
+          fi
