@@ -86,10 +86,16 @@ in-flight 表，按 `MaterializationKey` 合并并发请求；成功结果进入
 直接使用 provider runner 的库调用不会共享 backend cache 或 in-flight 表，生产入口必须通过
 backend。
 
-生产 backend 将 `ProcessExecutor` handle 注入所有 materializer。handle 把命令请求发送给单一
-`ProviderProcessSupervisor` actor；actor 负责 subreaper 初始化、spawn、超时清理、输出读取和
-adopted child 回收。不要为每个 provider 单独创建 supervisor，也不要在 actor 外调用
-`waitpid(-1)`。
+生产 backend 将 `ProcessExecutor` handle 注入所有 materializer。共享的
+`ProviderProcessSupervisor` actor 按队列调度命令，每条命令启动一个专属
+`dev-env-provider-worker` 子进程。worker 才是该命令的 Linux subreaper；它负责 provider
+进程组、超时和取消清理、输出读取，以及回收脱离进程组后被收养的后代。backend 只等待和终止
+自己启动的 worker，不枚举或回收 provider 后代。
+
+`dev-env-provider-worker` 必须与 `dev-env` 一起安装在同一 `bin` 目录。backend 根据自己的真实
+可执行文件路径解析 worker，不通过 `PATH` 查找；缺少 worker、worker 无法启动或 IPC 协议不兼容
+都会返回明确错误，不会切回 backend 内的进程扫描。backend 停止时会通过独立控制通道取消当前
+worker；backend 异常退出时 worker 的 parent-death signal 触发相同的清理流程。
 
 ### `shellenv`
 

@@ -8,7 +8,7 @@ use {
     libc::{getegid, geteuid},
     serde_json::{from_slice, Value},
     std::{
-        env::temp_dir,
+        env::{temp_dir, var_os},
         fs,
         io::{ErrorKind, Write},
         path::{Path, PathBuf},
@@ -34,6 +34,12 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn real_bash() -> PathBuf {
+        var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/bash"))
+    }
+
     fn new() -> Self {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -59,6 +65,7 @@ impl Fixture {
     }
 
     fn write_profile(&self, provider: &Path, extra_variables: &str, timeout_ms: u64) {
+        let real_bash = Self::real_bash();
         let profile = format!(
             r#"schema = 1
 id = "startup"
@@ -71,7 +78,7 @@ search = "fixed"
 default = "bash"
 
 [config.shells.bash]
-command = "/bin/bash"
+command = "{}"
 kind = "posix"
 interactive_args = ["-i"]
 login_args = ["-l"]
@@ -101,6 +108,7 @@ failure = "error"
 timeout_ms = 1000
 "#,
             self.workspace.display(),
+            real_bash.display(),
             self.root.join("provider.log").display(),
             extra_variables,
             provider.display(),
@@ -335,10 +343,11 @@ fn slow_initial_provider_does_not_block_readiness_or_repeat_same_key_work() {
         return;
     }
     let fixture = Fixture::new();
+    let real_bash = Fixture::real_bash();
     let provider = fixture.root.join("slow-provider");
     let provider_start = fixture.workspace.join("provider-started");
     let extra_variables = format!(
-        "PROVIDER_SLEEP_SECONDS = \"90\"\nPROVIDER_START_MARKER = \"{}\"",
+        "PROVIDER_SLEEP_SECONDS = \"2\"\nPROVIDER_START_MARKER = \"{}\"",
         provider_start.display()
     );
     fixture.write_profile(&provider, &extra_variables, 120_000);
@@ -373,7 +382,15 @@ esac
     let mut clients = vec![
         fixture
             .command_at_workspace()
-            .args(["exec", "--", "/bin/sh", "-c", "printf startup-exec"])
+            .args([
+                "--cwd",
+                fixture.workspace.to_str().unwrap(),
+                "exec",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf startup-exec",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -382,6 +399,8 @@ esac
             .command_at_workspace()
             .args([
                 "shell",
+                "--cwd",
+                fixture.workspace.to_str().unwrap(),
                 "--shell",
                 "bash",
                 "--",
@@ -396,10 +415,12 @@ esac
             .command_at_workspace()
             .args([
                 "shim",
+                "--cwd",
+                fixture.workspace.to_str().unwrap(),
                 "--shell",
                 "bash",
                 "--real",
-                "/bin/bash",
+                real_bash.to_str().unwrap(),
                 "--",
                 "-c",
                 "printf startup-shim",
@@ -428,17 +449,22 @@ esac
     assert_eq!(wait_ready["initial_runtime"], "preparing");
 
     let started = Instant::now();
-    for (client, expected) in
-        clients
-            .drain(..)
-            .zip(["startup-exec", "startup-shell", "startup-shim"])
+    for (index, (client, expected)) in clients
+        .drain(..)
+        .zip(["startup-exec", "startup-shell", "startup-shim"])
+        .enumerate()
     {
         let output = client.wait_with_output().unwrap();
-        assert_success(&output);
+        assert!(
+            output.status.success(),
+            "startup client {index} failed with {}:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
         assert!(!String::from_utf8_lossy(&output.stderr).contains("backend_busy"));
     }
-    assert!(started.elapsed() >= Duration::from_secs(60));
+    assert!(started.elapsed() >= Duration::from_secs(1));
     let provider_log = fs::read_to_string(fixture.root.join("provider.log")).unwrap();
     assert_eq!(
         provider_log
@@ -457,6 +483,107 @@ esac
     let running: Value = from_slice(&running.stdout).unwrap();
     assert_eq!(running["control_plane"], "serving");
     assert_eq!(running["initial_runtime"], "running");
+    assert_success(&fixture.run(&["backend", "stop"]));
+    assert_eq!(backend.0.wait().unwrap().code(), Some(143));
+}
+
+#[test]
+fn provider_cleanup_keeps_initial_runtime_child_alive_during_another_prepare() {
+    let _backend_lifecycle = BACKEND_STARTUP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(unsafe { geteuid() }, 0, "this backend test requires root");
+    if another_backend_owns_the_fixed_endpoint() {
+        eprintln!("skipping backend startup test because a runtime owns the fixed endpoint");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let provider = fixture.root.join("isolated-provider");
+    let initial_provider = fixture.workspace.join("initial-provider-started");
+    let release_initial_provider = fixture.workspace.join("release-initial-provider");
+    let regular_provider = fixture.workspace.join("regular-provider-started");
+    let release_regular_provider = fixture.workspace.join("release-regular-provider");
+    let initial_child = fixture.workspace.join("initial-child-pid");
+    let extra_variables = format!(
+        "WORKSPACE = \"{}\"\nINITIAL_PROVIDER_MARKER = \"{}\"\nINITIAL_PROVIDER_RELEASE = \"{}\"\nREGULAR_PROVIDER_MARKER = \"{}\"\nREGULAR_PROVIDER_RELEASE = \"{}\"",
+        fixture.workspace.display(),
+        initial_provider.display(),
+        release_initial_provider.display(),
+        regular_provider.display(),
+        release_regular_provider.display(),
+    );
+    fixture.write_profile(&provider, &extra_variables, 30_000);
+    let profile_path = fixture.profiles.join("00-startup.toml");
+    let mut profile = fs::read_to_string(&profile_path).unwrap();
+    profile.truncate(profile.find("[config.providers.startup.shellenv]").unwrap());
+    fs::write(profile_path, profile).unwrap();
+    write_provider(
+        &provider,
+        br#"#!/bin/sh
+set -eu
+case "$1" in
+  prepare)
+    case "$(pwd)" in
+      "$WORKSPACE")
+        : > "$INITIAL_PROVIDER_MARKER"
+        while [ ! -e "$INITIAL_PROVIDER_RELEASE" ]; do sleep 0.01; done
+        ;;
+      *)
+        : > "$REGULAR_PROVIDER_MARKER"
+        while [ ! -e "$REGULAR_PROVIDER_RELEASE" ]; do sleep 0.01; done
+        ;;
+    esac
+    ;;
+  env)
+    printf '%s\n' '{"FROM_PROVIDER":"isolated"}'
+    ;;
+esac
+"#,
+    );
+    let identity_socket = AbstractEndpoint::new(
+        fixture
+            .root
+            .join("identity-broker")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .unwrap();
+    let _identity_broker =
+        TestIdentityBroker::start(identity_socket.clone(), fixture.root.join("home"));
+    let initial_command = format!("echo $$ > {}; exec sleep 120", initial_child.display());
+    let mut backend = start_backend(&fixture, &identity_socket, &initial_command);
+    wait_for_provider_marker(&mut backend, &initial_provider, Duration::from_secs(10));
+
+    let regular_request = fixture
+        .command()
+        .args([
+            "--cwd",
+            fixture.nested.to_str().unwrap(),
+            "exec",
+            "--",
+            "/bin/true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fs::write(&release_initial_provider, "continue\n").unwrap();
+    wait_for_provider_marker(&mut backend, &regular_provider, Duration::from_secs(10));
+    wait_for_initial_runtime(&fixture, "running", Duration::from_secs(10));
+    let child_pid = fs::read_to_string(&initial_child).unwrap();
+    let child_path = PathBuf::from(format!("/proc/{}", child_pid.trim()));
+    assert!(child_path.exists(), "initial runtime child did not start");
+
+    fs::write(&release_regular_provider, "continue\n").unwrap();
+    let request_output = regular_request.wait_with_output().unwrap();
+    assert_success(&request_output);
+    assert!(
+        child_path.exists(),
+        "provider cleanup killed the initial runtime child"
+    );
+    assert!(backend.0.try_wait().unwrap().is_none());
+
     assert_success(&fixture.run(&["backend", "stop"]));
     assert_eq!(backend.0.wait().unwrap().code(), Some(143));
 }

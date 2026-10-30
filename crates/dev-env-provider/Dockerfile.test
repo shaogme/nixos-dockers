@@ -5,5 +5,6 @@ ENV DEV_ENV_HOST_LEAK=ambient-from-docker
 WORKDIR /workspace/nixos-dockers
 COPY . .
 
+RUN cargo build --locked -p dev-env-provider --bin dev-env-provider-worker
 RUN cargo test --locked -p dev-env-provider --test docker --no-run
 CMD ["cargo", "test", "--locked", "-p", "dev-env-provider", "--test", "docker", "--", "--nocapture"]

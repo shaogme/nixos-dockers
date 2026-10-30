@@ -18,6 +18,8 @@ metadata = json.loads(
     )
 )
 
+run(["cargo", "build", "--locked", "-p", "dev-env-provider", "--bin", "dev-env-provider-worker"])
+
 for package in metadata["packages"]:
     if package["id"] not in metadata["workspace_members"]:
         continue

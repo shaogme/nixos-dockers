@@ -9,7 +9,7 @@
 | `dev-env-model` | 配置模型、DSL 类型、输入值和验证错误 |
 | `dev-env-loader` | TOML 解析、profile 继承、overlay 合并、运行时输入覆盖 |
 | `dev-env-core` | 运行时上下文、初始环境和 provider 执行编排 |
-| `dev-env-provider` | provider 检测、依赖排序、命令执行监督、输出解析和 receipt |
+| `dev-env-provider` | provider 检测、依赖排序、worker 进程监督、输出解析和 receipt；同时构建 `dev-env-provider-worker` |
 | `dev-env-shell` | shell argv 构造、环境导出、shim 行为 |
 | `dev-env-cli` | 命令行入口、配置发现、进程边界、诊断和 trust 命令 |
 | `container-init-protocol` | container-init v2 身份握手的 DTO 与 client，供 `dev-env-cli` 调用 |
@@ -26,6 +26,7 @@ workspace 入口见 [`Cargo.toml`](../../Cargo.toml)，源码位于 `nixos-docke
 
 ```bash
 cargo build --locked -p dev-env-cli
+cargo build --locked -p dev-env-provider --bin dev-env-provider-worker
 cargo test --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked
@@ -72,7 +73,9 @@ cd nixos-dockers
 ./crates/dev-env-cli/tests/docker.sh
 ```
 
-这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、检测文件、真实 shell 或 backend transport 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
+CLI backend 从 `dev-env` 所在目录启动 `dev-env-provider-worker`；本地手动启动 backend 前，应先构建该 helper。`scripts/test-workspace.sh` 和 core/provider/CLI Docker harness 会先构建它，再运行测试。
+
+这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、脱组后代清理、检测文件、真实 shell 或 backend transport 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
 
 ## 4. 修改 DSL 的检查清单
 

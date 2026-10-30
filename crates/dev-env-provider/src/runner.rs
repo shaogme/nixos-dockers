@@ -17,7 +17,7 @@ use dev_env_model::{
     ModelError, PrepareStep, ProviderConfig, ProviderReceipt, Sensitivity,
 };
 use serde::Serialize;
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::OnceLock, time::Duration};
 
 /// A warning is intentionally an event-shaped value.  It keeps command
 /// output as bytes and status as fields, rather than storing a formatted
@@ -162,8 +162,13 @@ pub trait Provider: Send + Sync {
 
 impl Default for ProviderRunner {
     fn default() -> Self {
+        static SUPERVISOR: OnceLock<ProviderProcessSupervisor> = OnceLock::new();
         Self::from_parts(
-            Box::new(ProviderProcessSupervisor::new().executor()),
+            Box::new(
+                SUPERVISOR
+                    .get_or_init(ProviderProcessSupervisor::new)
+                    .executor(),
+            ),
             Box::new(SystemExecutableLocator),
         )
     }
@@ -586,6 +591,10 @@ fn command_failure_parts(error: &ProviderRuntimeError) -> CommandFailureInfo {
             | CommandError::InvalidArgument
             | CommandError::InvalidEnvironment
             | CommandError::InvalidTimeout
+            | CommandError::WorkerUnavailable { .. }
+            | CommandError::WorkerSpawn { .. }
+            | CommandError::Worker { .. }
+            | CommandError::Protocol { .. }
             | CommandError::SupervisorStopped => CommandFailureInfo {
                 status: None,
                 timed_out: false,

@@ -17,6 +17,8 @@ mod receipt;
 mod runner;
 mod supervisor;
 mod template;
+mod worker;
+mod worker_protocol;
 
 use dev_env_model::{Condition, ProviderConfig, ShellEnvEntry, ShellEnvFormat};
 use std::{
@@ -48,6 +50,7 @@ pub use runner::{
 };
 pub use supervisor::{ProviderJob, ProviderJobParts, ProviderSupervisor};
 pub use template::{ProviderTemplate, TemplateError};
+pub use worker::ProviderWorker;
 
 pub fn evaluate_condition(condition: &Condition, context: &ProviderContext) -> bool {
     ConditionEvaluator::evaluate(condition, context)

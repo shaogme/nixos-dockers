@@ -36,10 +36,11 @@ let
     version = "0.1.0";
     src = workspaceSrc;
     cargoLock.lockFile = ../../Cargo.lock;
-    cargoBuildFlags = [ "--package" "dev-env-cli" ];
+    cargoBuildFlags = [ "--package" "dev-env-cli" "--package" "dev-env-provider" ];
     doCheck = false;
     installPhase = ''
       install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/dev-env $out/bin/dev-env
+      install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/dev-env-provider-worker $out/bin/dev-env-provider-worker
     '';
   };
 
@@ -47,8 +48,10 @@ let
     mkdir -p $out/bin $out/usr/bin
     ln -s ${containerInit}/bin/container-init $out/bin/container-init
     ln -s ${devEnv}/bin/dev-env $out/bin/dev-env
+    ln -s ${devEnv}/bin/dev-env-provider-worker $out/bin/dev-env-provider-worker
     ln -s ${containerInit}/bin/container-init $out/usr/bin/container-init
     ln -s ${devEnv}/bin/dev-env $out/usr/bin/dev-env
+    ln -s ${devEnv}/bin/dev-env-provider-worker $out/usr/bin/dev-env-provider-worker
     ln -s dev-env $out/bin/dev-env-login-shell
     ln -s dev-env $out/usr/bin/dev-env-login-shell
   '';

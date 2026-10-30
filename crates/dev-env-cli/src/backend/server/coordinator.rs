@@ -408,7 +408,11 @@ impl BackendState {
             let _ = reply.send(self.error(
                 request.request_id(),
                 "invalid_input",
-                "request cwd is outside the snapshot workspace",
+                format!(
+                    "request cwd {} is outside the snapshot workspace {}",
+                    cwd.display(),
+                    snapshot.workspace_root().display()
+                ),
                 false,
             ));
             return;

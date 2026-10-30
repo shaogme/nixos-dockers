@@ -163,6 +163,8 @@ bootstrap namespace、UID/GID 解析、账户和目录 reconcile，并把 root s
 identity broker 为每个 request/provider 解析身份，再执行 provider。后续 `dev-env` client
 通过 Linux abstract endpoint `@dev-env.backend.v5` 请求环境。初始 shell/service 仍在准备时，backend 控制面已经可以服务请求；client 会在启动 deadline 内自动等待 backend 可服务。可用 `dev-env backend status --json` 分别查看 `control_plane` 与 `initial_runtime` 状态。
 
+Provider command 在同目录的 `dev-env-provider-worker` helper 子进程中运行。基础 Nix runtime 会将该 helper 与 `dev-env` 一起安装；从源码运行 backend 时也需要先构建 worker binary。backend 停止时会取消当前 provider worker，并等待它清理专属进程树。
+
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |
 | Docker 默认命令 | `container-init` → `dev-env backend` → `dev-env exec/shell` | backend snapshot、当前用户、cwd、provider |

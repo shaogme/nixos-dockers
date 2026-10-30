@@ -14,6 +14,7 @@ use {
     },
     dev_env_provider::{ProcessExecutor, ProviderProcessSupervisor},
     std::{
+        env::current_exe,
         io,
         os::unix::net::UnixStream,
         process::ExitStatus,
@@ -75,7 +76,18 @@ fn run(initial: BackendInitial, options: CliOptions) -> Result<i32, CliError> {
 
     let loaded = ConfigApi::load(&options)?;
     let snapshot = BackendSupport::make_snapshot(&loaded, Generation::INITIAL)?;
-    let process_supervisor = ProviderProcessSupervisor::new();
+    let worker_path = current_exe()
+        .ok()
+        .and_then(|executable| {
+            executable
+                .parent()
+                .map(|directory| directory.join("dev-env-provider-worker"))
+        })
+        .ok_or_else(|| {
+            CliError::Backend("could not locate dev-env executable directory".to_owned())
+        })?;
+    let process_supervisor = ProviderProcessSupervisor::try_new(worker_path)
+        .map_err(|error| CliError::Backend(error.to_string()))?;
     let process_executor = process_supervisor.executor();
     let materializer = Materializer::try_new_with_process_executor(
         loaded.config().clone(),
@@ -127,6 +139,7 @@ fn run(initial: BackendInitial, options: CliOptions) -> Result<i32, CliError> {
         thread::sleep(Duration::from_millis(5));
     }
     let summary = runtime.shutdown();
+    process_supervisor.stop();
     match summary.failure {
         Some(failure) if failure.class == "DEVENV-E-PROVIDER" => {
             Err(CliError::BackendProvider(failure.message))
