@@ -3,7 +3,7 @@ name = "container-init-backend"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Single-instance Unix socket backend and PID 1 supervisor for container-init"
+description = "Single-instance abstract endpoint backend and PID 1 supervisor for container-init"
 license.workspace = true
 
 [dependencies]

@@ -1,52 +1,36 @@
 use {
     crate::{CliError, LoadedConfig, OutputApi},
+    container_init_protocol::AbstractEndpoint,
     dev_env_core::RuntimeContext,
     dev_env_model::{
         BackendError, BackendProtocolError, BackendRequest, BackendRequestMessage, BackendResponse,
-        BackendResponseMessage, ConfigSnapshot, Generation, IdentityPeer, IdentityRequest,
-        MissingProviderPolicy, PreparedResponse, RequestContext, RequestMode, ShellConfig,
-        ShellInvocation as BackendShellInvocation, DEVENV_BACKEND_PROTOCOL_VERSION,
+        BackendResponseMessage, BackendStatus, ConfigSnapshot, ControlPlaneState, Generation,
+        IdentityPeer, IdentityRequest, MissingProviderPolicy, RequestContext, RequestMode,
+        ShellConfig, ShellInvocation as BackendShellInvocation, DEVENV_BACKEND_PROTOCOL_VERSION,
     },
     dev_env_provider::{detect, workspace_fingerprint, SystemExecutableLocator},
     dev_env_shell::{build_invocation, ConfiguredShellAdapter, ShellInvocation},
-    libc::{
-        bind, c_char, close, connect, fchmod, fchown, fstat, listen, open, openat, sa_family_t,
-        sockaddr_un, stat, AF_UNIX, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_NOFOLLOW, O_RDONLY, O_RDWR,
-        SOCK_CLOEXEC, SOCK_STREAM, S_IFMT, S_IFREG,
-    },
+    libc::{sockaddr_un, socklen_t},
     serde_json::{json, to_string, Value as JsonValue},
     std::{
         collections::BTreeMap,
         env,
-        ffi::{CStr, CString},
-        fs::{self, File},
         io::{self, Read},
-        mem::{size_of_val, zeroed},
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::net::{UnixListener, UnixStream},
-        },
+        os::unix::net::{UnixListener, UnixStream},
         path::{Component, Path, PathBuf},
         process::{id, ExitStatus},
-        ptr::copy_nonoverlapping,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-        time::Duration,
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
 };
 
-#[cfg(target_os = "linux")]
-use {
-    libc::{getsockopt, socklen_t, ucred, SOL_SOCKET, SO_PEERCRED},
-    std::mem::size_of,
-};
-
 #[cfg(unix)]
-use libc::{c_int, getegid, geteuid, sighandler_t, signal, socket, SIGINT, SIGTERM};
+use libc::{c_int, getegid, geteuid, sighandler_t, signal, SIGINT, SIGTERM};
 
-pub const BACKEND_RUNTIME_DIRECTORY: &str = "/run/dev-env";
-pub const BACKEND_LOCK_NAME: &[u8] = b"backend.lock\0";
-pub const BACKEND_ABSTRACT_ENDPOINT: &[u8] = b"\0dev-env.backend.v4";
-pub const ENDPOINT_DISPLAY: &str = "@dev-env.backend.v4";
+pub const BACKEND_ABSTRACT_ENDPOINT: &[u8] = b"\0dev-env.backend.v5";
+pub const ENDPOINT_DISPLAY: &str = "@dev-env.backend.v5";
+pub const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_ACTIVE_CONNECTIONS: usize = 32;
 pub const MAX_ACTIVE_REQUESTS: usize = 16;
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,27 +44,7 @@ pub struct BackendTransport;
 
 impl BackendTransport {
     pub fn sockaddr_for(endpoint: &[u8]) -> io::Result<(sockaddr_un, socklen_t)> {
-        let mut address: sockaddr_un = unsafe { zeroed() };
-        let path_capacity = size_of_val(&address.sun_path);
-        if endpoint.first() != Some(&0)
-            || endpoint.len() > path_capacity
-            || endpoint[1..].contains(&0)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "abstract backend endpoint has invalid Linux sockaddr_un encoding",
-            ));
-        }
-        address.sun_family = AF_UNIX as sa_family_t;
-        unsafe {
-            copy_nonoverlapping(
-                endpoint.as_ptr().cast::<c_char>(),
-                address.sun_path.as_mut_ptr(),
-                endpoint.len(),
-            );
-        }
-        let address_length = (size_of::<sa_family_t>() + endpoint.len()) as socklen_t;
-        Ok((address, address_length))
+        AbstractEndpoint::from_abstract_bytes(endpoint)?.sockaddr()
     }
 
     pub fn bind() -> io::Result<UnixListener> {
@@ -88,29 +52,7 @@ impl BackendTransport {
     }
 
     pub fn bind_endpoint(endpoint: &[u8]) -> io::Result<UnixListener> {
-        let (address, address_length) = Self::sockaddr_for(endpoint)?;
-        let descriptor = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let bound = unsafe {
-            bind(
-                descriptor,
-                (&address as *const sockaddr_un).cast(),
-                address_length,
-            )
-        };
-        if bound != 0 {
-            let source = io::Error::last_os_error();
-            unsafe { close(descriptor) };
-            return Err(source);
-        }
-        if unsafe { listen(descriptor, MAX_ACTIVE_CONNECTIONS as c_int) } != 0 {
-            let source = io::Error::last_os_error();
-            unsafe { close(descriptor) };
-            return Err(source);
-        }
-        Ok(unsafe { UnixListener::from_raw_fd(descriptor) })
+        AbstractEndpoint::from_abstract_bytes(endpoint)?.bind(MAX_ACTIVE_CONNECTIONS as c_int)
     }
 
     pub fn connect() -> io::Result<UnixStream> {
@@ -118,24 +60,8 @@ impl BackendTransport {
     }
 
     pub fn connect_endpoint(endpoint: &[u8]) -> io::Result<UnixStream> {
-        let (address, address_length) = Self::sockaddr_for(endpoint)?;
-        let descriptor = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let connected = unsafe {
-            connect(
-                descriptor,
-                (&address as *const sockaddr_un).cast(),
-                address_length,
-            )
-        };
-        if connected != 0 {
-            let source = io::Error::last_os_error();
-            unsafe { close(descriptor) };
-            return Err(source);
-        }
-        Ok(unsafe { UnixStream::from_raw_fd(descriptor) })
+        let endpoint = AbstractEndpoint::from_abstract_bytes(endpoint)?;
+        endpoint.connect_until(Instant::now() + CONNECTION_TIMEOUT)
     }
 }
 
@@ -145,76 +71,69 @@ pub enum ConnectionRequestError {
     Protocol(BackendProtocolError),
 }
 
+struct StartupDeadline {
+    started_at: Instant,
+    deadline: Instant,
+}
+
+struct StartupObservation {
+    state: String,
+    phase: String,
+    transport_error: Option<String>,
+}
+
+enum StartupReadiness {
+    Ready,
+    Pending(StartupObservation),
+    Failed(CliError),
+}
+
+impl StartupDeadline {
+    fn new(timeout_ms: Option<u64>) -> Result<Self, CliError> {
+        let timeout_ms = match timeout_ms {
+            Some(timeout_ms) => timeout_ms,
+            None => match env::var("DEVENV_STARTUP_TIMEOUT_MS") {
+                Ok(value) => value.parse::<u64>().map_err(|_| {
+                    CliError::Backend(
+                        "DEVENV_STARTUP_TIMEOUT_MS must be a positive integer".to_owned(),
+                    )
+                })?,
+                Err(env::VarError::NotPresent) => DEFAULT_STARTUP_TIMEOUT_MS,
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(CliError::Backend(
+                        "DEVENV_STARTUP_TIMEOUT_MS must be valid UTF-8".to_owned(),
+                    ));
+                }
+            },
+        };
+        if timeout_ms == 0 {
+            return Err(CliError::Backend(
+                "startup timeout must be greater than zero milliseconds".to_owned(),
+            ));
+        }
+        let timeout = Duration::from_millis(timeout_ms);
+        let started_at = Instant::now();
+        let deadline = started_at.checked_add(timeout).ok_or_else(|| {
+            CliError::Backend("startup timeout exceeds the supported range".to_owned())
+        })?;
+        Ok(Self {
+            started_at,
+            deadline,
+        })
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+}
+
 pub struct BackendSupport;
 
 impl BackendSupport {
-    pub fn backend_lock() -> Result<File, CliError> {
-        fs::create_dir_all(BACKEND_RUNTIME_DIRECTORY).map_err(|source| {
-            CliError::Backend(format!(
-                "could not initialize root-managed backend runtime directory: {source}"
-            ))
-        })?;
-        let directory_path = CString::new(BACKEND_RUNTIME_DIRECTORY)
-            .expect("backend runtime directory has no embedded NUL");
-        let directory_descriptor = unsafe {
-            open(
-                directory_path.as_ptr(),
-                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
-            )
-        };
-        if directory_descriptor < 0 {
-            return Err(CliError::Backend(format!(
-                "could not open trusted backend runtime directory: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        let directory = unsafe { File::from_raw_fd(directory_descriptor) };
-        if unsafe { fchown(directory.as_raw_fd(), 0, 0) } != 0
-            || unsafe { fchmod(directory.as_raw_fd(), 0o700) } != 0
-        {
-            return Err(CliError::Backend(format!(
-                "could not secure backend runtime directory: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        let lock_name = CStr::from_bytes_with_nul(BACKEND_LOCK_NAME)
-            .expect("backend lock name must be NUL terminated");
-        let lock_descriptor = unsafe {
-            openat(
-                directory.as_raw_fd(),
-                lock_name.as_ptr(),
-                O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
-                0o600,
-            )
-        };
-        if lock_descriptor < 0 {
-            return Err(CliError::Backend(format!(
-                "could not open trusted backend instance lock: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        let lock = unsafe { File::from_raw_fd(lock_descriptor) };
-        let mut metadata: stat = unsafe { zeroed() };
-        if unsafe { fstat(lock.as_raw_fd(), &mut metadata) } != 0 {
-            return Err(CliError::Backend(format!(
-                "could not inspect backend instance lock: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        if metadata.st_mode & S_IFMT != S_IFREG || metadata.st_uid != 0 || metadata.st_nlink != 1 {
-            return Err(CliError::Backend(
-                "backend instance lock must be a root-owned regular file with one link".to_owned(),
-            ));
-        }
-        if unsafe { fchmod(lock.as_raw_fd(), 0o600) } != 0 {
-            return Err(CliError::Backend(format!(
-                "could not secure backend instance lock: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        Ok(lock)
-    }
-
     pub fn configured_allowed_peer_uid() -> Result<u32, CliError> {
         match env::var_os("CONTAINER_INIT_HANDOFF_UID") {
             Some(value) => value
@@ -309,46 +228,106 @@ impl BackendSupport {
         .map_err(|error| CliError::Backend(error.to_string()))
     }
 
-    pub fn prepare_inner(context: RequestContext) -> Result<PreparedResponse, CliError> {
-        let response = Self::request(BackendRequest::Prepare { context })?;
-        match response.response() {
-            BackendResponse::Prepared(prepared) => {
-                if !prepared.cwd.is_absolute()
-                    || !prepared.shell_invocation.executable.is_absolute()
-                    || prepared
-                        .shell_invocation
-                        .args
-                        .iter()
-                        .any(|arg| arg.contains('\0'))
-                {
-                    return Err(CliError::Backend(
-                        "backend returned an invalid prepared invocation".to_owned(),
-                    ));
-                }
-                prepared
-                    .materialized_environment
-                    .validate()
-                    .map_err(|error| CliError::Backend(error.to_string()))?;
-                Ok((**prepared).clone())
-            }
-            BackendResponse::Error(error) => Err(CliError::Backend(format!(
-                "{}: {}",
-                error.class(),
-                error.message()
-            ))),
-            other => Err(CliError::Backend(format!(
-                "backend returned unexpected response: {other:?}"
-            ))),
-        }
-    }
-
     pub fn request_backend_inner(
         message: BackendRequest,
     ) -> Result<BackendResponseMessage, CliError> {
-        Self::request(message)
+        Self::request_with_startup_timeout(message, None)
     }
 
     pub fn request(request: BackendRequest) -> Result<BackendResponseMessage, CliError> {
+        Self::request_once(request)
+    }
+
+    pub fn request_with_startup_timeout(
+        request: BackendRequest,
+        timeout_ms: Option<u64>,
+    ) -> Result<BackendResponseMessage, CliError> {
+        if matches!(
+            &request,
+            BackendRequest::Hello
+                | BackendRequest::Status
+                | BackendRequest::Reload { .. }
+                | BackendRequest::Stop
+        ) {
+            return Self::request_once(request);
+        }
+
+        let deadline = StartupDeadline::new(timeout_ms)?;
+        loop {
+            Self::await_until(&deadline)?;
+            match Self::request_once(request.clone()) {
+                Ok(response)
+                    if matches!(
+                        response.response(),
+                        BackendResponse::Error(error)
+                            if error.class() == "backend_starting" && error.retryable()
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+
+    pub fn await_backend_ready(timeout_ms: Option<u64>) -> Result<BackendStatus, CliError> {
+        Self::await_until(&StartupDeadline::new(timeout_ms)?)
+    }
+
+    fn await_until(deadline: &StartupDeadline) -> Result<BackendStatus, CliError> {
+        let mut delay = Duration::from_millis(20);
+        loop {
+            let observation = match Self::request_once(BackendRequest::Status) {
+                Ok(response) => match response.response() {
+                    BackendResponse::Status(status) => match startup_readiness(status) {
+                        StartupReadiness::Ready => return Ok(status.clone()),
+                        StartupReadiness::Pending(observation) => observation,
+                        StartupReadiness::Failed(error) => return Err(error),
+                    },
+                    BackendResponse::Error(error) => {
+                        return Err(CliError::Backend(format!(
+                            "{}: {}",
+                            error.class(),
+                            error.message()
+                        )));
+                    }
+                    other => {
+                        return Err(CliError::Backend(format!(
+                            "backend returned unexpected readiness response: {other:?}"
+                        )));
+                    }
+                },
+                Err(CliError::BackendUnavailable(error)) => StartupObservation {
+                    state: "unavailable".to_owned(),
+                    phase: "endpoint_not_available".to_owned(),
+                    transport_error: Some(error),
+                },
+                Err(error) => return Err(error),
+            };
+
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                let StartupObservation {
+                    state,
+                    phase,
+                    transport_error,
+                } = observation;
+                let transport = transport_error
+                    .map(|error| format!("; last transport error: {error}"))
+                    .unwrap_or_default();
+                return Err(CliError::BackendStartupTimeout(format!(
+                    "control plane did not become serving; last_state={state}, startup_phase={phase}, waited_ms={}{}",
+                    deadline.elapsed_ms(),
+                    transport
+                )));
+            }
+            let jitter = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|time| Duration::from_millis((time.subsec_nanos() % 11) as u64))
+                .unwrap_or_default();
+            thread::sleep((delay + jitter).min(remaining));
+            delay = (delay * 2).min(Duration::from_millis(250));
+        }
+    }
+
+    fn request_once(request: BackendRequest) -> Result<BackendResponseMessage, CliError> {
         let mut stream = BackendTransport::connect().map_err(|source| {
             CliError::BackendUnavailable(format!(
                 "BACKEND-TRANSPORT-UNAVAILABLE: cannot connect to {ENDPOINT_DISPLAY}: {source}"
@@ -376,6 +355,13 @@ impl BackendSupport {
             )),
             error => CliError::Backend(error.to_string()),
         })
+    }
+
+    pub fn print_status(status: BackendStatus) -> Result<(), CliError> {
+        let output = to_string(&BackendResponse::Status(status))
+            .map_err(|error| CliError::Backend(error.to_string()))?;
+        OutputApi::write_stdout(&format!("{output}\n"))
+            .map_err(|error| CliError::Backend(error.to_string()))
     }
 
     pub fn print_response(response: BackendResponseMessage) -> Result<(), CliError> {
@@ -562,32 +548,9 @@ impl BackendSupport {
 
     #[cfg(target_os = "linux")]
     pub fn peer_credentials(stream: &UnixStream) -> io::Result<IdentityPeer> {
-        let mut credentials = ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length = size_of::<ucred>() as socklen_t;
-        let result = unsafe {
-            getsockopt(
-                stream.as_raw_fd(),
-                SOL_SOCKET,
-                SO_PEERCRED,
-                (&mut credentials as *mut ucred).cast(),
-                &mut length,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if length as usize != size_of::<ucred>() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SO_PEERCRED returned an invalid credential size",
-            ));
-        }
+        let credentials = AbstractEndpoint::peer_credentials(stream)?;
         Ok(IdentityPeer {
-            pid: credentials.pid as u32,
+            pid: credentials.pid,
             uid: credentials.uid,
             gid: credentials.gid,
         })
@@ -630,7 +593,84 @@ impl BackendSupport {
     }
 }
 
+fn startup_readiness(status: &BackendStatus) -> StartupReadiness {
+    let observation = StartupObservation {
+        state: format!("{:?}", status.control_plane).to_lowercase(),
+        phase: status
+            .startup_phase
+            .clone()
+            .unwrap_or_else(|| "none".to_owned()),
+        transport_error: None,
+    };
+    match status.control_plane {
+        ControlPlaneState::Serving => StartupReadiness::Ready,
+        ControlPlaneState::Starting | ControlPlaneState::Reloading => {
+            StartupReadiness::Pending(observation)
+        }
+        ControlPlaneState::Failed => {
+            let detail = status
+                .initial_runtime_error
+                .as_deref()
+                .unwrap_or("backend startup failed");
+            StartupReadiness::Failed(CliError::Backend(format!(
+                "backend_startup_failed: {detail}"
+            )))
+        }
+        ControlPlaneState::Stopping => StartupReadiness::Failed(CliError::Backend(
+            "backend_stopping: backend is stopping".to_owned(),
+        )),
+    }
+}
+
 #[cfg(unix)]
 extern "C" fn signal_handler(_: c_int) {
     SIGNAL_REQUESTED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+#[test]
+fn readiness_waits_only_for_transient_states_and_fails_fast_on_terminal_states() {
+    use dev_env_model::InitialRuntimeState;
+
+    fn status(control_plane: ControlPlaneState) -> BackendStatus {
+        BackendStatus {
+            control_plane,
+            initial_runtime: InitialRuntimeState::Preparing,
+            startup_phase: Some("profile_loading".to_owned()),
+            initial_runtime_exit_code: None,
+            initial_runtime_error: Some("intentional test failure".to_owned()),
+            generation: Generation::INITIAL,
+            config_fingerprint: [0; 32],
+            backend_pid: 1,
+            active_requests: 0,
+        }
+    }
+
+    for state in [ControlPlaneState::Starting, ControlPlaneState::Reloading] {
+        assert!(matches!(
+            startup_readiness(&status(state)),
+            StartupReadiness::Pending(observation)
+                if observation.state == format!("{:?}", state).to_lowercase()
+                    && observation.phase == "profile_loading"
+                    && observation.transport_error.is_none()
+        ));
+    }
+    assert!(matches!(
+        startup_readiness(&status(ControlPlaneState::Serving)),
+        StartupReadiness::Ready
+    ));
+    assert!(matches!(
+        startup_readiness(&status(ControlPlaneState::Failed)),
+        StartupReadiness::Failed(error) if error.to_string().contains("intentional test failure")
+    ));
+    assert!(matches!(
+        startup_readiness(&status(ControlPlaneState::Stopping)),
+        StartupReadiness::Failed(error) if error.to_string().contains("backend_stopping")
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn default_backend_startup_timeout_is_sixty_seconds() {
+    assert_eq!(DEFAULT_STARTUP_TIMEOUT_MS, 60_000);
 }

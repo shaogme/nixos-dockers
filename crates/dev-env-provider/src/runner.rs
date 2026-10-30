@@ -1,5 +1,8 @@
 use crate::{
-    command::{CommandError, CommandExecutor, CommandOutput, CommandRequest, ProcessExecutor},
+    command::{
+        CommandError, CommandExecutor, CommandOutput, CommandRequest, ProcessExecutor,
+        ProviderProcessSupervisor,
+    },
     condition::ConditionEvaluator,
     context::ProviderContext,
     detect::{DetectionResult, ExecutableLocator, ProviderDetection, SystemExecutableLocator},
@@ -159,13 +162,10 @@ pub trait Provider: Send + Sync {
 
 impl Default for ProviderRunner {
     fn default() -> Self {
-        Self {
-            executor: Box::new(ProcessExecutor),
-            locator: Box::new(SystemExecutableLocator),
-            command_timeout: Duration::from_secs(300),
-            max_stdout_bytes: 1024 * 1024,
-            max_stderr_bytes: 64 * 1024,
-        }
+        Self::from_parts(
+            Box::new(ProviderProcessSupervisor::new().executor()),
+            Box::new(SystemExecutableLocator),
+        )
     }
 }
 
@@ -200,14 +200,25 @@ impl Provider for GenericProvider {
 }
 
 impl ProviderRunner {
+    fn from_parts(executor: Box<dyn CommandExecutor>, locator: Box<dyn ExecutableLocator>) -> Self {
+        Self {
+            executor,
+            locator,
+            command_timeout: Duration::from_secs(300),
+            max_stdout_bytes: 1024 * 1024,
+            max_stderr_bytes: 64 * 1024,
+        }
+    }
+
+    pub fn with_process_executor(executor: ProcessExecutor) -> Self {
+        Self::from_parts(Box::new(executor), Box::new(SystemExecutableLocator))
+    }
+
     pub fn with_executor<E>(executor: E) -> Self
     where
         E: CommandExecutor + 'static,
     {
-        Self {
-            executor: Box::new(executor),
-            ..Self::default()
-        }
+        Self::from_parts(Box::new(executor), Box::new(SystemExecutableLocator))
     }
 
     pub fn with_executor_and_locator<E, L>(executor: E, locator: L) -> Self
@@ -215,11 +226,7 @@ impl ProviderRunner {
         E: CommandExecutor + 'static,
         L: ExecutableLocator + 'static,
     {
-        Self {
-            executor: Box::new(executor),
-            locator: Box::new(locator),
-            ..Self::default()
-        }
+        Self::from_parts(Box::new(executor), Box::new(locator))
     }
 
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
@@ -578,7 +585,8 @@ fn command_failure_parts(error: &ProviderRuntimeError) -> CommandFailureInfo {
             | CommandError::InvalidProgram
             | CommandError::InvalidArgument
             | CommandError::InvalidEnvironment
-            | CommandError::InvalidTimeout => CommandFailureInfo {
+            | CommandError::InvalidTimeout
+            | CommandError::SupervisorStopped => CommandFailureInfo {
                 status: None,
                 timed_out: false,
                 stderr: Vec::new(),

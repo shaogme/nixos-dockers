@@ -5,13 +5,12 @@ use libc::{
     POLLNVAL, POLLOUT,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::{from_slice, to_vec, to_writer, Error as JsonError};
+use serde_json::{from_slice, to_writer, Error as JsonError};
 use std::{
     error::Error,
     fmt,
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
-    sync::{Arc, Condvar, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -57,22 +56,6 @@ impl From<io::Error> for FrameError {
     }
 }
 
-struct FrameBudgetInner {
-    capacity: usize,
-    in_flight: Mutex<usize>,
-    available: Condvar,
-}
-
-#[derive(Clone)]
-pub struct FrameBudget {
-    inner: Arc<FrameBudgetInner>,
-}
-
-pub struct FramePermit {
-    inner: Arc<FrameBudgetInner>,
-    weight: usize,
-}
-
 #[derive(Debug)]
 pub struct FrameWriteError {
     pub error: FrameError,
@@ -85,75 +68,9 @@ struct BoundedVecWriter {
     exceeded_length: Option<usize>,
 }
 
-impl FrameBudget {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            inner: Arc::new(FrameBudgetInner {
-                capacity,
-                in_flight: Mutex::new(0),
-                available: Condvar::new(),
-            }),
-        }
-    }
-
-    pub fn acquire(&self, weight: usize, deadline: Instant) -> io::Result<FramePermit> {
-        if weight > self.inner.capacity {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "frame reservation exceeds the process in-flight byte budget",
-            ));
-        }
-        let mut in_flight = self
-            .inner
-            .in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        loop {
-            if self.inner.capacity.saturating_sub(*in_flight) >= weight {
-                *in_flight += weight;
-                return Ok(FramePermit {
-                    inner: Arc::clone(&self.inner),
-                    weight,
-                });
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "frame in-flight byte budget deadline expired",
-                ));
-            }
-            let (next, timeout) = self
-                .inner
-                .available
-                .wait_timeout(in_flight, remaining)
-                .unwrap_or_else(PoisonError::into_inner);
-            in_flight = next;
-            if timeout.timed_out() && self.inner.capacity.saturating_sub(*in_flight) < weight {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "frame in-flight byte budget deadline expired",
-                ));
-            }
-        }
-    }
-}
-
-impl Drop for FramePermit {
-    fn drop(&mut self) {
-        let mut in_flight = self
-            .inner
-            .in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *in_flight = in_flight.saturating_sub(self.weight);
-        self.inner.available.notify_all();
-    }
-}
-
 /// Serialize a JSON payload and prepend its four-byte big-endian length.
 pub fn encode_json_frame<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, FrameError> {
-    let payload = to_vec(value).map_err(FrameError::Json)?;
+    let payload = serialize_bounded(value, limit)?;
     encode_payload_frame(&payload, limit)
 }
 
@@ -220,26 +137,6 @@ pub fn read_json_frame_until<T: DeserializeOwned>(
     from_slice(&payload).map_err(FrameError::Json)
 }
 
-pub fn read_json_frame_until_with_budget<T: DeserializeOwned>(
-    stream: &UnixStream,
-    deadline: Instant,
-    limit: usize,
-    budget: &FrameBudget,
-) -> Result<(T, FramePermit), FrameError> {
-    let mut header = [0_u8; 4];
-    read_exact_until(stream, &mut header, deadline)?;
-    let length = u32::from_be_bytes(header) as usize;
-    check_length(length, limit)?;
-    let weight = length
-        .checked_mul(2)
-        .ok_or(FrameError::TooLarge { length, limit })?;
-    let permit = budget.acquire(weight, deadline)?;
-    let mut payload = vec![0_u8; length];
-    read_exact_until(stream, &mut payload, deadline)?;
-    let value = from_slice(&payload).map_err(FrameError::Json)?;
-    Ok((value, permit))
-}
-
 /// Write a frame by an absolute deadline. The byte count includes the header
 /// and is used by clients to decide whether retrying is safe.
 pub fn write_json_frame_until<T: Serialize>(
@@ -256,46 +153,6 @@ pub fn write_json_frame_until<T: Serialize>(
         error,
         bytes_written,
     })
-}
-
-pub fn write_json_frame_until_with_budget<T: Serialize>(
-    stream: &UnixStream,
-    value: &T,
-    deadline: Instant,
-    limit: usize,
-    budget: &FrameBudget,
-) -> Result<usize, FrameWriteError> {
-    let weight = limit.saturating_mul(2);
-    let _permit = budget
-        .acquire(weight, deadline)
-        .map_err(|error| FrameWriteError {
-            error: FrameError::Io(error),
-            bytes_written: 0,
-        })?;
-    let payload = serialize_bounded(value, limit).map_err(|error| FrameWriteError {
-        error,
-        bytes_written: 0,
-    })?;
-    let length = u32::try_from(payload.len()).map_err(|_| FrameWriteError {
-        error: FrameError::LengthOverflow(payload.len()),
-        bytes_written: 0,
-    })?;
-    let header = length.to_be_bytes();
-    let header_written =
-        write_all_until(stream, &header, deadline).map_err(|(error, bytes_written)| {
-            FrameWriteError {
-                error,
-                bytes_written,
-            }
-        })?;
-    let payload_written =
-        write_all_until(stream, &payload, deadline).map_err(|(error, bytes_written)| {
-            FrameWriteError {
-                error,
-                bytes_written: header_written + bytes_written,
-            }
-        })?;
-    Ok(header_written + payload_written)
 }
 
 fn serialize_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, FrameError> {
@@ -484,7 +341,7 @@ fn wait_fd(fd: c_int, events: i16, deadline: Instant) -> Result<(), FrameError> 
 mod tests {
     use super::{
         read_json_frame, read_json_frame_until, write_json_frame, write_json_frame_until,
-        FrameBudget, FrameError,
+        FrameError,
     };
     use serde::{Deserialize, Serialize};
     use std::{io::Cursor, os::unix::net::UnixStream, time::Instant};
@@ -549,14 +406,5 @@ mod tests {
             failure.error,
             FrameError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
         ));
-    }
-
-    #[test]
-    fn frame_budget_releases_reserved_bytes_when_a_permit_is_dropped() {
-        let budget = FrameBudget::new(10);
-        let permit = budget.acquire(10, Instant::now()).unwrap();
-        assert!(budget.acquire(1, Instant::now()).is_err());
-        drop(permit);
-        assert!(budget.acquire(10, Instant::now()).is_ok());
     }
 }

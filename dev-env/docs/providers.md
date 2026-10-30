@@ -80,10 +80,16 @@ sensitivity = "public"
 | `warn` | 记录结构化 `PrepareFailed` diagnostic，继续后续流程 |
 | `ignore` | 记录 diagnostic，继续后续流程 |
 
-prepare 不使用跨进程锁文件。生产 backend 由 `MaterializationService` 按
-`MaterializationKey` 做 single-flight，并在成功后缓存 receipt；相同 workspace、身份、
-provider 和 detect fingerprint 的并发请求只执行一次。直接使用 provider runner 的库
-调用不提供跨进程协调保证，生产入口必须通过 backend。
+prepare 不使用跨进程锁文件。backend coordinator 独占 `MaterializationService` 的 cache 和
+in-flight 表，按 `MaterializationKey` 合并并发请求；成功结果进入有 TTL/LRU 与敏感值字节上限
+的 cache，失败结果只 fan-out 给当前 waiter，不会缓存。相同 key 的并发请求只执行一次。
+直接使用 provider runner 的库调用不会共享 backend cache 或 in-flight 表，生产入口必须通过
+backend。
+
+生产 backend 将 `ProcessExecutor` handle 注入所有 materializer。handle 把命令请求发送给单一
+`ProviderProcessSupervisor` actor；actor 负责 subreaper 初始化、spawn、超时清理、输出读取和
+adopted child 回收。不要为每个 provider 单独创建 supervisor，也不要在 actor 外调用
+`waitpid(-1)`。
 
 ### `shellenv`
 

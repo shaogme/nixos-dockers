@@ -36,6 +36,9 @@ command -v nix-build >/dev/null
 command -v nix-instantiate >/dev/null
 command -v script >/dev/null
 
+echo "==> validating runtime startup-timeout option"
+nix-instantiate --eval --strict --json "$root_dir/tests/runtime-static.nix" >/dev/null
+
 assert_contains() {
     local value="$1"
     local expected="$2"
@@ -186,6 +189,10 @@ test_loaded_image() {
         "$attr:latest" /bin/sleep 300 >/dev/null
     wait_for_running "$exec_container"
     wait_for_container_init_backend "$exec_container"
+    local readiness_output
+    readiness_output="$(docker exec "$exec_container" /usr/bin/dev-env backend wait-ready --startup-timeout 60000)"
+    assert_contains "$readiness_output" '"control_plane":"serving"'
+    assert_contains "$readiness_output" '"initial_runtime":"running"'
 
     exec_output="$(docker exec --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" bash -lc \
         'test "$USER" = dev && test "$HOME" = /home/dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID" && test "$(stat -c %u:%g /home/dev)" = "$EXPECTED_UID:$EXPECTED_GID"')"
@@ -206,8 +213,8 @@ test_loaded_image() {
     local transport_output
     transport_output="$(docker exec --user "$expected_uid:$expected_gid" --workdir /tmp \
         "$exec_container" /usr/bin/dev-env doctor --json)"
-    assert_contains "$transport_output" '"endpoint": "@dev-env.backend.v4"'
-    assert_contains "$transport_output" '"protocol": 4'
+    assert_contains "$transport_output" '"endpoint": "@dev-env.backend.v5"'
+    assert_contains "$transport_output" '"protocol": 5'
     assert_contains "$transport_output" '"peer_authorized": true'
     transport_output="$(docker exec --user "$expected_uid:$expected_gid" --workdir /tmp/dev-env-private \
         "$exec_container" /usr/bin/dev-env doctor --json)"
@@ -218,6 +225,20 @@ test_loaded_image() {
         return 1
     fi
     assert_contains "$transport_output" 'unauthorized'
+
+    echo "==> validating concurrent docker exec requests"
+    local -a concurrent_exec_pids=()
+    local index
+    for index in 1 2 3; do
+        docker exec --user "$expected_uid:$expected_gid" "$exec_container" \
+            /usr/bin/dev-env exec -- /bin/sh -c "printf concurrent-$index" \
+            > "$tmp_dir/concurrent-exec-$index.out" &
+        concurrent_exec_pids+=("$!")
+    done
+    for index in "${!concurrent_exec_pids[@]}"; do
+        wait "${concurrent_exec_pids[$index]}"
+        [[ "$(cat "$tmp_dir/concurrent-exec-$((index + 1)).out")" == "concurrent-$((index + 1))" ]]
+    done
 
     exec_output="$(printf '%s\n' 'printf "%s" "nixos-docker stdin handoff"' | docker exec -i "$exec_container" bash)"
     [[ "$exec_output" == 'nixos-docker stdin handoff' ]]

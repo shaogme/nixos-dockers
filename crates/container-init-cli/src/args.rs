@@ -14,7 +14,8 @@ pub struct CliOptions {
     pub default_profile_file: Option<PathBuf>,
     pub workspace: Option<PathBuf>,
     pub receipt_path: Option<PathBuf>,
-    pub backend_socket: Option<PathBuf>,
+    pub backend_endpoint: Option<String>,
+    pub backend_peer_uid: Option<u32>,
     pub request_timeout: Option<Duration>,
     pub inputs: Vec<(String, String)>,
 }
@@ -266,7 +267,8 @@ fn parse_common_option(
             | "--receipt-path"
             | "--input"
             | "--set"
-            | "--backend-socket"
+            | "--backend-endpoint"
+            | "--backend-peer-uid"
             | "--request-timeout-ms"
     );
     if !expects_value {
@@ -295,7 +297,14 @@ fn parse_common_option(
             options.default_profile_file = Some(PathBuf::from(value))
         }
         "--workspace" | "--cwd" => options.workspace = Some(PathBuf::from(value)),
-        "--backend-socket" => options.backend_socket = Some(PathBuf::from(value)),
+        "--backend-endpoint" => options.backend_endpoint = Some(value),
+        "--backend-peer-uid" => {
+            options.backend_peer_uid = Some(value.parse::<u32>().map_err(|_| {
+                ParseError::Invalid(format!(
+                    "option --backend-peer-uid must be an unsigned integer: {value:?}"
+                ))
+            })?);
+        }
         "--request-timeout-ms" => {
             let ms = value.parse::<u64>().map_err(|_| {
                 ParseError::Invalid(format!(
@@ -377,7 +386,8 @@ options:\n  \
     --default-profile PATH       read the default profile id from PATH\n  \
     --workspace PATH             use PATH as the runtime working directory\n  \
     --input NAME=VALUE           set a declared bootstrap runtime input (--set is an alias)\n  \
-    --backend-socket PATH        connect to the backend socket\n  \
+    --backend-endpoint NAME      connect to the Linux abstract backend endpoint\n  \
+    --backend-peer-uid UID       require this backend server UID\n  \
     --request-timeout-ms N       bound backend connection time\n  \
     --receipt-path PATH          write an execution receipt to PATH\n  \
     -h, --help                   show this help\n\n\

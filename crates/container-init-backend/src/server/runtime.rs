@@ -1,26 +1,15 @@
 use super::transaction::ExecTransaction;
-use crate::socket::BackendSocket;
 use container_init_bootstrap_model::{
     ActionKind, BootstrapConfig, Condition, ConditionValue, Plan,
 };
 use container_init_core::{CoreError, ExecutionOptions, ResolvedIdentity};
-use container_init_protocol::{
-    BackendError, BackendState, BackendStatus, MAX_IN_FLIGHT_FRAME_BYTES,
-};
-use libc::{getegid, geteuid};
+use container_init_protocol::{BackendError, BackendState, BackendStatus};
 use serde::Serialize;
 use serde_json::to_vec;
 use std::{
     collections::{BTreeSet, HashMap},
-    fs, io,
-    os::unix::fs::MetadataExt,
-    path::Path,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard, PoisonError, RwLock,
-    },
+    sync::Arc,
 };
-use unix_frame::FrameBudget;
 
 #[derive(Serialize)]
 struct SnapshotDescription<'a> {
@@ -56,11 +45,10 @@ pub(super) struct BackendRuntime {
     request_plan: Arc<Plan>,
     startup_identity: ResolvedIdentity,
     allowed: AllowedClientValues,
-    transactions: Mutex<HashMap<String, ExecTransaction>>,
+    transactions: HashMap<String, ExecTransaction>,
     execution_options: ExecutionOptions,
-    status: RwLock<BackendStatus>,
-    active_connections: Arc<AtomicUsize>,
-    frame_budget: FrameBudget,
+    status: BackendStatus,
+    active_connections: usize,
 }
 
 impl BackendRuntime {
@@ -74,21 +62,16 @@ impl BackendRuntime {
             request_plan: options.request_plan,
             startup_identity: options.startup_identity,
             allowed: options.allowed,
-            transactions: Mutex::new(HashMap::new()),
+            transactions: HashMap::new(),
             execution_options: options.execution_options,
-            status: RwLock::new(options.status),
-            active_connections: Arc::new(AtomicUsize::new(0)),
-            frame_budget: FrameBudget::new(MAX_IN_FLIGHT_FRAME_BYTES),
+            status: options.status,
+            active_connections: 0,
         }
     }
 
     pub(super) fn status(&self) -> BackendStatus {
-        let mut status = self
-            .status
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        status.active_connections = self.active_connections.load(Ordering::Relaxed);
+        let mut status = self.status.clone();
+        status.active_connections = self.active_connections;
         status
     }
 
@@ -140,35 +123,16 @@ impl BackendRuntime {
         &self.execution_options
     }
 
-    pub(super) fn active_connections(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.active_connections)
+    pub(super) fn set_active_connections(&mut self, count: usize) {
+        self.active_connections = count;
     }
 
-    pub(super) fn frame_budget(&self) -> &FrameBudget {
-        &self.frame_budget
+    pub(super) fn transactions(&mut self) -> &mut HashMap<String, ExecTransaction> {
+        &mut self.transactions
     }
 
-    pub(super) fn transactions(&self) -> MutexGuard<'_, HashMap<String, ExecTransaction>> {
-        self.transactions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    pub(super) fn mark_stopping(&self) {
-        self.status
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .state = BackendState::Stopping;
-    }
-
-    pub(super) fn prepare_lock_directory(path: &Path, owner_uid: u32) -> io::Result<()> {
-        let group_gid = if unsafe { geteuid() } == 0 {
-            owner_uid
-        } else {
-            unsafe { getegid() }
-        };
-        BackendSocket::ensure_socket_directory(path, owner_uid, group_gid, 0o700)?;
-        validate_lock_directory(&fs::symlink_metadata(path)?, owner_uid)
+    pub(super) fn mark_stopping(&mut self) {
+        self.status.state = BackendState::Stopping;
     }
 
     pub(super) fn startup_config(config: &BootstrapConfig) -> BootstrapConfig {
@@ -216,22 +180,6 @@ impl RuntimeErrors {
             path: None,
         }
     }
-}
-
-fn validate_lock_directory(metadata: &fs::Metadata, owner_uid: u32) -> io::Result<()> {
-    if !metadata.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "backend lock parent is not a real directory",
-        ));
-    }
-    if metadata.uid() != owner_uid || metadata.mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "backend lock parent has an unsafe owner or mode",
-        ));
-    }
-    Ok(())
 }
 
 fn startup_config(config: &BootstrapConfig) -> BootstrapConfig {

@@ -21,7 +21,6 @@ dev-env-model = { workspace = true }
 dev-env-provider = { workspace = true }
 dev-env-shell = { workspace = true }
 container-init-protocol = { workspace = true }
-fs2 = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

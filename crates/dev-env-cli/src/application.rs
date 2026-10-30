@@ -64,7 +64,10 @@ where
             ensure_backend_options(&options)?;
             let hash = TrustApi::digest(&target)?;
             let target = parse_trust_target(&target)?;
-            let response = BackendApi::request_backend(BackendRequest::Trust { target })?;
+            let response = BackendApi::request_backend_with_startup_timeout(
+                BackendRequest::Trust { target },
+                options.startup_timeout_ms,
+            )?;
             match response.response() {
                 BackendResponse::Trusted { .. } => {
                     OutputApi::write_stdout(&format!("trusted: {hash}\n"))?;
@@ -199,7 +202,7 @@ fn prepare_client(
     let context = RequestContext::new("client", mode, normalize_path(&cwd), shell)
         .with_shell_args(shell_args)
         .with_ambient_environment(ConfigApi::ambient_environment());
-    BackendApi::prepare(context)
+    BackendApi::prepare_with_startup_timeout(context, options.startup_timeout_ms)
 }
 
 fn prepared_command_line(prepared: &PreparedResponse) -> Result<CommandLine, CliError> {
@@ -245,7 +248,8 @@ fn run_backend_value(
         }
     }
     ensure_backend_options(options)?;
-    let response = BackendApi::request_backend(request)?;
+    let response =
+        BackendApi::request_backend_with_startup_timeout(request, options.startup_timeout_ms)?;
     let value = match response.response() {
         BackendResponse::Explain(value) | BackendResponse::Plan(value) => value,
         BackendResponse::Error(error) => {
@@ -276,7 +280,10 @@ fn run_doctor(options: &CliOptions, json: bool) -> Result<i32, CliError> {
         return OfflineApi::doctor(options, json);
     }
     ensure_backend_options(options)?;
-    let response = BackendApi::request_backend(BackendRequest::Doctor)?;
+    let response = BackendApi::request_backend_with_startup_timeout(
+        BackendRequest::Doctor,
+        options.startup_timeout_ms,
+    )?;
     let value = match response.response() {
         BackendResponse::Doctor(value) => value,
         BackendResponse::Error(error) => {

@@ -1,28 +1,20 @@
-use crate::socket::BackendSocket;
 use container_init_core::{HandoffCommand, IdentitySource, ResolvedIdentity, WorkspaceStatus};
 use container_init_protocol::{
     max_supplementary_groups, read_message_until, validate_argv, validate_message,
-    write_message_until, BackendError, BackendState, BackendStatus, ClientMessage, ClientRequest,
-    CommitResult as WireCommitResult, CwdObject, ExecTransactionState,
-    IdentitySource as WireIdentitySource, PlanPage, PreparedHandoff as WirePreparedHandoff,
-    ProtocolError, ProtocolLimits, ReceiptSummary, ServerMessage, ServerResponse,
-    WorkspaceStatus as WireWorkspaceStatus, MAX_PLAN_PAGE_ACTIONS, MAX_REQUEST_FRAME_BYTES,
-    MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
+    write_message_until, AbstractEndpoint, BackendError, BackendState, BackendStatus,
+    ClientMessage, ClientRequest, CommitResult as WireCommitResult, CwdObject,
+    ExecTransactionState, IdentitySource as WireIdentitySource, PlanPage,
+    PreparedHandoff as WirePreparedHandoff, ProtocolError, ProtocolLimits, ReceiptSummary,
+    ServerMessage, ServerResponse, WorkspaceStatus as WireWorkspaceStatus, MAX_PLAN_PAGE_ACTIONS,
+    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, PROTOCOL_VERSION,
 };
-use libc::{
-    c_char, c_int, connect, getegid, geteuid, getgroups, getsockopt, gid_t, poll, pollfd,
-    sa_family_t, sockaddr_un, socket, socklen_t, AF_UNIX, EAGAIN, EALREADY, EBADF, EINPROGRESS,
-    EINTR, POLLNVAL, POLLOUT, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET, SO_ERROR,
-};
+use libc::{getegid, geteuid, getgroups, gid_t};
 use serde_json::{self, json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fmt, fs, io, mem,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt, net::UnixStream},
-    },
+    fmt, io,
+    os::unix::net::UnixStream,
     path::{Component, PathBuf},
     ptr, thread,
     time::{Duration, Instant},
@@ -30,7 +22,8 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub struct BackendClient {
-    socket_path: PathBuf,
+    endpoint: AbstractEndpoint,
+    expected_peer_uid: u32,
     timeout: Duration,
 }
 
@@ -117,9 +110,10 @@ fn protocol_client_error(error: ProtocolError) -> BackendClientError {
 }
 
 impl BackendClient {
-    pub fn new(path: impl Into<PathBuf>, timeout: Duration) -> Self {
+    pub fn new(endpoint: AbstractEndpoint, expected_peer_uid: u32, timeout: Duration) -> Self {
         Self {
-            socket_path: path.into(),
+            endpoint,
+            expected_peer_uid,
             timeout,
         }
     }
@@ -464,57 +458,15 @@ impl BackendClient {
         if deadline <= Instant::now() {
             return Err(BackendClientError::TimedOut);
         }
-        BackendSocket::validate_socket_path(&self.socket_path)?;
-        let path = self.socket_path.as_os_str().as_bytes();
-        if path.is_empty() || path.contains(&0) {
-            return Err(BackendClientError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "backend socket path is empty or contains NUL",
-            )));
-        }
-        let mut address: sockaddr_un = unsafe { mem::zeroed() };
-        if path.len() >= address.sun_path.len() {
-            return Err(BackendClientError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "backend socket path exceeds the Unix socket path limit",
-            )));
-        }
-        address.sun_family = AF_UNIX as sa_family_t;
-        for (slot, byte) in address.sun_path.iter_mut().zip(path.iter().copied()) {
-            *slot = byte as c_char;
-        }
-        let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0) };
-        if fd < 0 {
-            return Err(BackendClientError::Io(io::Error::last_os_error()));
-        }
-        let stream = unsafe { UnixStream::from_raw_fd(fd) };
-        let address_length = (mem::size_of::<sa_family_t>() + path.len() + 1) as socklen_t;
-        let result = unsafe {
-            connect(
-                stream.as_raw_fd(),
-                (&address as *const sockaddr_un).cast(),
-                address_length,
-            )
-        };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(EINPROGRESS) | Some(EALREADY) | Some(EAGAIN) | Some(EINTR) => {
-                    wait_connect(stream.as_raw_fd(), deadline)?
-                }
-                _ => return Err(BackendClientError::Io(error)),
-            }
-        }
-        let peer = BackendSocket::peer_credentials(&stream)?;
-        let effective_uid = unsafe { geteuid() };
-        let socket_metadata = fs::symlink_metadata(&self.socket_path)?;
-        if socket_metadata.uid() != peer.uid
-            || (effective_uid == 0 && peer.uid != 0)
-            || (effective_uid != 0 && peer.uid != 0 && peer.uid != effective_uid)
-        {
+        let stream = self.endpoint.connect_until(deadline)?;
+        let peer = AbstractEndpoint::peer_credentials(&stream)?;
+        if peer.uid != self.expected_peer_uid {
             return Err(BackendClientError::Io(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "backend socket owner does not match its peer credentials",
+                format!(
+                    "backend peer UID {} does not match the expected UID {}",
+                    peer.uid, self.expected_peer_uid
+                ),
             )));
         }
         Ok(stream)
@@ -638,57 +590,6 @@ fn validate_plan_page(
         return Err(BackendClientError::UnexpectedResponse);
     }
     Ok(())
-}
-
-fn wait_connect(fd: c_int, deadline: Instant) -> Result<(), BackendClientError> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(BackendClientError::TimedOut);
-        }
-        let millis = remaining
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
-        let mut descriptor = pollfd {
-            fd,
-            events: POLLOUT,
-            revents: 0,
-        };
-        let result = unsafe { poll(&mut descriptor, 1, millis) };
-        if result > 0 {
-            if descriptor.revents & POLLNVAL != 0 {
-                return Err(BackendClientError::Io(io::Error::from_raw_os_error(EBADF)));
-            }
-            let mut socket_error: c_int = 0;
-            let mut length = mem::size_of_val(&socket_error) as socklen_t;
-            if unsafe {
-                getsockopt(
-                    fd,
-                    SOL_SOCKET,
-                    SO_ERROR,
-                    (&mut socket_error as *mut c_int).cast(),
-                    &mut length,
-                )
-            } != 0
-            {
-                return Err(BackendClientError::Io(io::Error::last_os_error()));
-            }
-            if socket_error == 0 {
-                return Ok(());
-            }
-            return Err(BackendClientError::Io(io::Error::from_raw_os_error(
-                socket_error,
-            )));
-        }
-        if result == 0 {
-            return Err(BackendClientError::TimedOut);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(BackendClientError::Io(error));
-        }
-    }
 }
 
 fn validate_prepared(
@@ -878,14 +779,15 @@ fn current_groups() -> Result<Vec<u32>, BackendClientError> {
 mod tests {
     use super::{BackendClient, BackendClientError};
     use container_init_protocol::{
-        read_message, write_message, BackendError, BackendState, ClientMessage, ClientRequest,
-        CommitResult as WireCommitResult, ExecTransactionState, HelloInfo, ProtocolLimits,
-        ReceiptSummary, ServerMessage, ServerResponse, PROTOCOL_VERSION,
+        read_message, write_message, AbstractEndpoint, BackendError, BackendState, ClientMessage,
+        ClientRequest, CommitResult as WireCommitResult, ExecTransactionState, HelloInfo,
+        ProtocolLimits, ReceiptSummary, ServerMessage, ServerResponse, PROTOCOL_VERSION,
     };
+    use libc::geteuid;
     use std::{
         collections::BTreeMap,
         io,
-        os::unix::net::UnixListener,
+        process::id,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -895,11 +797,47 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    static ENDPOINT_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+    fn unique_endpoint() -> AbstractEndpoint {
+        AbstractEndpoint::new(format!(
+            "container-init-backend-test.{}.{}",
+            id(),
+            ENDPOINT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn client_rejects_an_unexpected_server_uid_before_sending_a_frame() {
+        let endpoint = unique_endpoint();
+        let listener = endpoint.bind(4).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            assert!(read_message::<ClientMessage>(&mut stream).is_err());
+        });
+        let client = BackendClient::new(
+            endpoint,
+            unsafe { geteuid() }.saturating_add(1),
+            Duration::from_secs(1),
+        );
+        let error = client.status().unwrap_err();
+        assert!(matches!(
+            error,
+            BackendClientError::Io(ref source)
+                if source.kind() == io::ErrorKind::PermissionDenied
+        ));
+        worker.join().unwrap();
+    }
+
     #[test]
     fn prepare_timeout_includes_the_prepare_exchange() {
         let temp = TempDir::new().unwrap();
-        let socket = temp.path().join("backend.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let endpoint = unique_endpoint();
+        let listener = endpoint.bind(4).unwrap();
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _: ClientMessage = read_message(&mut stream).unwrap();
@@ -922,7 +860,7 @@ mod tests {
             thread::sleep(Duration::from_millis(150));
         });
 
-        let client = BackendClient::new(&socket, Duration::from_millis(80));
+        let client = BackendClient::new(endpoint, unsafe { geteuid() }, Duration::from_millis(80));
         let result = client.prepare(
             vec!["/bin/true".to_owned()],
             temp.path().to_path_buf(),
@@ -938,15 +876,14 @@ mod tests {
 
     #[test]
     fn status_read_uses_the_callers_short_absolute_deadline() {
-        let temp = TempDir::new().unwrap();
-        let socket = temp.path().join("backend.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let endpoint = unique_endpoint();
+        let listener = endpoint.bind(4).unwrap();
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _: ClientMessage = read_message(&mut stream).unwrap();
             thread::sleep(Duration::from_millis(120));
         });
-        let client = BackendClient::new(&socket, Duration::from_millis(500));
+        let client = BackendClient::new(endpoint, unsafe { geteuid() }, Duration::from_millis(500));
         let started = Instant::now();
         let result = client.status_until(started + Duration::from_millis(50));
         assert!(matches!(result, Err(BackendClientError::TimedOut)));
@@ -956,9 +893,8 @@ mod tests {
 
     #[test]
     fn commit_queries_the_original_token_when_the_first_reply_is_still_committing() {
-        let temp = TempDir::new().unwrap();
-        let socket = temp.path().join("backend.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let endpoint = unique_endpoint();
+        let listener = endpoint.bind(4).unwrap();
         let worker = thread::spawn(move || {
             let (mut commit, _) = listener.accept().unwrap();
             let message: ClientMessage = read_message(&mut commit).unwrap();
@@ -1004,7 +940,7 @@ mod tests {
             )
             .unwrap();
         });
-        let client = BackendClient::new(&socket, Duration::from_secs(1));
+        let client = BackendClient::new(endpoint, unsafe { geteuid() }, Duration::from_secs(1));
         let result = client
             .commit_until("aabb", Instant::now() + Duration::from_secs(1))
             .unwrap();
@@ -1016,8 +952,8 @@ mod tests {
     #[test]
     fn prepare_does_not_retry_after_a_prepare_frame_is_sent() {
         let temp = TempDir::new().unwrap();
-        let socket = temp.path().join("backend.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let endpoint = unique_endpoint();
+        let listener = endpoint.bind(4).unwrap();
         listener.set_nonblocking(true).unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let observed = requests.clone();
@@ -1063,7 +999,7 @@ mod tests {
                 }
             }
         });
-        let client = BackendClient::new(&socket, Duration::from_millis(300));
+        let client = BackendClient::new(endpoint, unsafe { geteuid() }, Duration::from_millis(300));
         let result = client.prepare(
             vec!["/bin/true".into()],
             temp.path().to_path_buf(),
@@ -1078,8 +1014,8 @@ mod tests {
     #[test]
     fn prepare_retries_only_a_backend_error_that_guarantees_no_dispatch() {
         let temp = TempDir::new().unwrap();
-        let socket = temp.path().join("backend.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let endpoint = unique_endpoint();
+        let listener = endpoint.bind(4).unwrap();
         let worker = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
             let _: ClientMessage = read_message(&mut first).unwrap();
@@ -1133,7 +1069,7 @@ mod tests {
             let _: ClientMessage = read_message(&mut second).unwrap();
             thread::sleep(Duration::from_millis(80));
         });
-        let client = BackendClient::new(&socket, Duration::from_millis(40));
+        let client = BackendClient::new(endpoint, unsafe { geteuid() }, Duration::from_millis(40));
         let result = client.prepare(
             vec!["/bin/true".into()],
             temp.path().to_path_buf(),

@@ -1,3 +1,4 @@
+mod abstract_endpoint;
 mod client;
 mod protocol_types;
 
@@ -10,10 +11,10 @@ use std::{
     time::Instant,
 };
 use unix_frame::{
-    read_json_frame, read_json_frame_until, read_json_frame_until_with_budget, write_json_frame,
-    write_json_frame_until, write_json_frame_until_with_budget, FrameBudget, FrameError,
+    read_json_frame, read_json_frame_until, write_json_frame, write_json_frame_until, FrameError,
 };
 
+pub use abstract_endpoint::AbstractEndpoint;
 pub use client::{IdentityBrokerClient, IdentityBrokerError};
 pub use protocol_types::{
     BackendError, BackendState, BackendStatus, ClientMessage, ClientRequest, CommitResult,
@@ -21,11 +22,12 @@ pub use protocol_types::{
     IdentitySource, PeerCredentials, PlanPage, PreparedHandoff, PreparedIdentity, ProtocolError,
     ProtocolLimits, ReceiptSummary, ResolvedIdentity, ServerMessage, ServerResponse,
     WorkspaceStatus, FRAME_TIMEOUT_MS, MAX_ARGV_ITEMS, MAX_ARGV_ITEM_BYTES, MAX_ARGV_TOTAL_BYTES,
-    MAX_CWD_BYTES, MAX_ENVIRONMENT_NAMES, MAX_IN_FLIGHT_FRAME_BYTES, MAX_PLAN_PAGE_ACTIONS,
-    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, MAX_RUNTIME_INPUTS,
-    MAX_RUNTIME_VALUES_TOTAL_BYTES, MAX_RUNTIME_VALUE_BYTES, PROTOCOL_VERSION,
+    MAX_CWD_BYTES, MAX_ENVIRONMENT_NAMES, MAX_PLAN_PAGE_ACTIONS, MAX_REQUEST_FRAME_BYTES,
+    MAX_RESPONSE_FRAME_BYTES, MAX_RUNTIME_INPUTS, MAX_RUNTIME_VALUES_TOTAL_BYTES,
+    MAX_RUNTIME_VALUE_BYTES, PROTOCOL_VERSION,
 };
-pub use unix_frame::FramePermit;
+
+pub const DEFAULT_CONTAINER_INIT_BACKEND_ENDPOINT: &str = "container-init.backend.v4";
 
 pub fn max_supplementary_groups() -> usize {
     ProtocolLimits::max_supplementary_groups()
@@ -52,15 +54,6 @@ pub fn read_message_until<T: for<'de> Deserialize<'de>>(
     read_json_frame_until(stream, deadline, limit).map_err(map_frame_error)
 }
 
-pub fn read_message_until_with_budget<T: for<'de> Deserialize<'de>>(
-    stream: &mut UnixStream,
-    deadline: Instant,
-    limit: usize,
-    budget: &FrameBudget,
-) -> Result<(T, FramePermit), ProtocolError> {
-    read_json_frame_until_with_budget(stream, deadline, limit, budget).map_err(map_frame_error)
-}
-
 pub fn write_message<T: Serialize>(
     writer: &mut impl Write,
     message: &T,
@@ -77,21 +70,6 @@ pub fn write_message_until<T: Serialize>(
     write_json_frame_until(stream, message, deadline, limit).map_err(|error| FrameWriteError {
         error: map_frame_error(error.error),
         bytes_written: error.bytes_written,
-    })
-}
-
-pub fn write_message_until_with_budget<T: Serialize>(
-    stream: &mut UnixStream,
-    message: &T,
-    deadline: Instant,
-    limit: usize,
-    budget: &FrameBudget,
-) -> Result<usize, FrameWriteError> {
-    write_json_frame_until_with_budget(stream, message, deadline, limit, budget).map_err(|error| {
-        FrameWriteError {
-            error: map_frame_error(error.error),
-            bytes_written: error.bytes_written,
-        }
     })
 }
 

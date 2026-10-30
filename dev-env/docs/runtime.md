@@ -6,15 +6,17 @@
 
 生产容器只启动一个 `dev-env backend run`。该进程由 `container-init` 以 root supervisor
 身份 handoff，backend 在 startup/reload 读取 profile，创建
-不可变 snapshot，并持有 materializer、provider supervisor 和内存 cache。`exec`、`shell`、
+不可变 snapshot，并持有 materializer、provider supervisor 和内存 cache。control plane 在
+profile、snapshot、materializer、identity broker 检查和 endpoint 初始化完成后进入 `serving`；
+初始 shell/service 的准备和 spawn 由独立状态机报告，不阻塞 control plane。`exec`、`shell`、
 `login-shell`、shim 和 `print` 都是短命 client，只发送请求上下文，不读取 profile，也不
 直接启动 provider：
 
 ```text
 client 采集 cwd、shell、identity、runtime inputs 和允许的 ambient env
   ↓
-连接 Linux abstract endpoint @dev-env.backend.v4；身份通过独立的
-/run/container-init/backend.sock PrepareIdentity RPC 解析
+连接 Linux abstract endpoint @dev-env.backend.v5；身份通过共享的
+@container-init.backend.v4 PrepareIdentity RPC 解析
   ↓
 backend 校验 peer 和 snapshot policy
   ↓
@@ -41,6 +43,18 @@ fingerprint 缓存。`reload` 替换 snapshot 并清空旧 cache。没有 backen
 `DEVENV-E-BACKEND-UNAVAILABLE`，不会隐式启动实例。任何命令如需离线读取文件，必须显式传入
 `--offline`；生产入口默认不会回退到本地 profile。
 
+初始 runtime 物化期间，`backend status --json` 会显示 `control_plane: serving` 和
+`initial_runtime: preparing`；成功 spawn 后显示 `initial_runtime: running`。普通 `Prepare`
+请求可在初始 runtime 准备期间并行进入 materializer，同 key 请求共享 single-flight 结果。
+`backend status` 保持即时返回；`backend wait-ready` 等到 control plane 可服务并输出当前
+初始 runtime 状态。
+
+backend coordinator 是 snapshot、control plane、计数器、initial runtime 状态及 materialization
+cache/in-flight 表的唯一所有者。connection reader 只认证 peer、解析请求并发送消息；物化任务
+在 worker 中运行，完成事件回到 coordinator 后再更新 cache 和回复所有 waiter。provider 命令
+通过 backend 共享的 `ProviderProcessSupervisor` actor 执行；actor 独占 subreaper 初始化、子进程
+创建和 `waitpid(-1)` 回收，避免并发工作互相回收 direct child。
+
 ## 2. 命令总览
 
 ```text
@@ -55,26 +69,33 @@ dev-env trust <path|sha256>
 dev-env backend run [OPTIONS] --initial-shell
 dev-env backend run [OPTIONS] --initial-exec -- <command> [args...]
 dev-env backend status [--json]
+dev-env backend wait-ready [--startup-timeout MS]
 dev-env backend reload [--wait]
 dev-env backend stop
 dev-env version
 ```
 
-`backend run` 在启动时一次加载并校验 profile，持有 `/run/dev-env/backend.lock`，并
-通过固定的 Linux abstract endpoint `@dev-env.backend.v4` 提供 protocol v4 请求，错误
-envelope 使用 `error_version = 2`。`/run/dev-env` 仅用于 root 管理的 `backend.lock`，目录
-模式为 `0700`，lock 文件模式为 `0600`；客户端连接不访问该目录，也不依赖 supplementary
-groups。abstract endpoint 随 backend 进程关闭而释放，不创建或清理 filesystem socket。
-第二个 `backend run` 只返回已有实例状态；若锁被占用但 endpoint 无法连接，则报告
-`BACKEND-INSTANCE-CONFLICT`。`backend reload` 成功后才替换 snapshot 并递增 generation，
-失败时保留旧 snapshot。
+`backend run` 在读取 profile 前绑定固定的 Linux abstract endpoint
+`@dev-env.backend.v5`，提供 protocol v5 请求，错误 envelope 使用 `error_version = 2`。
+Linux 对同名 abstract socket 的重复 `bind` 会失败；第二个 `backend run` 尝试查询现有实例，
+查询失败时返回 `BACKEND-INSTANCE-CONFLICT`。endpoint 随 backend 进程退出自动释放，不创建
+lock 文件或 filesystem socket。客户端连接不访问 `/run/dev-env`，也不依赖 supplementary
+groups。backend protocol 版本常量仍为 v5 和 v2；部署时应一起升级匹配的 dev-env client 与
+server，不应混用不同发布版本的二进制。
+
+`backend reload` 进入 `reloading` 后拒绝新的 Prepare，等待已开始的物化任务完成再加载候选
+snapshot。成功后替换 snapshot、递增 generation 并清空旧 cache；加载失败时恢复 `serving`，
+继续使用旧 snapshot 和 cache。
 
 服务端在读取 frame 前通过 Linux `SO_PEERCRED` 取得 peer UID。root 与启动时固定的
 `CONTAINER_INIT_HANDOFF_UID` 可以使用普通请求；`Trust`、`Reload` 和 `Stop` 仍仅允许 root。
 UID 不匹配时返回 `BACKEND-PEER-REJECTED`，不解析客户端 payload。无法建立连接时报告
 `BACKEND-TRANSPORT-UNAVAILABLE`；协议版本不符时报告 `BACKEND-PROTOCOL-MISMATCH`。
-`dev-env doctor` 的 `backend_transport` 字段显示 endpoint、v4 握手结果和当前 peer UID
-授权状态。identity broker 仍使用自己的 filesystem socket；其路径和配置与 dev-env
+`dev-env doctor` 的 `backend_transport` 字段显示 endpoint、v5 握手结果和当前 peer UID
+授权状态。identity broker 复用 container-init v4 endpoint，并读取
+`CONTAINER_INIT_BACKEND_ENDPOINT` 与 `CONTAINER_INIT_BACKEND_PEER_UID`。它连接后先用
+`SO_PEERCRED` 精确验证预期 UID，再发送 Hello 或 PrepareIdentity；NixOS runtime 将 endpoint
+设为 `container-init.backend.v4`、peer UID 设为 `0`。
 
 通用选项可以放在 command 前，也可在支持它的子命令中使用：
 
@@ -89,10 +110,15 @@ UID 不匹配时返回 `BACKEND-PEER-REJECTED`，不解析客户端 payload。�
 --set PATH=VALUE
 --unset PATH
 --offline
+--startup-timeout MS
 ```
 
 profile、overlay、`--set`、`--unset` 和 workspace 选项只允许用于 `backend run`/`reload`
 或显式 `--offline`；普通 client 从 backend snapshot 获取配置。
+
+`DEVENV_STARTUP_TIMEOUT_MS` 默认是 `60000`。支持 backend 的客户端命令可用
+`--startup-timeout MS` 覆盖该次等待；deadline 只覆盖 endpoint 出现和 control plane 进入
+`serving` 的时间，不限制之后的 provider/materialization 请求。
 
 ### `exec`
 
@@ -242,7 +268,7 @@ ENTRYPOINT ["/usr/bin/container-init", "run", "--"]
 ```
 
 `container-init` backend 先做一次 bootstrap namespace 的 identity/filesystem/SSH action，
-然后通过 Unix socket 为后续 handoff 提供同一份 snapshot：
+然后通过 `@container-init.backend.v4` 为后续 handoff 提供同一份 snapshot：
 
 ```text
 无显式 command: /usr/bin/dev-env backend run --initial-shell

@@ -1,11 +1,13 @@
+mod parse_error;
+
+pub use parse_error::ParseError;
+
 use {
     dev_env_loader::CliPatch,
     dev_env_model::{OverrideOperation, OverrideSpec, ValueTree},
     std::{
         env::var_os,
-        error::Error,
         ffi::OsString,
-        fmt::{Display, Formatter, Result as FmtResult},
         path::{Path, PathBuf},
     },
 };
@@ -20,6 +22,7 @@ pub enum BackendInitial {
 pub enum BackendCommand {
     Run { initial: BackendInitial },
     Status { json: bool },
+    WaitReady,
     Reload { wait: bool },
     Stop,
 }
@@ -82,6 +85,7 @@ pub struct CliOptions {
     pub patches: Vec<CliPatch>,
     pub show_secrets: bool,
     pub offline: bool,
+    pub startup_timeout_ms: Option<u64>,
 }
 
 const DEFAULT_REAL_SHELL: &str = "/usr/local/libexec/dev-env/real/bash";
@@ -91,62 +95,6 @@ pub struct Cli {
     options: CliOptions,
     command: CliCommand,
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ParseError {
-    MissingCommand,
-    UnknownCommand { command: String },
-    UnknownOption { option: String },
-    MissingValue { option: String },
-    EmptyValue { option: String },
-    InvalidUtf8 { index: usize },
-    InvalidAssignment { option: String, value: String },
-    InvalidFormat { value: String },
-    MissingRequiredOption { command: String, option: String },
-    UnexpectedArgument { command: String, argument: String },
-    MultipleArguments { command: String },
-}
-
-impl Display for ParseError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        match self {
-            Self::MissingCommand => write!(formatter, "missing command\n\n{}", usage("")),
-            Self::UnknownCommand { command } => {
-                write!(formatter, "unknown command {command:?}\n\n{}", usage(""))
-            }
-            Self::UnknownOption { option } => {
-                write!(formatter, "unknown option {option:?}\n\n{}", usage(""))
-            }
-            Self::MissingValue { option } => write!(formatter, "option {option} requires a value"),
-            Self::EmptyValue { option } => {
-                write!(formatter, "option {option} requires a non-empty value")
-            }
-            Self::InvalidUtf8 { index } => {
-                write!(formatter, "argument {index} must be valid UTF-8")
-            }
-            Self::InvalidAssignment { option, value } => write!(
-                formatter,
-                "option {option} value {value:?} must have the form PATH=VALUE"
-            ),
-            Self::InvalidFormat { value } => write!(
-                formatter,
-                "unknown environment format {value:?}; expected dotenv, json, or shell"
-            ),
-            Self::MissingRequiredOption { command, option } => {
-                write!(formatter, "command {command} requires {option}")
-            }
-            Self::UnexpectedArgument { command, argument } => write!(
-                formatter,
-                "unexpected argument {argument:?} for command {command:?}"
-            ),
-            Self::MultipleArguments { command } => {
-                write!(formatter, "command {command:?} accepts only one argument")
-            }
-        }
-    }
-}
-
-impl Error for ParseError {}
 
 impl Cli {
     pub fn options(&self) -> &CliOptions {
@@ -162,7 +110,7 @@ impl Cli {
     }
 
     pub fn usage(reason: &str) -> String {
-        usage(reason)
+        ParseError::usage(reason)
     }
 
     pub fn parse<I>(arguments: I) -> Result<Self, ParseError>
@@ -354,6 +302,22 @@ fn parse_backend(
             }
             Ok(CliCommand::Backend {
                 command: BackendCommand::Status { json: true },
+            })
+        }
+        "wait-ready" => {
+            while index < arguments.len() {
+                let argument = text_argument(arguments, index)?;
+                if is_common_option(argument) {
+                    parse_common_option(arguments, &mut index, options)?;
+                } else {
+                    return Err(ParseError::UnexpectedArgument {
+                        command: "backend wait-ready".to_owned(),
+                        argument: argument.to_owned(),
+                    });
+                }
+            }
+            Ok(CliCommand::Backend {
+                command: BackendCommand::WaitReady,
             })
         }
         "reload" => {
@@ -695,6 +659,15 @@ fn parse_common_option(
             options.offline = true;
             *index += 1;
         }
+        "--startup-timeout" => {
+            let raw = value(index)?;
+            let timeout = raw
+                .parse::<u64>()
+                .ok()
+                .filter(|timeout| *timeout > 0)
+                .ok_or(ParseError::InvalidStartupTimeout { value: raw })?;
+            options.startup_timeout_ms = Some(timeout);
+        }
         _ => {
             return Err(ParseError::UnknownOption {
                 option: name.to_owned(),
@@ -718,6 +691,7 @@ fn is_common_option(argument: &str) -> bool {
         "--set",
         "--unset",
         "--offline",
+        "--startup-timeout",
     ]
     .iter()
     .any(|name| argument == *name || argument.starts_with(&format!("{name}=")))
@@ -780,41 +754,4 @@ fn text_argument(arguments: &[OsString], index: usize) -> Result<&str, ParseErro
 
 fn is_help(argument: &str) -> bool {
     matches!(argument, "-h" | "--help")
-}
-
-fn usage(reason: &str) -> String {
-    let prefix = if reason.is_empty() {
-        String::new()
-    } else {
-        format!("{reason}\n\n")
-    };
-    format!(
-        "{prefix}usage: dev-env [OPTIONS] <COMMAND> [ARGS...]\n\n\
-options:\n  \
-    --profile ID                 select the profile id\n  \
-    --profiles-dir PATH          load image profiles from PATH\n  \
-    --admin-profiles-dir PATH    load trusted admin profiles from PATH\n  \
-    --default-profile-file PATH read the default profile id from PATH\n  \
-    --workspace PATH             use PATH as the workspace root\n  \
-    --cwd PATH                   run the session from PATH\n  \
-    --config PATH                add an explicit workspace overlay\n  \
-    --set PATH=VALUE             set an allowed configuration value\n  \
-    --unset PATH                 unset an allowed configuration value\n  \
-    --offline                    use the file loader for diagnostics/tests\n  \
-    -h, --help                   show this help\n\n\
-commands:\n  \
-    exec [--] COMMAND [ARGS...]  execute a command with the materialized environment\n  \
-    shell [OPTIONS]              enter the configured shell\n  \
-    login-shell [--] [ARGS...]   SSH-compatible login shell entry point\n  \
-    shim --shell ID --real PATH  execute a real shell through the materializer\n  \
-    print [OPTIONS]              print the materialized environment (--json is an alias)\n  \
-    explain [PATH]               show configuration and provenance\n  \
-    doctor [--json]              check configuration and runtime paths\n  \
-    trust PATH_OR_HASH           record or inspect a workspace config hash\n  \
-    backend run [OPTIONS]       start the single-instance backend\n  \
-    backend status [--json]     query backend state\n  \
-    backend reload [--wait]     reload the backend snapshot\n  \
-    backend stop                 stop the backend\n  \
-    version                      print the dev-env version"
-    )
 }

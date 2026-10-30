@@ -6,4 +6,5 @@ WORKDIR /workspace/nixos-dockers
 COPY . .
 
 RUN cargo test --locked -p dev-env-cli --test docker --no-run
-CMD ["cargo", "test", "--locked", "-p", "dev-env-cli", "--test", "docker", "--", "--nocapture"]
+RUN cargo test --locked -p dev-env-cli --test backend_startup --no-run
+CMD ["sh", "-c", "cargo test --locked -p dev-env-cli --test docker -- --nocapture && cargo test --locked -p dev-env-cli --test backend_startup -- --nocapture"]

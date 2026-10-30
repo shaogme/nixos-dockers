@@ -1,17 +1,8 @@
 use container_init_posix::{
-    is_writable, mode, parse_mountinfo, set_mode, NamespaceMap, PosixIdentity, PosixLock,
-    PosixSystem,
+    is_writable, mode, parse_mountinfo, set_mode, NamespaceMap, PosixIdentity, PosixSystem,
 };
 use libc::{_exit, fork, waitpid};
-use std::{
-    fs,
-    io::ErrorKind,
-    os::unix::fs::MetadataExt,
-    path::Path,
-    sync::mpsc::channel,
-    thread::{sleep, spawn},
-    time::{Duration, Instant},
-};
+use std::{fs, os::unix::fs::MetadataExt, path::Path};
 use tempfile::TempDir;
 
 #[test]
@@ -119,7 +110,7 @@ fn malformed_account_entries_are_not_overwritten() {
 }
 
 #[test]
-fn ownership_modes_and_locking_use_real_posix_primitives() {
+fn ownership_modes_and_writability_use_real_posix_primitives() {
     let temp = TempDir::new().unwrap();
     let file = temp.path().join("state");
     fs::write(&file, "state\n").unwrap();
@@ -132,49 +123,8 @@ fn ownership_modes_and_locking_use_real_posix_primitives() {
     assert_eq!(fs::metadata(&file).unwrap().uid(), uid);
     assert_eq!(fs::metadata(&file).unwrap().gid(), gid);
 
-    let lock_path = temp.path().join("bootstrap.lock");
-    let lock = PosixLock::acquire(&lock_path).unwrap();
-    let error = PosixLock::try_acquire(&lock_path).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-    drop(lock);
-    let _lock = PosixLock::acquire(&lock_path).unwrap();
-
     assert!(is_writable(temp.path()));
     assert!(is_writable(&temp.path().join("not-created-yet")));
-}
-
-#[test]
-fn posix_lock_retries_and_acquires_after_release() {
-    let temp = TempDir::new().unwrap();
-    let lock_path = temp.path().join("retry.lock");
-    let (tx, rx) = channel();
-    let thread_lock_path = lock_path.clone();
-
-    let handle = spawn(move || {
-        let lock = PosixLock::acquire(&thread_lock_path).unwrap();
-        tx.send(()).unwrap();
-        sleep(Duration::from_millis(50));
-        drop(lock);
-    });
-
-    rx.recv().unwrap();
-    let started = Instant::now();
-    let lock = PosixLock::acquire(&lock_path).unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(30));
-    drop(lock);
-    handle.join().unwrap();
-}
-
-#[test]
-fn posix_lock_times_out_when_held() {
-    let temp = TempDir::new().unwrap();
-    let lock_path = temp.path().join("timeout.lock");
-    let lock = PosixLock::acquire(&lock_path).unwrap();
-    let started = Instant::now();
-    let error = PosixLock::acquire_with_timeout(&lock_path, Duration::from_millis(50)).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::WouldBlock);
-    assert!(started.elapsed() >= Duration::from_millis(40));
-    drop(lock);
 }
 
 #[test]

@@ -1,8 +1,8 @@
 use crate::{ActionChange, PosixError};
-use libc::{chown, gid_t, lchown, uid_t};
+use libc::{access, chown, gid_t, lchown, uid_t, W_OK};
 use std::{
     ffi::{CString, OsStr},
-    fs::{self, OpenOptions},
+    fs::{self, metadata, OpenOptions},
     io::{self, Write},
     os::unix::{
         ffi::OsStrExt,
@@ -30,6 +30,16 @@ impl Filesystem {
 
     pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+
+    pub(crate) fn is_writable(path: &Path) -> bool {
+        let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        (unsafe { access(c_path.as_ptr(), W_OK) == 0 })
+            || path
+                .parent()
+                .is_some_and(|parent| metadata(path).is_err() && Self::is_writable(parent))
     }
 
     pub(crate) fn chown(

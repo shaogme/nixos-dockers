@@ -43,7 +43,6 @@ dev-env-shell = { path = "crates/dev-env-shell" }
 profile-graph = { path = "crates/profile-graph" }
 unix-frame = { path = "crates/unix-frame" }
 
-fs2 = "0.4"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

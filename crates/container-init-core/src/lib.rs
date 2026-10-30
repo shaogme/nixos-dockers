@@ -14,7 +14,6 @@ mod filesystem;
 mod handoff;
 mod identity;
 mod report;
-mod resource_lock;
 mod ssh;
 
 pub use condition::ConditionContext;
@@ -28,7 +27,4 @@ pub use identity::{
     RuntimeInput, WorkspaceStatus,
 };
 pub use report::{ActionOutcome, ActionStatus, ExecutionOptions, ExecutionReport, PreparedExec};
-pub use resource_lock::{
-    PathScope, ProcessNamespace, ResourceKey, ResourceLockGuard, ResourceLockManager,
-};
 pub use ssh::SshCapability;

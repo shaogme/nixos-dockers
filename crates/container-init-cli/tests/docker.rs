@@ -1,5 +1,6 @@
 use container_init_backend::BackendClient;
 use container_init_core::{PosixSystem, SshCapability};
+use container_init_protocol::AbstractEndpoint;
 use libc::{kill, SIGTERM};
 use serde_json::{from_slice, Value};
 use std::{
@@ -98,7 +99,7 @@ depends_on = ["directory"]
             "docker",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             lock.to_str().unwrap(),
             "plan",
             "--json",
@@ -130,7 +131,7 @@ depends_on = ["directory"]
             "docker",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             lock.to_str().unwrap(),
             "--receipt-path",
             receipt.to_str().unwrap(),
@@ -238,7 +239,7 @@ depends_on = ["resolve"]
         "ssh",
         "--workspace",
         workspace.to_str().unwrap(),
-        "--backend-socket",
+        "--backend-endpoint",
         lock.to_str().unwrap(),
     ];
     let plan = Command::new(&binary)
@@ -361,7 +362,7 @@ depends_on = ["resolve"]
         "cgroup",
         "--workspace",
         workspace.to_str().unwrap(),
-        "--backend-socket",
+        "--backend-endpoint",
         lock.to_str().unwrap(),
         "--receipt-path",
         receipt.to_str().unwrap(),
@@ -475,7 +476,7 @@ depends_on = ["resolve"]
         "cgroup-bind",
         "--workspace",
         workspace.to_str().unwrap(),
-        "--backend-socket",
+        "--backend-endpoint",
         lock.to_str().unwrap(),
         "--receipt-path",
         receipt.to_str().unwrap(),
@@ -595,7 +596,7 @@ depends_on = ["resolve"]
         "reconcile",
         "--workspace",
         workspace.to_str().unwrap(),
-        "--backend-socket",
+        "--backend-endpoint",
         lock.to_str().unwrap(),
         "--receipt-path",
         receipt.to_str().unwrap(),
@@ -610,7 +611,11 @@ depends_on = ["resolve"]
         .unwrap();
     let mut run_dev = run_dev;
     let socket_path = lock.to_str().unwrap();
-    let client = BackendClient::new(&lock, Duration::from_secs(1));
+    let client = BackendClient::new(
+        AbstractEndpoint::new(lock.to_string_lossy().into_owned()).unwrap(),
+        0,
+        Duration::from_secs(1),
+    );
     for _ in 0..100 {
         if client.status().is_ok() {
             break;
@@ -626,7 +631,7 @@ depends_on = ["resolve"]
 
     // 2. Exec with RUN_AS_ROOT=1.
     let run_root = Command::new(&binary)
-        .args(["--backend-socket", socket_path])
+        .args(["--backend-endpoint", socket_path])
         .env("RUN_AS_ROOT", "1")
         .args(["exec", "--", "true"])
         .output()
@@ -645,7 +650,7 @@ depends_on = ["resolve"]
 
     // 3. Exec again as dev (RUN_AS_ROOT=0).
     let run_dev2 = Command::new(&binary)
-        .args(["--backend-socket", socket_path])
+        .args(["--backend-endpoint", socket_path])
         .env("RUN_AS_ROOT", "0")
         .args(["exec", "--", "true"])
         .output()
@@ -664,7 +669,7 @@ depends_on = ["resolve"]
 
     // 4. Exec with RUN_AS_ROOT=1.
     let exec_root = Command::new(&binary)
-        .args(["--backend-socket", socket_path])
+        .args(["--backend-endpoint", socket_path])
         .env("RUN_AS_ROOT", "1")
         .args(["exec", "--", "true"])
         .output()
@@ -683,7 +688,7 @@ depends_on = ["resolve"]
 
     // 5. Exec with RUN_AS_ROOT=0.
     let exec_dev = Command::new(&binary)
-        .args(["--backend-socket", socket_path])
+        .args(["--backend-endpoint", socket_path])
         .env("RUN_AS_ROOT", "0")
         .args(["exec", "--", "true"])
         .output()
@@ -702,7 +707,7 @@ depends_on = ["resolve"]
 
     // 6. Exec again with RUN_AS_ROOT=0.
     let exec_dev_nodrift = Command::new(&binary)
-        .args(["--backend-socket", socket_path])
+        .args(["--backend-endpoint", socket_path])
         .env("RUN_AS_ROOT", "0")
         .args(["exec", "--", "true"])
         .output()
@@ -715,7 +720,7 @@ depends_on = ["resolve"]
 
     // 7. Concurrent slow-path exec commands (identity drift to root concurrently)
     let bin = &binary;
-    let args = ["--backend-socket", socket_path];
+    let args = ["--backend-endpoint", socket_path];
     scope(|s| {
         for i in 0..4 {
             s.spawn(move || {
@@ -891,7 +896,7 @@ depends_on = ["resolve"]
             "acl",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
             "run",
             "--",
@@ -901,7 +906,11 @@ depends_on = ["resolve"]
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let client = BackendClient::new(&socket, Duration::from_secs(2));
+    let client = BackendClient::new(
+        AbstractEndpoint::new(socket.to_string_lossy().into_owned()).unwrap(),
+        0,
+        Duration::from_secs(2),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if client.status().is_ok() {
@@ -924,7 +933,7 @@ depends_on = ["resolve"]
     let allowed_input = format!("CONTAINER_HOME={}", allowed_home.display());
     let allowed = Command::new(&binary)
         .args([
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
             "--input",
             allowed_input.as_str(),
@@ -957,8 +966,10 @@ depends_on = ["resolve"]
             "--groups=65534,54321",
             "--",
             binary.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
+            "--backend-peer-uid",
+            "0",
             "--input",
             peer_input.as_str(),
             "exec",
@@ -984,8 +995,10 @@ depends_on = ["resolve"]
             "--groups=65534",
             "--",
             binary.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
+            "--backend-peer-uid",
+            "0",
             "--input",
             mismatch_input.as_str(),
             "exec",
@@ -1000,6 +1013,12 @@ depends_on = ["resolve"]
         "non-root peer missing a resolved supplementary group must be rejected"
     );
     assert!(
+        String::from_utf8_lossy(&mismatch.stderr)
+            .contains("non-root peers may only hand off with their current supplementary groups"),
+        "supplementary-group mismatch should be the reason the request is rejected: {}",
+        String::from_utf8_lossy(&mismatch.stderr)
+    );
+    assert!(
         !mismatch_home.exists(),
         "credential rejection must precede Commit"
     );
@@ -1008,7 +1027,7 @@ depends_on = ["resolve"]
     let denied_input = format!("CONTAINER_HOME={}", denied_home.display());
     let denied = Command::new(&binary)
         .args([
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
             "--input",
             denied_input.as_str(),
@@ -1038,7 +1057,7 @@ depends_on = ["resolve"]
     let parent_denied_command = format!("printf denied > {parent_denied_marker}");
     let parent_denied = Command::new(&binary)
         .args([
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
             "--input",
             parent_denied_input.as_str(),

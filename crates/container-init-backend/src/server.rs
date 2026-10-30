@@ -9,21 +9,15 @@ use self::{
     lifecycle::BackendSupervisor,
     runtime::{BackendRuntime, BackendRuntimeOptions},
 };
-use crate::{
-    client::BackendClient,
-    instance::{InstanceClaim, InstanceLock},
-    socket::BackendSocket,
-};
+use crate::client::BackendClient;
 use container_init_bootstrap_model::{BootstrapConfig, Plan};
-use container_init_core::{
-    CoreError, ExecutionOptions, PlanExecutor, ResourceLockManager, RuntimeContext,
-};
-use container_init_protocol::{BackendState, BackendStatus};
+use container_init_core::{CoreError, ExecutionOptions, PlanExecutor, RuntimeContext};
+use container_init_protocol::{AbstractEndpoint, BackendState, BackendStatus};
 use libc::{getegid, geteuid};
 use std::{
     error::Error,
     fmt, io,
-    path::{Path, PathBuf},
+    os::unix::net::UnixListener,
     process,
     sync::Arc,
     thread,
@@ -32,14 +26,14 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub struct BackendPaths {
-    pub socket_path: PathBuf,
-    pub lock_path: PathBuf,
+    pub endpoint: AbstractEndpoint,
     pub owner_uid: u32,
+    pub peer_uid: u32,
 }
 
 pub struct BackendLease {
     paths: BackendPaths,
-    _lock: InstanceLock,
+    listener: Option<UnixListener>,
 }
 
 pub enum BackendClaim {
@@ -65,39 +59,33 @@ pub enum BackendRunError {
 
 impl BackendLease {
     pub fn claim(paths: BackendPaths, timeout: Duration) -> io::Result<BackendClaim> {
-        let parent = paths.lock_path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "backend lock path has no parent",
-            )
-        })?;
-        let socket_parent = paths.socket_path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "backend socket path has no parent",
-            )
-        })?;
-        if parent != socket_parent || paths.owner_uid != unsafe { geteuid() } {
+        if paths.owner_uid != unsafe { geteuid() } {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "backend socket and lock must share a runtime directory owned by this user",
+                "backend owner uid must match the current user",
             ));
         }
-        BackendRuntime::prepare_lock_directory(parent, paths.owner_uid)?;
-        match InstanceLock::try_acquire(&paths.lock_path)? {
-            InstanceClaim::Acquired(lock) => {
-                BackendSocket::cleanup_stale_socket(&paths.socket_path)?;
-                Ok(BackendClaim::Acquired(Self { paths, _lock: lock }))
+        match paths.endpoint.bind(32) {
+            Ok(listener) => {
+                listener.set_nonblocking(true)?;
+                Ok(BackendClaim::Acquired(Self {
+                    paths,
+                    listener: Some(listener),
+                }))
             }
-            InstanceClaim::Occupied => Ok(BackendClaim::AlreadyRunning(request_existing_status(
-                &paths.socket_path,
-                timeout,
-            )?)),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                Ok(BackendClaim::AlreadyRunning(request_existing_status(
+                    &paths.endpoint,
+                    paths.peer_uid,
+                    timeout,
+                )?))
+            }
+            Err(error) => Err(error),
         }
     }
 
     pub fn start(mut self, mut options: BackendStartOptions) -> Result<i32, BackendRunError> {
-        BackendSupervisor::install_signal_handlers()?;
+        let _signal_mask = BackendSupervisor::block_shutdown_signals()?;
         let snapshot_id = BackendRuntime::calculate_snapshot_id(
             &options.profile,
             &options.config,
@@ -112,7 +100,6 @@ impl BackendLease {
         let plan = Arc::new(options.plan);
         options.execution_options = options
             .execution_options
-            .with_resource_locks(ResourceLockManager::default())
             .preserve_current_process_in_cgroup();
 
         let startup = PlanExecutor::new(startup_config, options.startup_context.clone())
@@ -120,7 +107,6 @@ impl BackendLease {
             .execute_prevalidated(&startup_plan, &[])?;
         let identity = startup.identity().clone();
         options.execution_options = options.execution_options.without_receipt_path();
-        self._lock.allow_peer_group(identity.gid)?;
         let root_service = BackendSupervisor::is_root_service(
             &config,
             &options.command,
@@ -140,42 +126,18 @@ impl BackendLease {
             .into());
         }
 
-        let owner_uid = self.paths.owner_uid;
-        let group_gid = if owner_uid == 0 {
-            identity.gid
-        } else {
-            owner_uid
-        };
-        let socket_dir = self.paths.socket_path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "socket path has no parent")
+        let listener = self.listener.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "backend listener is unavailable",
+            )
         })?;
-        BackendSocket::ensure_socket_directory(
-            socket_dir,
-            owner_uid,
-            group_gid,
-            if owner_uid == 0 { 0o710 } else { 0o700 },
-        )?;
-        BackendSocket::cleanup_stale_socket(&self.paths.socket_path)?;
-        let listener = BackendSocket::bind_socket(
-            &self.paths.socket_path,
-            owner_uid,
-            group_gid,
-            if owner_uid == 0 { 0o660 } else { 0o600 },
-        )?;
-        listener.set_nonblocking(true)?;
-        let child = match BackendSupervisor::spawn_handoff(
+        let child = BackendSupervisor::spawn_handoff(
             &handoff,
             &identity,
             root_service,
             options.startup_context.cwd(),
-        ) {
-            Ok(child) => child,
-            Err(error) => {
-                drop(listener);
-                BackendSocket::cleanup_stale_socket(&self.paths.socket_path)?;
-                return Err(error.into());
-            }
-        };
+        )?;
         let status = BackendStatus {
             state: BackendState::Ready,
             profile: options.profile.clone(),
@@ -188,7 +150,7 @@ impl BackendLease {
                 .as_secs(),
             active_connections: 0,
         };
-        let runtime = Arc::new(BackendRuntime::new(BackendRuntimeOptions {
+        let mut runtime = BackendRuntime::new(BackendRuntimeOptions {
             profile: options.profile,
             snapshot_id,
             config,
@@ -199,9 +161,8 @@ impl BackendLease {
             allowed,
             execution_options: options.execution_options,
             status,
-        }));
-        BackendSupervisor::supervise(listener, child, &self.paths.socket_path, runtime)
-            .map_err(BackendRunError::Io)
+        });
+        BackendSupervisor::supervise(listener, child, &mut runtime).map_err(BackendRunError::Io)
     }
 }
 
@@ -228,7 +189,11 @@ impl From<io::Error> for BackendRunError {
     }
 }
 
-fn request_existing_status(path: &Path, timeout: Duration) -> io::Result<BackendStatus> {
+fn request_existing_status(
+    endpoint: &AbstractEndpoint,
+    peer_uid: u32,
+    timeout: Duration,
+) -> io::Result<BackendStatus> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "status deadline is invalid"))?;
@@ -241,7 +206,7 @@ fn request_existing_status(path: &Path, timeout: Duration) -> io::Result<Backend
                 "backend status request exceeded its deadline",
             ));
         }
-        match BackendClient::new(path, remaining).status_until(deadline) {
+        match BackendClient::new(endpoint.clone(), peer_uid, remaining).status_until(deadline) {
             Ok(status) => return Ok(status),
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
@@ -252,7 +217,10 @@ fn request_existing_status(path: &Path, timeout: Duration) -> io::Result<Backend
             Err(error) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    format!("backend owns the singleton lock but is not ready: {error}"),
+                    format!(
+                        "backend endpoint {} is occupied without a verifiable backend response: {error}",
+                        endpoint.display()
+                    ),
                 ));
             }
         }
@@ -261,8 +229,42 @@ fn request_existing_status(path: &Path, timeout: Duration) -> io::Result<Backend
 
 #[cfg(test)]
 mod tests {
-    use super::connection::ConnectionService;
-    use container_init_protocol::PeerCredentials;
+    use super::{connection::ConnectionService, BackendClaim, BackendLease, BackendPaths};
+    use container_init_protocol::{AbstractEndpoint, PeerCredentials};
+    use libc::geteuid;
+    use std::{io, process::id, time::Duration};
+
+    #[test]
+    fn endpoint_conflict_fails_before_start_and_is_not_cleared() {
+        let endpoint =
+            AbstractEndpoint::new(format!("container-init-claim-test.{}", id())).unwrap();
+        let occupied = endpoint.bind(4).unwrap();
+        let result = BackendLease::claim(
+            BackendPaths {
+                endpoint: endpoint.clone(),
+                owner_uid: unsafe { geteuid() },
+                peer_uid: unsafe { geteuid() },
+            },
+            Duration::from_millis(100),
+        );
+        let error = match result {
+            Ok(_) => panic!("occupied endpoint unexpectedly produced a lease"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(endpoint.bind(4).is_err());
+        drop(occupied);
+        let lease = BackendLease::claim(
+            BackendPaths {
+                endpoint,
+                owner_uid: unsafe { geteuid() },
+                peer_uid: unsafe { geteuid() },
+            },
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(matches!(lease, BackendClaim::Acquired(_)));
+    }
 
     #[test]
     fn peer_authorization_allows_root_and_startup_uid_only() {

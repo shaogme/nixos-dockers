@@ -77,11 +77,11 @@ profile 仍然可以有意把 `bootstrap.handoff.runtime` 配成 `/bin/sh`，并
 
 文件创建采用临时文件、写入、`fsync`、rename；passwd/group 也使用原子替换。SSH host key 使用更严格的成对检查和 non-overwriting hard-link 安装。
 
-这些针对 bootstrap 文件 action 的检查是路径级保护，不应被理解为完整的内核级 sandbox 或 dirfd 级 TOCTOU 防护。backend socket 和实例锁另行使用 no-follow 目录描述符、属主/权限校验及 inode 比较；这不改变 bootstrap 文件 action 的保护边界。对于可被不可信进程并发改写的目录，应该使用容器 mount、目录权限和外部隔离策略；不要把 workspace overlay 当作 root 配置来源。
+这些针对 bootstrap 文件 action 的检查是路径级保护，不应被理解为完整的内核级 sandbox 或 dirfd 级 TOCTOU 防护。RPC 使用 Linux abstract endpoint，并在 frame 读取前校验 `SO_PEERCRED`；backend 由 bind 成功者持有 endpoint，直到进程退出。backend 内部按单线程顺序执行 action，不协调其他管理员进程对 passwd/group、workspace、cgroup 或 receipt 的并发修改。对于可被不可信进程并发改写的目录，应该使用容器 mount、目录权限和外部隔离策略；不要把 workspace overlay 当作 root 配置来源。
 
 ### Backend `exec` 的身份和 cwd 预检
 
-v4 `PrepareExec` 只解析身份、构造 handoff 候选并绑定 cwd 对象，不执行 request reconcile。非 root peer 必须以自身 UID、有效 GID 和完整 supplementary-group 集合发起普通 handoff；服务端将解析身份与 socket 内核凭据及 `/proc/<pid>/status` 观察到的组集合比较。CLI 也会在发送 Commit 前复核候选凭据。需要切换 UID、GID 或组成员关系的 profile 必须由 root 发起请求。
+v4 `PrepareExec` 只解析身份、构造 handoff 候选并绑定 cwd 对象，不执行 request reconcile。非 root peer 必须以自身 UID、有效 GID 和完整 supplementary-group 集合发起普通 handoff；服务端将解析身份与 endpoint 内核凭据及 `/proc/<pid>/status` 观察到的组集合比较。CLI 也会在发送 Commit 前复核候选凭据。需要切换 UID、GID 或组成员关系的 profile 必须由 root 发起请求。
 
 cwd 权限由 handoff 子进程在目标凭据下对客户端原始路径执行 `chdir` 判定，因此采用内核的 POSIX ACL、ACL mask、逐级目录和 supplementary-group 规则。Prepare 会通过单个 `O_PATH | O_DIRECTORY` FD 绑定 canonical cwd、设备号和 inode；Preflight 对原始路径执行 `chdir` 后核对对象标识，并在 Commit 期间保持该 cwd。路径或 symlink 在 Prepare 与 Preflight 之间被替换时会拒绝提交。不要用 `stat` 的 group mode 位替代这次内核授权检查。
 
@@ -143,7 +143,7 @@ SSH private key 不会进入 plan effect 或 receipt。仍应将 host key 目录
 | 67 | 身份错误 | UID/GID/HOME 输入或 POSIX identity 无法解析 |
 | 68 | action 错误 | 文件、账户、SSH 或其他 bootstrap action 执行失败 |
 | 69 | handoff 错误 | runtime exec 失败 |
-| 69 | backend 错误 | Unix socket、singleton flock 或 handoff RPC 失败 |
+| 69 | backend 错误 | abstract endpoint bind、身份校验或 handoff RPC 失败 |
 
 错误文本通常包括 action id、路径、来源和修复提示；JSON 错误会包含 `class`、`kind`、`action`/`path` 等结构化字段。`doctor` 发现 fail 时使用检查对应的错误分类；只有无法进一步分类时才使用 65。
 
@@ -156,7 +156,8 @@ SSH private key 不会进入 plan effect 或 receipt。仍应将 host key 目录
 - image 中不存在不必要的 `service.ssh.prepare`；
 - `allow_outside_workspace` 仅用于明确需要的 HOME，并且路径来自可信输入；
 - `filesystem.ensure_symlink` 的 link 不会覆盖 volume mount 或真实配置目录；
-- backend socket 和 singleton lock 位于合适的 runtime/workspace 目录，并通过 owner/mode/type 校验；
+- `@container-init.backend.v4` 在 network namespace 内唯一，预期 server UID 由受信任的 runtime 配置；
+- backend endpoint 名称在 network namespace 内唯一，并由预期 UID 持有；
 - receipt 目录权限足够严格；
 - workspace 不会被当作 bootstrap trusted profile 加载；
 - 镜像、admin profile 和 handoff runtime 的变更都有对应测试。

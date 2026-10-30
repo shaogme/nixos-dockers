@@ -26,6 +26,7 @@ use std::{
 
 pub use command::{
     CommandError, CommandExecutor, CommandOutput, CommandRequest, OutputStream, ProcessExecutor,
+    ProviderProcessSupervisor,
 };
 pub use condition::ConditionEvaluator;
 pub use context::ProviderContext;

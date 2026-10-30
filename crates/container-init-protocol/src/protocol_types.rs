@@ -22,7 +22,6 @@ pub const MAX_RUNTIME_VALUES_TOTAL_BYTES: usize = 512 * 1024;
 pub const MAX_CWD_BYTES: usize = 4 * 1024;
 pub const MAX_PLAN_PAGE_ACTIONS: usize = 256;
 pub const FRAME_TIMEOUT_MS: u64 = 30_000;
-pub const MAX_IN_FLIGHT_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -147,8 +147,8 @@ let
 
     [bootstrap.handoff]
     runtime = "/usr/bin/dev-env"
-    # Running commands through container-init starts the dev-env backend once;
-    # subsequent container-init exec requests keep using the client prefix.
+    # The control plane serves requests while the initial shell or service is preparing.
+    # Subsequent container-init exec requests keep using the client prefix.
     exec_prefix = ["exec", "--"]
     initial_exec_prefix = ["backend", "run", "--initial-exec", "--"]
     shell_prefix = ${backendInitialPrefix}
@@ -233,6 +233,12 @@ in
       default = false;
       description = "Install the container-init and dev-env runtimes and their base profile.";
     };
+
+    backendStartupTimeoutMs = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 60000;
+      description = "Maximum time in milliseconds for dev-env clients to wait for the backend control plane.";
+    };
   };
 
   config = lib.mkIf config.runtime.enable {
@@ -241,7 +247,9 @@ in
       DEVENV_BOOTSTRAP_REAL_SHELL = bootstrapRealShellPath;
       CONTAINER_INIT_PROFILE_DIR = "/etc/dev-env/profiles.d";
       CONTAINER_INIT_DEFAULT_PROFILE = "/etc/dev-env/default-profile";
-      DEVENV_IDENTITY_BROKER_SOCKET = "/run/container-init/backend.sock";
+      CONTAINER_INIT_BACKEND_ENDPOINT = "container-init.backend.v4";
+      CONTAINER_INIT_BACKEND_PEER_UID = "0";
+      DEVENV_STARTUP_TIMEOUT_MS = toString config.runtime.backendStartupTimeoutMs;
       CONTAINER_INIT_HANDOFF_USER = config.system.defaultUser;
       DEVENV_BACKEND_SERVICE_COMMAND = lib.optionalString config.services.openssh.enable "/bin/sshd";
     };

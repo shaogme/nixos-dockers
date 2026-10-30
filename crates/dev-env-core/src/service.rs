@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
-    sync::{Arc, Condvar, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -43,14 +43,14 @@ impl MaterializationServiceResult {
 #[derive(Debug)]
 pub enum MaterializationServiceError {
     Core(CoreError),
-    SharedFailure(String),
+    SharedFailure { code: String, message: String },
 }
 
 impl fmt::Display for MaterializationServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Core(source) => source.fmt(formatter),
-            Self::SharedFailure(message) => formatter.write_str(message),
+            Self::SharedFailure { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -59,7 +59,16 @@ impl Error for MaterializationServiceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Core(source) => Some(source),
-            Self::SharedFailure(_) => None,
+            Self::SharedFailure { .. } => None,
+        }
+    }
+}
+
+impl MaterializationServiceError {
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Core(source) => source.code(),
+            Self::SharedFailure { code, .. } => code,
         }
     }
 }
@@ -70,14 +79,8 @@ struct CacheEntry {
     sensitive_bytes: usize,
 }
 
-struct Flight {
-    result: Mutex<Option<Result<Arc<Materialization>, String>>>,
-    ready: Condvar,
-}
-
 struct ServiceState {
     cache: HashMap<MaterializationKey, CacheEntry>,
-    in_flight: HashMap<MaterializationKey, Arc<Flight>>,
     sensitive_bytes: usize,
 }
 
@@ -85,8 +88,8 @@ struct ServiceState {
 /// is constructed once, successful values are retained in memory, and
 /// concurrent requests for the same key share one provider execution.
 pub struct MaterializationService {
-    materializer: Materializer,
-    state: Mutex<ServiceState>,
+    materializer: Arc<Materializer>,
+    state: ServiceState,
     max_entries: usize,
     max_sensitive_bytes: usize,
     ttl: Option<Duration>,
@@ -95,12 +98,11 @@ pub struct MaterializationService {
 impl MaterializationService {
     pub fn new(materializer: Materializer) -> Self {
         Self {
-            materializer,
-            state: Mutex::new(ServiceState {
+            materializer: Arc::new(materializer),
+            state: ServiceState {
                 cache: HashMap::new(),
-                in_flight: HashMap::new(),
                 sensitive_bytes: 0,
-            }),
+            },
             max_entries: 128,
             max_sensitive_bytes: 8 * 1024 * 1024,
             ttl: Some(Duration::from_secs(900)),
@@ -122,154 +124,122 @@ impl MaterializationService {
         &self.materializer
     }
 
-    pub fn clear(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("materialization cache lock poisoned");
-        state.cache.clear();
-        state.sensitive_bytes = 0;
+    pub fn shared_materializer(&self) -> Arc<Materializer> {
+        Arc::clone(&self.materializer)
+    }
+
+    pub fn clear(&mut self) {
+        self.state.cache.clear();
+        self.state.sensitive_bytes = 0;
     }
 
     pub fn len(&self) -> usize {
-        self.state
-            .lock()
-            .expect("materialization cache lock poisoned")
-            .cache
-            .len()
+        self.state.cache.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.state.cache.is_empty()
+    }
+
+    pub fn cached(&mut self, key: &MaterializationKey) -> Option<MaterializationServiceResult> {
+        self.remove_expired();
+        self.state.cache.get_mut(key).map(|entry| {
+            entry.last_used = Instant::now();
+            MaterializationServiceResult {
+                materialization: Arc::clone(&entry.value),
+                cache_hit: true,
+            }
+        })
+    }
+
+    pub fn cache_success(
+        &mut self,
+        key: MaterializationKey,
+        materialization: Arc<Materialization>,
+    ) {
+        let sensitive_bytes = sensitive_bytes(&materialization);
+        if sensitive_bytes > self.max_sensitive_bytes {
+            return;
+        }
+        if let Some(previous) = self.state.cache.insert(
+            key,
+            CacheEntry {
+                value: materialization,
+                last_used: Instant::now(),
+                sensitive_bytes,
+            },
+        ) {
+            self.state.sensitive_bytes = self
+                .state
+                .sensitive_bytes
+                .saturating_sub(previous.sensitive_bytes);
+        }
+        self.state.sensitive_bytes = self.state.sensitive_bytes.saturating_add(sensitive_bytes);
+        self.evict_to_limits();
     }
 
     pub fn prepare(
-        &self,
+        &mut self,
         key: MaterializationKey,
         context: &RuntimeContext,
         metadata: &MaterializationMetadata,
     ) -> Result<MaterializationServiceResult, MaterializationServiceError> {
         key.validate()
-            .map_err(|error| MaterializationServiceError::SharedFailure(error.to_string()))?;
+            .map_err(|error| MaterializationServiceError::SharedFailure {
+                code: "DEVENV-E-MODEL".to_owned(),
+                message: error.to_string(),
+            })?;
+        if let Some(result) = self.cached(&key) {
+            return Ok(result);
+        }
+        let materialization = Arc::new(
+            self.materializer
+                .materialize_with_metadata(context, metadata)
+                .map_err(MaterializationServiceError::Core)?,
+        );
+        self.cache_success(key, Arc::clone(&materialization));
+        Ok(MaterializationServiceResult {
+            materialization,
+            cache_hit: false,
+        })
+    }
 
-        let (flight, owner) = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("materialization cache lock poisoned");
-            let now = Instant::now();
-            let expired = self.ttl.is_some_and(|ttl| {
-                state
-                    .cache
-                    .values()
-                    .any(|entry| now.duration_since(entry.last_used) > ttl)
-            });
-            if expired {
-                if let Some(ttl) = self.ttl {
-                    state
-                        .cache
-                        .retain(|_, entry| now.duration_since(entry.last_used) <= ttl);
-                    state.sensitive_bytes = state
-                        .cache
-                        .values()
-                        .map(|entry| entry.sensitive_bytes)
-                        .sum();
-                }
-            }
-            if let Some(entry) = state.cache.get_mut(&key) {
-                entry.last_used = now;
-                return Ok(MaterializationServiceResult {
-                    materialization: Arc::clone(&entry.value),
-                    cache_hit: true,
-                });
-            }
-            if let Some(flight) = state.in_flight.get(&key) {
-                (Arc::clone(flight), false)
-            } else {
-                let flight = Arc::new(Flight {
-                    result: Mutex::new(None),
-                    ready: Condvar::new(),
-                });
-                state.in_flight.insert(key.clone(), Arc::clone(&flight));
-                (flight, true)
-            }
+    fn remove_expired(&mut self) {
+        let Some(ttl) = self.ttl else {
+            return;
         };
+        let now = Instant::now();
+        self.state
+            .cache
+            .retain(|_, entry| now.duration_since(entry.last_used) <= ttl);
+        self.state.sensitive_bytes = self
+            .state
+            .cache
+            .values()
+            .map(|entry| entry.sensitive_bytes)
+            .sum();
+    }
 
-        if !owner {
-            let mut result = flight.result.lock().expect("single-flight lock poisoned");
-            while result.is_none() {
-                result = flight
-                    .ready
-                    .wait(result)
-                    .expect("single-flight lock poisoned");
-            }
-            return match result.as_ref().expect("single-flight result missing") {
-                Ok(value) => Ok(MaterializationServiceResult {
-                    materialization: Arc::clone(value),
-                    cache_hit: true,
-                }),
-                Err(message) => Err(MaterializationServiceError::SharedFailure(message.clone())),
-            };
-        }
-
-        let result = self
-            .materializer
-            .materialize_with_metadata(context, metadata)
-            .map(Arc::new);
-        let shared = result.as_ref().map(Arc::clone).map_err(ToString::to_string);
+    fn evict_to_limits(&mut self) {
+        while self.state.cache.len() > self.max_entries
+            || self.state.sensitive_bytes > self.max_sensitive_bytes
         {
-            let mut state = self
+            let Some(oldest) = self
                 .state
-                .lock()
-                .expect("materialization cache lock poisoned");
-            if let Ok(value) = &result {
-                let sensitive_bytes = sensitive_bytes(value);
-                if sensitive_bytes <= self.max_sensitive_bytes {
-                    if let Some(previous) = state.cache.insert(
-                        key.clone(),
-                        CacheEntry {
-                            value: Arc::clone(value),
-                            last_used: Instant::now(),
-                            sensitive_bytes,
-                        },
-                    ) {
-                        state.sensitive_bytes = state
-                            .sensitive_bytes
-                            .saturating_sub(previous.sensitive_bytes);
-                    }
-                    state.sensitive_bytes = state.sensitive_bytes.saturating_add(sensitive_bytes);
-                }
-                while state.cache.len() > self.max_entries
-                    || state.sensitive_bytes > self.max_sensitive_bytes
-                {
-                    let Some(oldest) = state
-                        .cache
-                        .iter()
-                        .min_by_key(|(_, entry)| entry.last_used)
-                        .map(|(key, _)| key.clone())
-                    else {
-                        break;
-                    };
-                    if let Some(entry) = state.cache.remove(&oldest) {
-                        state.sensitive_bytes =
-                            state.sensitive_bytes.saturating_sub(entry.sensitive_bytes);
-                    }
-                }
+                .cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.state.cache.remove(&oldest) {
+                self.state.sensitive_bytes = self
+                    .state
+                    .sensitive_bytes
+                    .saturating_sub(entry.sensitive_bytes);
             }
-            // Publish the result while the flight is still registered. This
-            // prevents a failed operation from having a gap where a second
-            // caller starts a duplicate provider job before waiters wake up.
-            *flight.result.lock().expect("single-flight lock poisoned") = Some(shared);
-            state.in_flight.remove(&key);
         }
-        flight.ready.notify_all();
-
-        result
-            .map(|materialization| MaterializationServiceResult {
-                materialization,
-                cache_hit: false,
-            })
-            .map_err(MaterializationServiceError::Core)
     }
 }
 

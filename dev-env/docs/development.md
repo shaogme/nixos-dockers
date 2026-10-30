@@ -9,7 +9,7 @@
 | `dev-env-model` | 配置模型、DSL 类型、输入值和验证错误 |
 | `dev-env-loader` | TOML 解析、profile 继承、overlay 合并、运行时输入覆盖 |
 | `dev-env-core` | 运行时上下文、初始环境和 provider 执行编排 |
-| `dev-env-provider` | provider 检测、依赖排序、命令执行、输出解析和 receipt |
+| `dev-env-provider` | provider 检测、依赖排序、命令执行监督、输出解析和 receipt |
 | `dev-env-shell` | shell argv 构造、环境导出、shim 行为 |
 | `dev-env-cli` | 命令行入口、配置发现、进程边界、诊断和 trust 命令 |
 | `container-init-protocol` | container-init v2 身份握手的 DTO 与 client，供 `dev-env-cli` 调用 |
