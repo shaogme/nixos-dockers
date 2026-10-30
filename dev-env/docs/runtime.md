@@ -52,8 +52,11 @@ fingerprint 缓存。`reload` 替换 snapshot 并清空旧 cache。没有 backen
 backend coordinator 是 snapshot、control plane、计数器、initial runtime 状态及 materialization
 cache/in-flight 表的唯一所有者。connection reader 只认证 peer、解析请求并发送消息；物化任务
 在 worker 中运行，完成事件回到 coordinator 后再更新 cache 和回复所有 waiter。provider 命令
-通过 backend 共享的 `ProviderProcessSupervisor` actor 执行；actor 独占 subreaper 初始化、子进程
-创建和 `waitpid(-1)` 回收，避免并发工作互相回收 direct child。
+通过 backend 共享的 `ProviderProcessSupervisor` actor 排队，每条命令由同目录的
+`dev-env-provider-worker` 子进程执行和监督。worker 独占 subreaper 初始化、provider 后代信号
+发送及 `waitpid(-1)` 回收；backend 只管理自己直接创建的 worker，因此 initial shell/service 与
+provider 后代具有不同的回收边界。停止 backend 时，actor 通过 out-of-band 控制通道取消当前
+worker，并等待其清理完成；worker 路径固定为真实 `dev-env` 可执行文件旁的 helper。
 
 ## 2. 命令总览
 

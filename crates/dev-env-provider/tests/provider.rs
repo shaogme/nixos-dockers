@@ -14,13 +14,13 @@ use std::{
     env::temp_dir,
     fs, io,
     path::{Path, PathBuf},
-    process::id,
+    process::{id, Command},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct TempWorkspace {
@@ -522,6 +522,71 @@ fn shared_supervisor_keeps_concurrent_direct_child_statuses_separate() {
 
     assert_eq!(first.join().unwrap().status(), Some(23));
     assert_eq!(second.join().unwrap().status(), Some(42));
+}
+
+#[test]
+fn provider_cleanup_does_not_kill_or_reap_an_unrelated_parent_child() {
+    let mut unrelated = Command::new("/bin/sh")
+        .args(["-c", "sleep 30"])
+        .spawn()
+        .unwrap();
+    let request = CommandRequest::new("/bin/sh", temp_dir())
+        .with_args(["-c".to_owned(), "sleep 0.15".to_owned()])
+        .with_environment(BTreeMap::from([(
+            "PATH".to_owned(),
+            "/usr/bin:/bin".to_owned(),
+        )]))
+        .with_timeout(Some(Duration::from_secs(2)));
+
+    let output = process_executor().execute(&request).unwrap();
+    assert!(output.succeeded());
+    assert_eq!(unrelated.try_wait().unwrap(), None);
+
+    unrelated.kill().unwrap();
+    assert!(unrelated.wait().unwrap().code().is_none());
+}
+
+#[test]
+fn stopping_the_supervisor_cancels_and_reaps_the_active_provider_worker() {
+    let marker = temp_dir().join(format!(
+        "dev-env-provider-cancel-{}-{}",
+        id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let request = CommandRequest::new("/bin/sh", temp_dir())
+        .with_args([
+            "-c".to_owned(),
+            "echo $$ > \"$PID_FILE\"; sleep 30".to_owned(),
+        ])
+        .with_environment(BTreeMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("PID_FILE".to_owned(), marker.display().to_string()),
+        ]));
+    let supervisor = ProviderProcessSupervisor::try_new(PathBuf::from(env!(
+        "CARGO_BIN_EXE_dev-env-provider-worker"
+    )))
+    .unwrap();
+    let executor = supervisor.executor();
+    let running = thread::spawn(move || executor.execute(&request));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "provider command did not start");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let provider_pid = fs::read_to_string(&marker).unwrap();
+    let provider_path = PathBuf::from(format!("/proc/{}", provider_pid.trim()));
+
+    supervisor.stop();
+
+    assert!(running.join().unwrap().is_err());
+    assert!(
+        !provider_path.exists(),
+        "cancelled provider process remained alive"
+    );
+    let _ = fs::remove_file(marker);
 }
 
 #[test]
