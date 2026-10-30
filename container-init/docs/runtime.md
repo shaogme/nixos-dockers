@@ -27,7 +27,7 @@ container-init --profile coding-images plan --json
 - 解析环境变量中的 typed runtime input；
 - 读取或修改 passwd/group；
 - 创建目录、文件或软链接；
-- 启动 backend 或获取实例锁；
+- 启动 backend 或占用 backend endpoint；
 - 检查 runtime 是否真实可执行；
 - 执行 SSH keygen 或 handoff。
 
@@ -79,7 +79,7 @@ container-init --profile coding-images doctor --json
 
 文本输出会列出 `pass`、`warn` 或 `fail` 检查和最后的 `status`。JSON 输出包含 `profile`、`profile_chain`、`workspace`、可选 `identity`、`handoff`、`action_count`、`checks` 和 `ok`。warning 不会令 `ok` 变为 false，任一 fail 会令命令以对应错误码退出。
 
-doctor 不会创建 workspace、HOME、SSH 目录、lock 或 receipt，也不会验证每个普通文件 action 的最终路径是否真的可写。
+doctor 不会创建 workspace、HOME、SSH 目录、backend endpoint 或 receipt，也不会验证每个普通文件 action 的最终路径是否真的可写。
 
 ### `run`
 
@@ -93,12 +93,23 @@ container-init --profile coding-images run -- tool --flag 'value with spaces'
 
 `run` 是每个容器唯一的 backend 启动入口。执行顺序是：
 
-1. 获取固定 backend 实例 `flock`；已有实例只返回状态，不再加载 profile；
-2. 加载 image/admin profile 目录并选择 profile，构建不可变 snapshot；
-3. 完成启动 reconcile，创建 identity broker socket，并以 root service 身份启动唯一的
+1. 立即绑定 Linux abstract endpoint `@container-init.backend.v4`；bind 成功者持有 listener 并成为唯一 backend；
+2. 若 endpoint 已占用，通过 endpoint 校验 peer UID 并查询已有 backend 状态，不运行启动 action；
+3. 加载 image/admin profile 目录并选择 profile，构建不可变 snapshot；
+4. 完成启动 reconcile，并以 root service 身份启动唯一的
    runtime backend handoff 子进程；
-4. backend 监督初始子进程，初始子进程退出码成为容器退出码；
-5. 收到终止信号时转发给 backend，回收子进程并清理 broker/socket 状态。
+5. backend 监督初始子进程，初始子进程退出码成为容器退出码；
+6. 收到终止信号时转发给 backend，回收子进程并关闭 listener 释放 endpoint。
+
+container-init v4 RPC 和 dev-env 的身份代理共用 `@container-init.backend.v4`。它只在当前
+network namespace 内可见；同一 namespace 中的 backend 必须使用不同 endpoint 名称。
+identity broker 不再创建 `/run/container-init/backend.sock` 文件。
+
+handoff 后的 dev-env backend 使用独立的 v5 readiness 状态：control plane 在配置、snapshot、
+materializer、identity broker 检查和 endpoint 初始化完成后即可服务请求；初始 shell/service
+仍可处于 `preparing`。`container-init` 不把这两个状态合并，也不改变 handoff、监督或退出码
+传播语义。dev-env client 自行等待 endpoint 与 control plane；排查时可使用
+`dev-env backend status --json` 或 `dev-env backend wait-ready`。
 
 backend handoff 可以声明 `root_service = true`。这表示 root 只属于初始 backend/SSH
 service supervisor；`container-init exec` 不继承该标志，普通 provider job 和客户端
@@ -155,7 +166,8 @@ container-init --version
 | `--default-profile PATH` / `--default-profile-file PATH` | 默认 profile id 文件 |
 | `--workspace PATH` / `--cwd PATH` | runtime workspace |
 | `--input NAME=VALUE` / `--set NAME=VALUE` | 设置一个已声明的 typed bootstrap 输入，可重复 |
-| `--backend-socket PATH` | 覆盖 backend Unix socket 路径 |
+| `--backend-endpoint NAME` | 覆盖 Linux abstract endpoint 名称（不含 `@`） |
+| `--backend-peer-uid UID` | 覆盖客户端要求的 backend server UID |
 | `--request-timeout-ms MS` | backend 操作的总 deadline，涵盖连接、Prepare、Preflight、Commit 和必要的结果查询 |
 | `--receipt-path PATH` | 写执行 receipt 的路径 |
 | `--json` | `plan`/`doctor`/`status` 支持 |
@@ -186,12 +198,15 @@ CLI 环境变量的发现顺序如下；同一类配置中，命令行选项优�
 | `CONTAINER_INIT_DEFAULT_PROFILE_FILE` | 默认 profile 文件的兼容名称 | — |
 | `CONTAINER_INIT_WORKSPACE` | workspace | — |
 | `WORKSPACE` | workspace 的通用回退变量 | 当前目录 |
-| `CONTAINER_INIT_BACKEND_SOCKET` | backend Unix socket | root: `/run/container-init/backend.sock` |
+| `CONTAINER_INIT_BACKEND_ENDPOINT` | v4 backend 和 identity broker endpoint 名称 | `container-init.backend.v4` |
+| `CONTAINER_INIT_BACKEND_PEER_UID` | 客户端要求的 backend server UID | 当前有效 UID；NixOS root backend 固定为 `0` |
+| `CONTAINER_INIT_RUNTIME_DIR` | `PlanExecutor::runtime_dir()` helper 返回的目录；backend 不用它取得 endpoint 所有权 | root: `/run/container-init`；非 root: workspace 下 `.container-init` |
 | `CONTAINER_INIT_BACKEND_TIMEOUT_MS` | backend 操作的总 deadline | 5000 |
 
 初始 handoff 启动 root service 时，`container-init` 会将解析后的目标 UID 写入
 `CONTAINER_INIT_HANDOFF_UID`。dev-env backend 在启动时读取并固定该 UID，作为普通 peer
-授权策略；container-init identity broker 的 filesystem socket ACL 独立管理。
+授权策略；container-init v4 server 和客户端都通过 `SO_PEERCRED` 校验 peer。客户端在发送
+任何 frame 前必须确认 peer UID 与 `CONTAINER_INIT_BACKEND_PEER_UID` 一致。
 
 profile 的 typed input 不是由 container-init 读取全部环境变量，而是仅读取 `bootstrap.inputs` 中声明的名字和 aliases。其他 ambient 环境值只会在条件或路径显式使用 `env.NAME` 时被引用。
 
@@ -268,11 +283,13 @@ profile 的 typed input 不是由 container-init 读取全部环境变量，而�
 
 条件为假会记录 `skipped_condition`，同样不满足依赖成功条件。
 
-## 6. Backend 生命周期和锁
+## 6. Backend 所有权和事件循环
 
-backend 在 socket 同目录持有固定实例 `flock`。锁只防止同一容器启动第二个 backend，不参与 action 调度；action 使用按账户、路径、cgroup 和 namespace 推导的资源锁。backend 退出时内核释放 `flock`，下次 `run` 才能清理陈旧 socket；清理会校验 socket 类型、属主和权限，并确认 inode 未在操作期间被替换。
+backend 直接 bind Linux abstract endpoint。内核只允许一个进程持有该 endpoint；bind 成功后 listener 一直保留到 backend 退出，不清理或接管已占用 endpoint。收到 `AddrInUse` 时客户端尝试读取现有 backend 状态并验证 peer UID，不会执行启动 reconcile。
 
-socket 和 lock 路径的目录组件拒绝 symlink；backend 校验父目录、socket 和 lock 文件的属主与权限，并在 Linux 上使用 `SO_PEERCRED` 检查 peer。backend 不接收 profile 文本、action 描述或任意 spawn 命令；未经授权或结构无效的请求不会触发 bootstrap action。
+单线程 `poll` 事件循环独占事务表、状态、连接 frame 和待发送响应。连接使用非阻塞读写与 30 秒绝对 frame deadline；最多保留 32 条连接，同时最多接收 4 个 request body。request frame 最大 16 MiB，response frame 最大 8 MiB，因此通信缓冲区的 wire-frame 上界为 `32 × 8 MiB + 4 × 16 MiB`，另加连接状态、一个正在解码的请求对象和最多一个待序列化响应。容量达到上限时，body admission 立即返回 capacity 错误；慢速或超时连接不会占住事件循环。
+
+Commit 和启动 reconcile 由同一事件循环顺序执行；POSIX action 执行期间新 RPC 暂停处理。服务端在 frame 读取前通过 `SO_PEERCRED` 只接受 root 或启动身份 UID，客户端校验预期 server UID。backend 不接收 profile 文本、action 描述或任意 spawn 命令；未经授权或结构无效的请求不会触发 bootstrap action。endpoint 的可见范围由 network namespace 决定，bind-mount 不能跨 namespace 共享它。
 
 ## 7. Receipt
 

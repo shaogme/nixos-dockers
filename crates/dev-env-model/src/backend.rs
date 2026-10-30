@@ -16,7 +16,7 @@ use unix_frame::{read_payload_frame, write_payload_frame, FrameError};
 
 /// The dev-env backend protocol is deliberately independent from the
 /// container-init protocol number.
-pub const DEVENV_BACKEND_PROTOCOL_VERSION: u16 = 4;
+pub const DEVENV_BACKEND_PROTOCOL_VERSION: u16 = 5;
 pub const BACKEND_PROTOCOL_VERSION: u16 = DEVENV_BACKEND_PROTOCOL_VERSION;
 pub const DEVENV_BACKEND_ERROR_VERSION: u16 = 2;
 pub const MAX_BACKEND_FRAME_BYTES: usize = 1024 * 1024;
@@ -34,11 +34,20 @@ pub enum BackendProtocolError {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum BackendState {
+pub enum ControlPlaneState {
     Starting,
-    Ready,
+    Serving,
     Reloading,
     Stopping,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialRuntimeState {
+    Preparing,
+    Running,
+    Exited,
     Failed,
 }
 
@@ -85,7 +94,11 @@ pub type BackendRequestEnvelope = BackendRequestMessage;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloInfo {
-    pub state: BackendState,
+    pub control_plane: ControlPlaneState,
+    pub initial_runtime: InitialRuntimeState,
+    pub startup_phase: Option<String>,
+    pub initial_runtime_exit_code: Option<i32>,
+    pub initial_runtime_error: Option<String>,
     pub generation: Generation,
     pub config_fingerprint: [u8; 32],
     #[serde(default)]
@@ -128,7 +141,11 @@ pub struct ReceiptSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendStatus {
-    pub state: BackendState,
+    pub control_plane: ControlPlaneState,
+    pub initial_runtime: InitialRuntimeState,
+    pub startup_phase: Option<String>,
+    pub initial_runtime_exit_code: Option<i32>,
+    pub initial_runtime_error: Option<String>,
     pub generation: Generation,
     pub config_fingerprint: [u8; 32],
     pub backend_pid: u32,

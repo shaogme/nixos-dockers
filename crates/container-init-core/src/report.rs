@@ -1,6 +1,4 @@
-use crate::{
-    CoreError, HandoffCommand, PosixSystem, ResolvedIdentity, ResourceLockManager, SshCapability,
-};
+use crate::{CoreError, HandoffCommand, PosixSystem, ResolvedIdentity, SshCapability};
 use container_init_bootstrap_model::{ActionKind, Origin, PlanPhase};
 use serde::Serialize;
 use serde_json::to_vec_pretty;
@@ -18,7 +16,6 @@ pub struct ExecutionOptions {
     receipt_path: Option<PathBuf>,
     posix: PosixSystem,
     ssh: Option<SshCapability>,
-    resource_locks: ResourceLockManager,
     preserve_current_process_in_cgroup: bool,
 }
 
@@ -43,11 +40,6 @@ impl ExecutionOptions {
         self
     }
 
-    pub fn with_resource_locks(mut self, manager: ResourceLockManager) -> Self {
-        self.resource_locks = manager;
-        self
-    }
-
     pub fn preserve_current_process_in_cgroup(mut self) -> Self {
         self.preserve_current_process_in_cgroup = true;
         self
@@ -63,10 +55,6 @@ impl ExecutionOptions {
 
     pub(crate) fn ssh(&self) -> Option<&SshCapability> {
         self.ssh.as_ref()
-    }
-
-    pub(crate) fn resource_locks(&self) -> &ResourceLockManager {
-        &self.resource_locks
     }
 
     pub(crate) fn preserves_current_process_in_cgroup(&self) -> bool {

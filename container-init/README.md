@@ -27,7 +27,7 @@ Compose 注入的开发环境变量会随进程环境保留到 handoff runtime�
 
 - [DSL 完整参考](docs/dsl.md)：profile 结构、输入、action、插值和条件表达式。
 - [配置与部署](docs/configuration.md)：profile 文件布局、继承、来源、覆盖和容器配置。
-- [运行时与 CLI](docs/runtime.md)：`run`、`plan`、`doctor`、环境变量、锁和 receipt。
+- [运行时与 CLI](docs/runtime.md)：`run`、`plan`、`doctor`、backend 生命周期和 receipt。
 - [安全模型](docs/security.md)：信任边界、路径检查、权限阶段、SSH 和错误码。
 - [开发与测试](docs/development.md)：crate 分层、构建、单元测试和 Docker 测试。
 
@@ -132,6 +132,12 @@ shell shim 而把 root 登录映射到开发用户。低层 shell 入口不会�
 Bootstrap。`docker exec` 的自动身份行为来自 shim 委托，不是 Docker daemon 修改了
 容器默认用户。
 
+`container-init` 的 Bootstrap 和 handoff 行为不依赖 dev-env 的 readiness 状态。handoff 后，
+`dev-env backend` 会先完成控制面初始化并允许环境请求，再并行准备初始 shell/service；
+`dev-env backend status --json` 可分别观察 `control_plane` 与 `initial_runtime`。客户端在
+backend endpoint 尚未出现或控制面尚未 `serving` 时自动等待，超时由 dev-env startup
+deadline 报告。`container-init` 仍负责监督初始 handoff 子进程并传播退出码。
+
 ### 3. 用运行时输入映射宿主身份
 
 profile 先声明输入，CLI 或环境变量才可以设置它：
@@ -199,13 +205,13 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
     ↓
 校验 schema、来源、信任、字段和 action 依赖
     ↓
-解析输入和目标身份
+绑定 Linux abstract endpoint，取得 backend 唯一所有权
     ↓
-获取 backend 实例 flock
+选择 profile、构建 plan 并解析目标身份
     ↓
-按静态 plan 执行启动 action
+按静态 plan 顺序执行启动 action
     ↓
-发布 Unix socket 并监督 handoff child
+由单线程 poll 事件循环处理 RPC 并监督 handoff child
 ```
 
 计划由 `container-init-bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。离线 `plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统；backend 在线时，`plan` 从不可变快照分页读取并合并结果。
@@ -222,7 +228,7 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 - `process.set_user_shell`、`process.drop_privileges`、`handoff.exec`；
 - 可选 `service.ssh.prepare`，仅通过受信任的 `ssh-keygen` capability 生成 host key；
 - 可选 `cgroup.v2_init`，自动化 cgroup v2 根进程子组迁移与控制器（`cpu`、`io`、`memory`、`pids`）委托，支持默认就地模式与只读环境下的挂载覆挂重定向（bind-mount shadowing），供嵌套容器引擎使用；
-- `plan --json`、`doctor --json`、结构化错误、非阻塞锁和原子 receipt；
+- `plan --json`、`doctor --json`、结构化错误、单所有者 RPC 事件循环和原子 receipt；
 - Linux mountinfo workspace 挂载证据、UID/GID namespace 映射和 group 成员 reconcile；
 - `container-init-bootstrap-model`、`container-init-bootstrap-loader`、`container-init-core`、`container-init-posix`、`container-init-backend` 和 `container-init-cli` crate；所有产品 crate 由 `nixos-dockers/Cargo.toml` 的根 workspace 管理。
 
@@ -245,9 +251,9 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 | v2 身份协议 | [`crates/container-init-protocol`](../crates/container-init-protocol) | server/client 共用的身份握手 DTO 与 client |
 | 模型与计划 | [`crates/container-init-bootstrap-model`](../crates/container-init-bootstrap-model) | DSL 类型、字段校验、条件 AST、路径模板、依赖图和静态计划 |
 | 加载与合并 | [`crates/container-init-bootstrap-loader`](../crates/container-init-bootstrap-loader) | TOML 解析、action kind 归一化、继承、来源和信任、冲突处理 |
-| POSIX 边界 | [`crates/container-init-posix`](../crates/container-init-posix) | passwd/group、UID/GID、`chown`、权限、`flock` 等系统原语 |
-| 执行核心 | [`crates/container-init-core`](../crates/container-init-core) | 身份解析、条件求值、文件 action、SSH capability、资源锁、receipt 和 handoff |
-| Backend | [`crates/container-init-backend`](../crates/container-init-backend) | 单实例 snapshot、Unix socket RPC、实例 flock 和 PID 1 supervisor |
+| POSIX 边界 | [`crates/container-init-posix`](../crates/container-init-posix) | passwd/group、UID/GID、`chown`、权限和可写性检查 |
+| 执行核心 | [`crates/container-init-core`](../crates/container-init-core) | 身份解析、条件求值、按 plan 顺序执行文件 action、SSH capability、receipt 和 handoff |
+| Backend | [`crates/container-init-backend`](../crates/container-init-backend) | 单实例 snapshot、abstract endpoint 单所有者 RPC 事件循环和 PID 1 supervisor |
 | CLI | [`crates/container-init-cli`](../crates/container-init-cli) | 参数解析、profile 路径发现、backend `run/exec/plan/doctor/status/version` |
 
 几个关键入口：

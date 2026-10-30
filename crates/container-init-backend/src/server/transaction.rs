@@ -55,7 +55,7 @@ pub(super) struct TransactionService;
 
 impl TransactionService {
     pub(super) fn prepare(
-        runtime: &BackendRuntime,
+        runtime: &mut BackendRuntime,
         peer: PeerCredentials,
         options: PrepareExecOptions,
     ) -> Result<WirePreparedHandoff, BackendError> {
@@ -63,7 +63,7 @@ impl TransactionService {
     }
 
     pub(super) fn commit(
-        runtime: &BackendRuntime,
+        runtime: &mut BackendRuntime,
         peer: PeerCredentials,
         prepare_id: &str,
     ) -> ServerResponse {
@@ -71,7 +71,7 @@ impl TransactionService {
     }
 
     pub(super) fn abort(
-        runtime: &BackendRuntime,
+        runtime: &mut BackendRuntime,
         peer: PeerCredentials,
         prepare_id: &str,
     ) -> ServerResponse {
@@ -79,7 +79,7 @@ impl TransactionService {
     }
 
     pub(super) fn result(
-        runtime: &BackendRuntime,
+        runtime: &mut BackendRuntime,
         peer: PeerCredentials,
         prepare_id: &str,
     ) -> ServerResponse {
@@ -88,7 +88,7 @@ impl TransactionService {
 }
 
 fn prepare_exec(
-    runtime: &BackendRuntime,
+    runtime: &mut BackendRuntime,
     peer: PeerCredentials,
     options: PrepareExecOptions,
 ) -> Result<WirePreparedHandoff, BackendError> {
@@ -272,44 +272,47 @@ fn prepare_exec(
         ));
     }
     let deadline = request_deadline;
-    let mut transactions = runtime.transactions();
-    transactions.retain(|_, transaction| {
-        transaction.deadline > now
-            || matches!(transaction.state, ExecTransactionStateData::Committing)
-    });
-    let peer_transactions = transactions
-        .values()
-        .filter(|transaction| {
-            transaction.owner_uid == peer.uid
-                && transaction.owner_gid == peer.gid
-                && transaction_is_active(transaction)
-        })
-        .count();
-    if transactions.len() >= MAX_TRANSACTIONS || peer_transactions >= MAX_TRANSACTIONS_PER_PEER {
-        return Err(RuntimeErrors::backend(
-            "capacity",
-            true,
-            "backend transaction capacity is temporarily exhausted",
-        ));
-    }
-    transactions.insert(
-        prepare_id.clone(),
-        ExecTransaction {
-            owner_uid: peer.uid,
-            owner_gid: peer.gid,
-            snapshot_id: runtime.snapshot_id().to_owned(),
-            deadline,
-            state: ExecTransactionStateData::Prepared {
-                context: executor.context().clone(),
-                identity: identity.clone(),
+    let snapshot_id = runtime.snapshot_id().to_owned();
+    {
+        let transactions = runtime.transactions();
+        transactions.retain(|_, transaction| {
+            transaction.deadline > now
+                || matches!(transaction.state, ExecTransactionStateData::Committing)
+        });
+        let peer_transactions = transactions
+            .values()
+            .filter(|transaction| {
+                transaction.owner_uid == peer.uid
+                    && transaction.owner_gid == peer.gid
+                    && transaction_is_active(transaction)
+            })
+            .count();
+        if transactions.len() >= MAX_TRANSACTIONS || peer_transactions >= MAX_TRANSACTIONS_PER_PEER
+        {
+            return Err(RuntimeErrors::backend(
+                "capacity",
+                true,
+                "backend transaction capacity is temporarily exhausted",
+            ));
+        }
+        transactions.insert(
+            prepare_id.clone(),
+            ExecTransaction {
+                owner_uid: peer.uid,
+                owner_gid: peer.gid,
+                snapshot_id: snapshot_id.clone(),
+                deadline,
+                state: ExecTransactionStateData::Prepared {
+                    context: executor.context().clone(),
+                    identity: identity.clone(),
+                },
             },
-        },
-    );
-    drop(transactions);
+        );
+    }
     let (program, args) = command.into_parts();
     Ok(WirePreparedHandoff {
         prepare_id,
-        snapshot_id: runtime.snapshot_id().to_owned(),
+        snapshot_id,
         command: WireHandoffCommand { program, args },
         cwd: resolved_cwd.canonical_path,
         cwd_object: resolved_cwd.object,
@@ -344,12 +347,13 @@ fn transaction_is_active(transaction: &ExecTransaction) -> bool {
 }
 
 fn commit_exec(
-    runtime: &BackendRuntime,
+    runtime: &mut BackendRuntime,
     peer: PeerCredentials,
     prepare_id: &str,
 ) -> ServerResponse {
     let context = {
-        let mut transactions = runtime.transactions();
+        let snapshot_id = runtime.snapshot_id().to_owned();
+        let transactions = runtime.transactions();
         let Some(transaction) = transactions.get_mut(prepare_id) else {
             return ServerResponse::Error(RuntimeErrors::backend(
                 "unknown_transaction",
@@ -364,7 +368,7 @@ fn commit_exec(
                 "transaction credentials do not match the authenticated peer",
             ));
         }
-        if transaction.snapshot_id != runtime.snapshot_id() {
+        if transaction.snapshot_id != snapshot_id {
             return ServerResponse::Error(RuntimeErrors::backend(
                 "invalid_snapshot",
                 false,
@@ -411,7 +415,7 @@ fn commit_exec(
         })
         .map_err(|error| RuntimeErrors::core(&error));
 
-    let mut transactions = runtime.transactions();
+    let transactions = runtime.transactions();
     let Some(transaction) = transactions.get_mut(prepare_id) else {
         return ServerResponse::Error(RuntimeErrors::backend(
             "unknown_transaction",
@@ -426,8 +430,12 @@ fn commit_exec(
     ServerResponse::CommitResult(transaction_response(prepare_id, &transaction.state))
 }
 
-fn abort_exec(runtime: &BackendRuntime, peer: PeerCredentials, prepare_id: &str) -> ServerResponse {
-    let mut transactions = runtime.transactions();
+fn abort_exec(
+    runtime: &mut BackendRuntime,
+    peer: PeerCredentials,
+    prepare_id: &str,
+) -> ServerResponse {
+    let transactions = runtime.transactions();
     let Some(transaction) = transactions.get_mut(prepare_id) else {
         return ServerResponse::Error(RuntimeErrors::backend(
             "unknown_transaction",
@@ -452,11 +460,11 @@ fn abort_exec(runtime: &BackendRuntime, peer: PeerCredentials, prepare_id: &str)
 }
 
 fn get_exec_result(
-    runtime: &BackendRuntime,
+    runtime: &mut BackendRuntime,
     peer: PeerCredentials,
     prepare_id: &str,
 ) -> ServerResponse {
-    let mut transactions = runtime.transactions();
+    let transactions = runtime.transactions();
     let Some(transaction) = transactions.get_mut(prepare_id) else {
         return ServerResponse::Error(RuntimeErrors::backend(
             "unknown_transaction",

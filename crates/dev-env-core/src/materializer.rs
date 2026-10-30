@@ -9,8 +9,8 @@ use dev_env_model::{
     ProviderConfig, ResolvedConfig, ValueTree,
 };
 use dev_env_provider::{
-    evaluate_condition, ProviderContext, ProviderDiagnostic, ProviderJob, ProviderJobParts,
-    ProviderRunResult, ProviderRunner, ProviderSupervisor,
+    evaluate_condition, ProcessExecutor, ProviderContext, ProviderDiagnostic, ProviderJob,
+    ProviderJobParts, ProviderRunResult, ProviderRunner, ProviderSupervisor,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -118,6 +118,17 @@ struct ProviderContextInput<'a> {
 }
 
 impl Materializer {
+    pub fn try_new_with_process_executor(
+        config: ResolvedConfig,
+        executor: ProcessExecutor,
+    ) -> Result<Self, CoreError> {
+        config.validate().map_err(CoreError::Model)?;
+        Ok(Self::with_provider_runner(
+            config,
+            ProviderRunner::with_process_executor(executor),
+        ))
+    }
+
     pub fn new(config: ResolvedConfig) -> Self {
         Self::with_provider_runner(config, ProviderRunner::default())
     }

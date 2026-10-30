@@ -425,10 +425,20 @@ fn docker_cli_explain_doctor_and_trust_are_real_process_commands() {
 }
 
 #[test]
-fn docker_client_reports_backend_unavailable_without_offline_fallback() {
+fn docker_client_reports_startup_timeout_without_offline_fallback() {
     let fixture = Fixture::new();
-    let output = fixture.command().arg("print").output().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("DEVENV-E-BACKEND-UNAVAILABLE"));
+    let output = fixture
+        .command()
+        .env("DEVENV_STARTUP_TIMEOUT_MS", "10")
+        .arg("print")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(74), "{stderr}");
+    assert!(
+        stderr.contains("DEVENV-E-BACKEND-STARTUP-TIMEOUT"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("last_state=unavailable"), "{stderr}");
     assert!(output.stdout.is_empty());
 }

@@ -1,7 +1,6 @@
 mod accounts;
 mod credentials;
 mod filesystem;
-mod locking;
 mod namespace;
 mod types;
 
@@ -14,10 +13,8 @@ use std::{
     io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
-pub use locking::{PosixLock, DEFAULT_LOCK_TIMEOUT, DEFAULT_POLL_INTERVAL};
 pub use namespace::{IdMapEntry, MountInfoEntry, NamespaceMap};
 pub use types::{ActionChange, PosixError, PosixIdentity, PosixUser, WorkspaceObservation};
 
@@ -258,16 +255,8 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     Filesystem::set_mode(path, mode)
 }
 
-pub fn default_lock_timeout() -> Duration {
-    PosixLock::default_lock_timeout()
-}
-
-pub fn default_poll_interval() -> Duration {
-    PosixLock::default_poll_interval()
-}
-
 pub fn is_writable(path: &Path) -> bool {
-    PosixLock::is_writable(path)
+    Filesystem::is_writable(path)
 }
 
 pub fn parse_mountinfo(contents: &str) -> Result<Vec<MountInfoEntry>, PosixError> {

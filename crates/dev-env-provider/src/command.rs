@@ -11,7 +11,8 @@ use std::{
     ptr::null_mut,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Once, OnceLock,
+        mpsc::{self, Receiver, Sender, SyncSender},
+        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -57,6 +58,7 @@ pub enum CommandError {
     Kill {
         source: io::Error,
     },
+    SupervisorStopped,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +171,9 @@ impl Display for CommandError {
                 write!(formatter, "provider {stream:?} reader thread panicked")
             }
             Self::Kill { source } => write!(formatter, "could not stop provider: {source}"),
+            Self::SupervisorStopped => {
+                formatter.write_str("provider process supervisor has stopped")
+            }
         }
     }
 }
@@ -184,7 +189,8 @@ impl Error for CommandError {
             | Self::InvalidArgument
             | Self::InvalidEnvironment
             | Self::InvalidTimeout
-            | Self::ReaderPanicked { .. } => None,
+            | Self::ReaderPanicked { .. }
+            | Self::SupervisorStopped => None,
         }
     }
 }
@@ -252,12 +258,49 @@ pub trait CommandExecutor: Send + Sync {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProcessExecutor;
+enum SupervisorMessage {
+    Execute {
+        request: CommandRequest,
+        identity: Option<EffectiveIdentity>,
+        reply: SyncSender<Result<CommandOutput, CommandError>>,
+    },
+}
+
+#[derive(Clone)]
+pub struct ProcessExecutor {
+    sender: Sender<SupervisorMessage>,
+}
+
+pub struct ProviderProcessSupervisor {
+    executor: ProcessExecutor,
+}
+
+impl ProviderProcessSupervisor {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("dev-env-provider-supervisor".to_owned())
+            .spawn(move || run_supervisor(receiver))
+            .expect("could not spawn provider process supervisor");
+        Self {
+            executor: ProcessExecutor { sender },
+        }
+    }
+
+    pub fn executor(&self) -> ProcessExecutor {
+        self.executor.clone()
+    }
+}
+
+impl Default for ProviderProcessSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CommandExecutor for ProcessExecutor {
     fn execute(&self, request: &CommandRequest) -> Result<CommandOutput, CommandError> {
-        self.execute_as(request, None)
+        self.execute_request(request, None)
     }
 
     fn execute_with_identity(
@@ -265,91 +308,115 @@ impl CommandExecutor for ProcessExecutor {
         request: &CommandRequest,
         identity: Option<&EffectiveIdentity>,
     ) -> Result<CommandOutput, CommandError> {
-        self.execute_as(request, identity)
+        self.execute_request(request, identity)
     }
 }
 
 impl ProcessExecutor {
-    fn execute_as(
+    fn execute_request(
         &self,
         request: &CommandRequest,
         identity: Option<&EffectiveIdentity>,
     ) -> Result<CommandOutput, CommandError> {
-        // waitpid is process-wide.  Keeping the wait/reap boundary serialized
-        // prevents concurrent provider workers from stealing each other's
-        // direct child status.
-        let _execution_guard = process_execution_lock()
-            .lock()
-            .expect("provider execution lock poisoned");
-        request.validate()?;
-        install_subreaper();
-        let mut command = Command::new(&request.program);
-        command
-            // The materializer supplies the environment explicitly.  Do not
-            // leak the launcher process environment (tokens, host paths, or
-            // unrelated runtime inputs) into a provider child.
-            .env_clear()
-            .args(&request.args)
-            .current_dir(&request.cwd)
-            .envs(&request.environment)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_process_group(&mut command, identity);
-        let baseline_processes = process_ids();
-        let mut child = command
-            .spawn()
-            .map_err(|source| CommandError::Spawn { source })?;
-        let _pidfd = PidFd::open(child.id());
-
-        let child_done = Arc::new(AtomicBool::new(false));
-        let stdout = take_pipe(&mut child, OutputStream::Stdout, Arc::clone(&child_done))?;
-        let stderr = take_pipe(&mut child, OutputStream::Stderr, Arc::clone(&child_done))?;
-        let started = Instant::now();
-        let mut timed_out = false;
-        let status = loop {
-            match child
-                .try_wait()
-                .map_err(|source| CommandError::Wait { source })?
-            {
-                Some(status) => break status.code(),
-                None if request
-                    .timeout
-                    .is_some_and(|timeout| started.elapsed() >= timeout) =>
-                {
-                    timed_out = true;
-                    terminate_process_group(child.id());
-                    if let Err(source) = child.kill() {
-                        if source.kind() != io::ErrorKind::NotFound {
-                            return Err(CommandError::Kill { source });
-                        }
-                    }
-                    break child
-                        .wait()
-                        .map_err(|source| CommandError::Wait { source })?
-                        .code();
-                }
-                None => thread::sleep(Duration::from_millis(5)),
-            }
-        };
-
-        // A provider operation is one-shot.  Clean up anything left in its
-        // process group before joining pipe readers, otherwise a detached
-        // child can keep the pipe open and block the backend forever.
-        child_done.store(true, Ordering::Release);
-        terminate_process_group(child.id());
-        terminate_new_adopted_children(&baseline_processes);
-        for _ in 0..10 {
-            reap_adopted_children();
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        Ok(CommandOutput {
-            status,
-            timed_out,
-            stdout: join_pipe(stdout, OutputStream::Stdout, request.max_stdout_bytes)?,
-            stderr: join_pipe(stderr, OutputStream::Stderr, request.max_stderr_bytes)?,
-        })
+        let (reply, result) = mpsc::sync_channel(1);
+        self.sender
+            .send(SupervisorMessage::Execute {
+                request: request.clone(),
+                identity: identity.cloned(),
+                reply,
+            })
+            .map_err(|_| CommandError::SupervisorStopped)?;
+        result.recv().map_err(|_| CommandError::SupervisorStopped)?
     }
+}
+
+fn run_supervisor(receiver: Receiver<SupervisorMessage>) {
+    install_subreaper();
+    while let Ok(message) = receiver.recv() {
+        match message {
+            SupervisorMessage::Execute {
+                request,
+                identity,
+                reply,
+            } => {
+                let result = execute_as(&request, identity.as_ref());
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+fn execute_as(
+    request: &CommandRequest,
+    identity: Option<&EffectiveIdentity>,
+) -> Result<CommandOutput, CommandError> {
+    request.validate()?;
+    let mut command = Command::new(&request.program);
+    command
+        // The materializer supplies the environment explicitly.  Do not
+        // leak the launcher process environment (tokens, host paths, or
+        // unrelated runtime inputs) into a provider child.
+        .env_clear()
+        .args(&request.args)
+        .current_dir(&request.cwd)
+        .envs(&request.environment)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_group(&mut command, identity);
+    let baseline_processes = process_ids();
+    let mut child = command
+        .spawn()
+        .map_err(|source| CommandError::Spawn { source })?;
+    let _pidfd = PidFd::open(child.id());
+
+    let child_done = Arc::new(AtomicBool::new(false));
+    let stdout = take_pipe(&mut child, OutputStream::Stdout, Arc::clone(&child_done))?;
+    let stderr = take_pipe(&mut child, OutputStream::Stderr, Arc::clone(&child_done))?;
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|source| CommandError::Wait { source })?
+        {
+            Some(status) => break status.code(),
+            None if request
+                .timeout
+                .is_some_and(|timeout| started.elapsed() >= timeout) =>
+            {
+                timed_out = true;
+                terminate_process_group(child.id());
+                if let Err(source) = child.kill() {
+                    if source.kind() != io::ErrorKind::NotFound {
+                        return Err(CommandError::Kill { source });
+                    }
+                }
+                break child
+                    .wait()
+                    .map_err(|source| CommandError::Wait { source })?
+                    .code();
+            }
+            None => thread::sleep(Duration::from_millis(5)),
+        }
+    };
+
+    // A provider operation is one-shot.  Clean up anything left in its
+    // process group before joining pipe readers, otherwise a detached
+    // child can keep the pipe open and block the backend forever.
+    child_done.store(true, Ordering::Release);
+    terminate_process_group(child.id());
+    terminate_new_adopted_children(&baseline_processes);
+    for _ in 0..10 {
+        reap_adopted_children();
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    Ok(CommandOutput {
+        status,
+        timed_out,
+        stdout: join_pipe(stdout, OutputStream::Stdout, request.max_stdout_bytes)?,
+        stderr: join_pipe(stderr, OutputStream::Stderr, request.max_stderr_bytes)?,
+    })
 }
 
 #[cfg(unix)]
@@ -467,8 +534,6 @@ fn terminate_new_adopted_children(baseline: &HashSet<u32>) {
 #[cfg(not(target_os = "linux"))]
 fn terminate_new_adopted_children(_baseline: &HashSet<u32>) {}
 
-static SUBREAPER_ONCE: Once = Once::new();
-
 struct PidFd(Option<c_int>);
 
 impl PidFd {
@@ -495,17 +560,12 @@ impl Drop for PidFd {
     }
 }
 
-fn process_execution_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 fn install_subreaper() {
     #[cfg(target_os = "linux")]
-    SUBREAPER_ONCE.call_once(|| unsafe {
+    unsafe {
         // Provider descendants are reparented to the backend instead of PID 1.
         let _ = prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-    });
+    }
 }
 
 fn take_pipe(

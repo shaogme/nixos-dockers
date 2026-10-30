@@ -1,6 +1,6 @@
 use crate::{
-    read_message, write_message, ClientMessage, ClientRequest, HelloInfo, IdentityRequest,
-    PreparedIdentity, ServerMessage, ServerResponse, PROTOCOL_VERSION,
+    read_message, write_message, AbstractEndpoint, ClientMessage, ClientRequest, HelloInfo,
+    IdentityRequest, PreparedIdentity, ServerMessage, ServerResponse, PROTOCOL_VERSION,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,8 +8,8 @@ use std::{
     fmt::{Display, Formatter, Result as FmtResult},
     net::Shutdown,
     os::unix::net::UnixStream,
-    path::{Path, PathBuf},
-    time::Duration,
+    path::Path,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug)]
@@ -39,16 +39,33 @@ impl Error for IdentityBrokerError {}
 
 #[derive(Clone, Debug)]
 pub struct IdentityBrokerClient {
-    socket: PathBuf,
+    endpoint: AbstractEndpoint,
+    expected_peer_uid: u32,
     timeout: Duration,
 }
 
 impl IdentityBrokerClient {
-    pub fn new(socket: impl Into<PathBuf>, timeout: Duration) -> Self {
+    pub fn new(endpoint: AbstractEndpoint, expected_peer_uid: u32, timeout: Duration) -> Self {
         Self {
-            socket: socket.into(),
+            endpoint,
+            expected_peer_uid,
             timeout,
         }
+    }
+
+    pub fn hello(&self) -> Result<HelloInfo, IdentityBrokerError> {
+        let mut stream = self.connect()?;
+        write_message(
+            &mut stream,
+            &ClientMessage {
+                version: PROTOCOL_VERSION,
+                request: ClientRequest::Hello,
+            },
+        )
+        .map_err(|error| {
+            IdentityBrokerError::new(format!("identity broker write failed: {error}"))
+        })?;
+        expect_hello(&mut stream)
     }
 
     pub fn resolve(
@@ -58,20 +75,7 @@ impl IdentityBrokerClient {
         inputs: BTreeMap<String, String>,
         environment: BTreeMap<String, String>,
     ) -> Result<PreparedIdentity, IdentityBrokerError> {
-        if !self.socket.is_absolute() || self.socket.to_string_lossy().contains('\0') {
-            return Err(IdentityBrokerError::new(
-                "identity broker socket must be absolute".to_owned(),
-            ));
-        }
-        let mut stream = UnixStream::connect(&self.socket).map_err(|error| {
-            IdentityBrokerError::new(format!("identity broker unavailable: {error}"))
-        })?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|error| {
-                IdentityBrokerError::new(format!("identity broker socket setup failed: {error}"))
-            })?;
+        let mut stream = self.connect()?;
 
         write_message(
             &mut stream,
@@ -136,6 +140,31 @@ impl IdentityBrokerClient {
         validate_identity(&identity)?;
         Ok(identity)
     }
+
+    fn connect(&self) -> Result<UnixStream, IdentityBrokerError> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| IdentityBrokerError::new("identity broker timeout is invalid"))?;
+        let stream = self.endpoint.connect_until(deadline).map_err(|error| {
+            IdentityBrokerError::new(format!("identity broker unavailable: {error}"))
+        })?;
+        let peer = AbstractEndpoint::peer_credentials(&stream).map_err(|error| {
+            IdentityBrokerError::new(format!("identity broker peer check failed: {error}"))
+        })?;
+        if peer.uid != self.expected_peer_uid {
+            return Err(IdentityBrokerError::new(format!(
+                "identity broker peer UID {} does not match the expected UID {}",
+                peer.uid, self.expected_peer_uid
+            )));
+        }
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .and_then(|_| stream.set_write_timeout(Some(self.timeout)))
+            .map_err(|error| {
+                IdentityBrokerError::new(format!("identity broker stream setup failed: {error}"))
+            })?;
+        Ok(stream)
+    }
 }
 
 fn expect_hello(stream: &mut UnixStream) -> Result<HelloInfo, IdentityBrokerError> {
@@ -197,14 +226,13 @@ fn validate_identity(identity: &PreparedIdentity) -> Result<(), IdentityBrokerEr
 mod tests {
     use super::IdentityBrokerClient;
     use crate::{
-        read_message, write_message, BackendState, ClientMessage, ClientRequest, HelloInfo,
-        IdentityRequest, PreparedIdentity, ProtocolLimits, ServerMessage, ServerResponse,
-        PROTOCOL_VERSION,
+        read_message, write_message, AbstractEndpoint, BackendState, ClientMessage, ClientRequest,
+        HelloInfo, IdentityRequest, PreparedIdentity, ProtocolLimits, ServerMessage,
+        ServerResponse, PROTOCOL_VERSION,
     };
+    use libc::geteuid;
     use std::{
         collections::BTreeMap,
-        fs::remove_file,
-        os::unix::net::UnixListener,
         path::{Path, PathBuf},
         process::id,
         thread,
@@ -217,11 +245,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let socket = PathBuf::from(format!(
-            "/tmp/container-init-protocol-{}-{nonce}.sock",
-            id()
-        ));
-        let listener = UnixListener::bind(&socket).unwrap();
+        let endpoint =
+            AbstractEndpoint::new(format!("container-init-protocol-{}-{nonce}", id())).unwrap();
+        let listener = endpoint.bind(4).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let hello: ClientMessage = read_message(&mut stream).unwrap();
@@ -276,7 +302,8 @@ mod tests {
             .unwrap();
         });
 
-        let client = IdentityBrokerClient::new(&socket, Duration::from_secs(2));
+        let client =
+            IdentityBrokerClient::new(endpoint, unsafe { geteuid() }, Duration::from_secs(2));
         let identity = client
             .resolve(
                 IdentityRequest::Peer {
@@ -295,8 +322,31 @@ mod tests {
             )
             .unwrap();
         server.join().unwrap();
-        let _ = remove_file(socket);
         assert_eq!(identity.uid, 1000);
         assert_eq!(identity.user, "dev");
+    }
+
+    #[test]
+    fn identity_client_rejects_an_unexpected_peer_uid_before_sending_a_frame() {
+        let endpoint =
+            AbstractEndpoint::new(format!("container-init-protocol-peer-{}", id())).unwrap();
+        let listener = endpoint.bind(4).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            assert!(read_message::<ClientMessage>(&mut stream).is_err());
+        });
+        let client = IdentityBrokerClient::new(
+            endpoint,
+            unsafe { geteuid() }.saturating_add(1),
+            Duration::from_secs(1),
+        );
+        let error = client.hello().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the expected UID"));
+        server.join().unwrap();
     }
 }

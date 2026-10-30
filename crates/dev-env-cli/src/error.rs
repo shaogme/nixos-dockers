@@ -284,6 +284,8 @@ pub enum CliError {
     Bootstrap(BootstrapError),
     Backend(String),
     BackendUnavailable(String),
+    BackendStartupTimeout(String),
+    BackendProvider(String),
     Launch {
         program: PathBuf,
         args: Vec<OsString>,
@@ -322,7 +324,8 @@ impl CliError {
             Self::Io { .. } | Self::Output(_) => 74,
             Self::Trust(_) => 66,
             Self::Bootstrap(_) => 65,
-            Self::Backend(_) | Self::BackendUnavailable(_) => 74,
+            Self::BackendProvider(_) => 70,
+            Self::Backend(_) | Self::BackendUnavailable(_) | Self::BackendStartupTimeout(_) => 74,
             Self::Launch { .. } => 127,
             Self::DoctorFailed { .. } => 65,
         }
@@ -369,6 +372,10 @@ impl fmt::Display for CliError {
             Self::BackendUnavailable(error) => {
                 write!(formatter, "DEVENV-E-BACKEND-UNAVAILABLE: {error}")
             }
+            Self::BackendStartupTimeout(error) => {
+                write!(formatter, "DEVENV-E-BACKEND-STARTUP-TIMEOUT: {error}")
+            }
+            Self::BackendProvider(error) => write!(formatter, "DEVENV-E-PROVIDER: {error}"),
             Self::Launch {
                 program, source, ..
             } => write!(
@@ -401,6 +408,8 @@ impl Error for CliError {
             Self::Bootstrap(error) => Some(error),
             Self::Backend(_) => None,
             Self::BackendUnavailable(_) => None,
+            Self::BackendStartupTimeout(_) => None,
+            Self::BackendProvider(_) => None,
             Self::Launch { source, .. } => Some(source),
             Self::DoctorFailed { .. } => None,
         }

@@ -3,12 +3,16 @@ use container_init_bootstrap_loader::LoaderError;
 use container_init_bootstrap_model::{ModelError, SourceKind};
 use container_init_cli::{Cli, CliCommand, CliError};
 use container_init_core::PosixSystem;
-use container_init_protocol::{BackendState, ExecTransactionState};
+use container_init_protocol::{
+    read_message_until, AbstractEndpoint, BackendState, ExecTransactionState, ServerMessage,
+    ServerResponse, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
+};
 use libc::{kill, SIGTERM};
 use serde_json::{from_slice, Value};
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -106,9 +110,18 @@ fn common_args(profiles: &Path, workspace: &Path, lock: &Path) -> Vec<String> {
         "fixture".to_owned(),
         "--workspace".to_owned(),
         workspace.display().to_string(),
-        "--backend-socket".to_owned(),
+        "--backend-endpoint".to_owned(),
         socket.display().to_string(),
     ]
+}
+
+fn endpoint_for_path(path: &Path) -> AbstractEndpoint {
+    AbstractEndpoint::new(path.to_string_lossy().into_owned()).unwrap()
+}
+
+fn assert_endpoint_released(path: &Path) {
+    let listener = endpoint_for_path(path).bind(1).unwrap();
+    drop(listener);
 }
 
 fn start_backend(profiles: &Path, workspace: &Path, socket: &Path, initial_command: &str) -> Child {
@@ -120,12 +133,16 @@ fn start_backend(profiles: &Path, workspace: &Path, socket: &Path, initial_comma
             "fixture",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
             "run",
             "--",
             initial_command,
         ])
+        .env(
+            "CONTAINER_INIT_RUNTIME_DIR",
+            socket.parent().expect("endpoint fixture has a parent"),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -133,7 +150,11 @@ fn start_backend(profiles: &Path, workspace: &Path, socket: &Path, initial_comma
 }
 
 fn wait_for_backend(child: &mut Child, socket: &Path) {
-    let client = BackendClient::new(socket, Duration::from_millis(500));
+    let client = BackendClient::new(
+        endpoint_for_path(socket),
+        PosixSystem::new().current_ids().0,
+        Duration::from_millis(500),
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(status) = client.status() {
@@ -257,6 +278,7 @@ fn run_executes_actions_then_handoffs_to_the_declared_runtime() {
     let receipt = temp.path().join("receipt.json");
     let script = format!("printf 'handoff\\n' > {}", handoff.display());
     let output = Command::new(binary())
+        .env("CONTAINER_INIT_RUNTIME_DIR", temp.path())
         .args(common_args(&profiles, &workspace, &lock))
         .args(["--receipt-path", receipt.to_str().unwrap(), "run", "--"])
         .arg(script)
@@ -334,16 +356,17 @@ run_as = "root"
             "broken",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
             "run",
             "--",
             &format!("printf handoff > {}", handoff.display()),
         ])
+        .env("CONTAINER_INIT_RUNTIME_DIR", temp.path())
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(!socket.exists());
+    assert_endpoint_released(&socket);
     assert!(!handoff.exists());
 }
 
@@ -351,8 +374,8 @@ run_as = "root"
 fn parser_parses_exec_command_with_double_dash_and_arguments() {
     let cli = Cli::parse_strings([
         "container-init",
-        "--backend-socket",
-        "/run/container-init/backend.sock",
+        "--backend-endpoint",
+        "container-init.backend.v4",
         "exec",
         "--",
         "tool",
@@ -362,8 +385,8 @@ fn parser_parses_exec_command_with_double_dash_and_arguments() {
     .unwrap();
     let (options, command) = cli.into_parts();
     assert_eq!(
-        options.backend_socket,
-        Some(PathBuf::from("/run/container-init/backend.sock"))
+        options.backend_endpoint,
+        Some("container-init.backend.v4".to_owned())
     );
     assert_eq!(
         command,
@@ -395,7 +418,7 @@ fn exec_hands_off_through_the_running_backend() {
     wait_for_backend(&mut backend, &socket);
     let script = format!("printf 'exec-handoff\\n' > {}", handoff.display());
     let output = Command::new(binary())
-        .args(["--backend-socket", socket.to_str().unwrap(), "exec", "--"])
+        .args(["--backend-endpoint", socket.to_str().unwrap(), "exec", "--"])
         .arg(script)
         .output()
         .unwrap();
@@ -408,7 +431,7 @@ fn exec_hands_off_through_the_running_backend() {
     assert_eq!(fs::read_to_string(&handoff).unwrap(), "exec-handoff\n");
     assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
     assert_eq!(backend.wait().unwrap().code(), Some(0));
-    assert!(!socket.exists());
+    assert_endpoint_released(&socket);
 }
 
 #[test]
@@ -432,7 +455,7 @@ fn exec_accepts_the_37543_byte_argument_through_preflight_and_handoff() {
     wait_for_backend(&mut backend, &socket);
     let long_argument = "x".repeat(37_543);
     let output = Command::new(binary())
-        .args(["--backend-socket", socket.to_str().unwrap(), "exec", "--"])
+        .args(["--backend-endpoint", socket.to_str().unwrap(), "exec", "--"])
         .arg("true")
         .arg(long_argument)
         .output()
@@ -515,7 +538,11 @@ depends_on = ["resolve"]
         "trap 'exit 0' TERM; while :; do sleep 1; done",
     );
     wait_for_backend(&mut backend, &socket);
-    let client = BackendClient::new(&socket, Duration::from_secs(5));
+    let client = BackendClient::new(
+        endpoint_for_path(&socket),
+        PosixSystem::new().current_ids().0,
+        Duration::from_secs(5),
+    );
     let inputs = BTreeMap::from([(
         "CONTAINER_HOME".to_owned(),
         deferred_home.display().to_string(),
@@ -607,7 +634,7 @@ depends_on = ["resolve"]
 }
 
 #[test]
-fn exec_supports_parallel_execution_without_lock_contention() {
+fn exec_supports_parallel_clients_through_the_single_backend() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
     }
@@ -632,7 +659,7 @@ fn exec_supports_parallel_execution_without_lock_contention() {
         handles.push(thread::spawn(move || {
             let script = format!("printf '{i}\\n' > {}", out_file.display());
             let output = Command::new(binary())
-                .args(["--backend-socket", socket.to_str().unwrap(), "exec", "--"])
+                .args(["--backend-endpoint", socket.to_str().unwrap(), "exec", "--"])
                 .arg(script)
                 .output()
                 .unwrap();
@@ -647,6 +674,81 @@ fn exec_supports_parallel_execution_without_lock_contention() {
     for handle in handles {
         handle.join().unwrap();
     }
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn partial_frames_and_body_admission_do_not_block_the_event_loop() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let mut backend = start_backend(
+        &profiles,
+        &workspace,
+        &socket,
+        "trap 'exit 0' TERM; while :; do sleep 1; done",
+    );
+    wait_for_backend(&mut backend, &socket);
+
+    let endpoint = endpoint_for_path(&socket);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut partial_header = endpoint.connect_until(deadline).unwrap();
+    partial_header.write_all(&[0, 0]).unwrap();
+
+    let client = BackendClient::new(
+        endpoint.clone(),
+        PosixSystem::new().current_ids().0,
+        Duration::from_secs(2),
+    );
+    assert_eq!(client.status().unwrap().state, BackendState::Ready);
+
+    let mut partial_bodies = Vec::new();
+    for _ in 0..4 {
+        let mut stream = endpoint.connect_until(deadline).unwrap();
+        stream.write_all(&2_u32.to_be_bytes()).unwrap();
+        stream.write_all(b"{").unwrap();
+        partial_bodies.push(stream);
+    }
+    thread::sleep(Duration::from_millis(150));
+
+    let mut over_admission = endpoint.connect_until(deadline).unwrap();
+    over_admission.write_all(&2_u32.to_be_bytes()).unwrap();
+    let response: ServerMessage = read_message_until(
+        &mut over_admission,
+        Instant::now() + Duration::from_secs(2),
+        MAX_RESPONSE_FRAME_BYTES,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response,
+        ServerResponse::Error(error) if error.class == "capacity"
+    ));
+
+    let mut oversized = endpoint.connect_until(deadline).unwrap();
+    oversized
+        .write_all(&((MAX_REQUEST_FRAME_BYTES + 1) as u32).to_be_bytes())
+        .unwrap();
+    let response: ServerMessage = read_message_until(
+        &mut oversized,
+        Instant::now() + Duration::from_secs(2),
+        MAX_RESPONSE_FRAME_BYTES,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response,
+        ServerResponse::Error(error) if error.class == "request_too_large"
+    ));
+
+    drop(partial_bodies);
+    drop(partial_header);
     assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
     assert_eq!(backend.wait().unwrap().code(), Some(0));
 }
@@ -672,8 +774,12 @@ fn duplicate_run_uses_the_existing_backend_without_reloading_config() {
     );
     wait_for_backend(&mut backend, &socket);
     let output = Command::new(binary())
+        .env(
+            "CONTAINER_INIT_RUNTIME_DIR",
+            socket.parent().expect("endpoint fixture has a parent"),
+        )
         .args([
-            "--backend-socket",
+            "--backend-endpoint",
             socket.to_str().unwrap(),
             "--profiles-dir",
             temp.path().join("missing").to_str().unwrap(),
@@ -705,6 +811,18 @@ fn removed_bootstrap_lock_option_is_rejected() {
         .unwrap();
     assert_eq!(output.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option"));
+}
+
+#[test]
+fn removed_backend_socket_option_is_rejected() {
+    let error = Cli::parse_strings([
+        "container-init",
+        "--backend-socket",
+        "/tmp/backend.sock",
+        "status",
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown option"));
 }
 
 #[test]
@@ -784,6 +902,10 @@ depends_on = ["drop"]
     let script =
         "printf 'HOME=%s USER=%s LOGNAME=%s UID=%s GID=%s\\n' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$(id -u)\" \"$(id -g)\"";
     let output = Command::new(binary())
+        .env(
+            "CONTAINER_INIT_RUNTIME_DIR",
+            lock.parent().expect("lock fixture has a parent"),
+        )
         .args([
             "--profiles-dir",
             profiles.to_str().unwrap(),
@@ -791,7 +913,7 @@ depends_on = ["drop"]
             "identity",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             lock.to_str().unwrap(),
             "run",
             "--",
@@ -884,7 +1006,7 @@ content = "ssh-ed25519 AAAAcli-test\n"
         "ssh",
         "--workspace",
         workspace.to_str().unwrap(),
-        "--backend-socket",
+        "--backend-endpoint",
         lock.to_str().unwrap(),
     ];
     let plan = Command::new(binary())
@@ -929,6 +1051,10 @@ content = "ssh-ed25519 AAAAcli-test\n"
 
     let script = format!("printf 'ssh handoff\\n' > {}", handoff.display());
     let run = Command::new(binary())
+        .env(
+            "CONTAINER_INIT_RUNTIME_DIR",
+            lock.parent().expect("lock fixture has a parent"),
+        )
         .args(common)
         .args(["run", "--"])
         .arg(script)
@@ -1072,7 +1198,7 @@ run_as = "root"
             "fixture-cgroup",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             lock.to_str().unwrap(),
             "plan",
             "--json",
@@ -1148,7 +1274,7 @@ run_as = "root"
             "fixture-cgroup-bind",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--backend-socket",
+            "--backend-endpoint",
             lock.to_str().unwrap(),
             "plan",
             "--json",

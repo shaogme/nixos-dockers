@@ -8,15 +8,12 @@ use container_init_backend::{
 };
 use container_init_bootstrap_model::ActionKind;
 use container_init_core::{ExecutionOptions, PosixSystem, SshCapability};
-use container_init_protocol::{ProtocolError, FRAME_TIMEOUT_MS};
+use container_init_protocol::{
+    AbstractEndpoint, ProtocolError, DEFAULT_CONTAINER_INIT_BACKEND_ENDPOINT, FRAME_TIMEOUT_MS,
+};
 use serde_json::to_value;
 use std::{
-    collections::BTreeMap,
-    env,
-    ffi::OsString,
-    io,
-    os::unix::process::ExitStatusExt,
-    path::{Path, PathBuf},
+    collections::BTreeMap, env, ffi::OsString, io, os::unix::process::ExitStatusExt, path::PathBuf,
     time::Duration,
 };
 
@@ -31,6 +28,12 @@ impl Application {
     {
         let cli = Cli::parse(arguments).map_err(parse_error)?;
         let (options, command) = cli.into_parts();
+        if matches!(&command, CliCommand::Run { .. } | CliCommand::Exec { .. }) {
+            let endpoint = backend_endpoint(&options)?;
+            let peer_uid = backend_peer_uid(&options)?;
+            env::set_var("CONTAINER_INIT_BACKEND_ENDPOINT", endpoint.name());
+            env::set_var("CONTAINER_INIT_BACKEND_PEER_UID", peer_uid.to_string());
+        }
         match command {
             CliCommand::Help => {
                 println!("{}", Cli::usage(""));
@@ -81,8 +84,7 @@ impl Application {
                 Ok(0)
             }
             CliCommand::Run { command } => {
-                let workspace = ConfigLoader::workspace_path(&options)?;
-                let paths = backend_paths(&options, &workspace)?;
+                let paths = backend_paths(&options)?;
                 let lease = match BackendLease::claim(paths, request_timeout(&options)?)
                     .map_err(|error| CliError::Backend(error.to_string()))?
                 {
@@ -172,46 +174,52 @@ impl Application {
 }
 
 fn backend_client(options: &CliOptions) -> Result<BackendClient, CliError> {
-    let workspace = ConfigLoader::workspace_path(options)?;
     Ok(BackendClient::new(
-        backend_socket(options, &workspace),
+        backend_endpoint(options)?,
+        backend_peer_uid(options)?,
         request_timeout(options)?,
     ))
 }
 
-fn backend_paths(options: &CliOptions, workspace: &Path) -> Result<BackendPaths, CliError> {
-    let socket_path = backend_socket(options, workspace);
-    let parent = socket_path
-        .parent()
-        .ok_or_else(|| CliError::Configuration("backend socket path has no parent".to_owned()))?
-        .to_path_buf();
+fn backend_paths(options: &CliOptions) -> Result<BackendPaths, CliError> {
     Ok(BackendPaths {
-        socket_path,
-        lock_path: parent.join("backend.lock"),
+        endpoint: backend_endpoint(options)?,
         owner_uid: PosixSystem::new().current_ids().0,
+        peer_uid: backend_peer_uid(options)?,
     })
 }
 
-fn backend_socket(options: &CliOptions, workspace: &Path) -> PathBuf {
-    if let Some(path) = &options.backend_socket {
-        return path.clone();
-    }
-    if let Some(path) = env::var_os("CONTAINER_INIT_BACKEND_SOCKET") {
-        return PathBuf::from(path);
-    }
-    let runtime_dir = env::var_os("CONTAINER_INIT_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let uid = PosixSystem::new().current_ids().0;
-            if uid == 0 {
-                PathBuf::from("/run/container-init")
-            } else if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
-                PathBuf::from(runtime).join("container-init")
-            } else {
-                workspace.join(".container-init")
+fn backend_endpoint(options: &CliOptions) -> Result<AbstractEndpoint, CliError> {
+    let name = match &options.backend_endpoint {
+        Some(name) => name.clone(),
+        None => match env::var("CONTAINER_INIT_BACKEND_ENDPOINT") {
+            Ok(name) => name,
+            Err(env::VarError::NotPresent) => DEFAULT_CONTAINER_INIT_BACKEND_ENDPOINT.to_owned(),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(CliError::Configuration(
+                    "CONTAINER_INIT_BACKEND_ENDPOINT must be valid UTF-8".to_owned(),
+                ));
             }
-        });
-    runtime_dir.join("backend.sock")
+        },
+    };
+    AbstractEndpoint::new(name).map_err(|error| CliError::Configuration(error.to_string()))
+}
+
+fn backend_peer_uid(options: &CliOptions) -> Result<u32, CliError> {
+    if let Some(uid) = options.backend_peer_uid {
+        return Ok(uid);
+    }
+    match env::var("CONTAINER_INIT_BACKEND_PEER_UID") {
+        Ok(value) => value.parse::<u32>().map_err(|_| {
+            CliError::Configuration(
+                "CONTAINER_INIT_BACKEND_PEER_UID must be an unsigned integer".to_owned(),
+            )
+        }),
+        Err(env::VarError::NotPresent) => Ok(PosixSystem::new().current_ids().0),
+        Err(env::VarError::NotUnicode(_)) => Err(CliError::Configuration(
+            "CONTAINER_INIT_BACKEND_PEER_UID must be valid UTF-8".to_owned(),
+        )),
+    }
 }
 
 fn request_timeout(options: &CliOptions) -> Result<Duration, CliError> {

@@ -1,10 +1,11 @@
 use dev_env_core::{
-    CoreError, MaterializationDiagnostic, Materializer, ProviderJob, ProviderSupervisor,
-    RuntimeContext,
+    CoreError, MaterializationDiagnostic, MaterializationMetadata, MaterializationService,
+    Materializer, ProviderJob, ProviderSupervisor, RuntimeContext,
 };
 use dev_env_model::{
-    ConditionalEnvironmentVariable, ConfiguredValuePrecedence, EnvironmentConfig, EnvironmentPath,
-    FailurePolicy, MissingProviderPolicy, ModelError, Origin, PathMode, PrepareStep,
+    ConditionalEnvironmentVariable, ConfiguredValuePrecedence, EffectiveIdentity,
+    EnvironmentConfig, EnvironmentPath, FailurePolicy, Generation, MaterializationKey,
+    MaterializationKeyBuilder, MissingProviderPolicy, ModelError, Origin, PathMode, PrepareStep,
     ProviderConfig, ProviderReceipt, ResolvedConfig, Sensitivity, ShellConfig, ShellEnvConfig,
     ShellEnvFormat, ShellKind, ShellSelection, ValueTree, WorkspaceConfig,
 };
@@ -18,6 +19,8 @@ use std::{
     error::Error,
     path::PathBuf,
     sync::{Arc, Mutex},
+    thread::sleep,
+    time::Duration,
 };
 
 fn shell() -> ShellConfig {
@@ -118,6 +121,13 @@ fn context() -> RuntimeContext {
     .with_workspace_writable(true)
 }
 
+fn service_key(generation: Generation, identity: EffectiveIdentity) -> MaterializationKey {
+    let workspace = current_dir().unwrap();
+    MaterializationKeyBuilder::new(generation, workspace.clone(), workspace, "bash", identity)
+        .build()
+        .unwrap()
+}
+
 #[derive(Clone)]
 struct FakeRuntime {
     calls: Arc<Mutex<Vec<(String, ProviderContext)>>>,
@@ -148,14 +158,19 @@ impl ProviderSupervisor for FakeRuntime {
     }
 }
 
-fn result(provider: &str, path: Option<&str>, value: (&str, &str)) -> ProviderRunResult {
+fn result_with_sensitivity(
+    provider: &str,
+    path: Option<&str>,
+    value: (&str, &str),
+    sensitivity: Sensitivity,
+) -> ProviderRunResult {
     let mut set = BTreeMap::from([(value.0.to_owned(), value.1.to_owned())]);
     if let Some(path) = path {
         set.insert("PATH".to_owned(), path.to_owned());
     }
     ProviderRunResult::new(ProviderRunResultParts {
         provider: provider.to_owned(),
-        sensitivity: Sensitivity::Public,
+        sensitivity,
         detection: DetectionResult {
             executable: Some(PathBuf::from("/fake/provider")),
             matched_files: Vec::new(),
@@ -172,6 +187,10 @@ fn result(provider: &str, path: Option<&str>, value: (&str, &str)) -> ProviderRu
             completed_at: None,
         }),
     })
+}
+
+fn result(provider: &str, path: Option<&str>, value: (&str, &str)) -> ProviderRunResult {
+    result_with_sensitivity(provider, path, value, Sensitivity::Public)
 }
 
 #[test]
@@ -451,4 +470,78 @@ fn conditional_environment_variables_set_and_remove_sccache_wrapper() {
         output.environment().values()["CARGO_INCREMENTAL"].value(),
         "0"
     );
+}
+
+#[test]
+fn materialization_service_caches_successful_results() {
+    let identity = EffectiveIdentity::root();
+    let generation = Generation::new(1);
+    let key = service_key(generation, identity.clone());
+    let metadata = MaterializationMetadata::new("cache-test", generation, identity);
+    let context = context();
+    let mut service =
+        MaterializationService::new(Materializer::new(config().with_providers(BTreeMap::new())));
+
+    let first = service.prepare(key.clone(), &context, &metadata).unwrap();
+    let second = service.prepare(key, &context, &metadata).unwrap();
+
+    assert!(!first.cache_hit());
+    assert!(second.cache_hit());
+    assert_eq!(service.len(), 1);
+}
+
+#[test]
+fn materialization_service_enforces_lru_and_ttl_limits() {
+    let identity = EffectiveIdentity::root();
+    let context = context();
+    let generation = Generation::new(1);
+    let metadata = MaterializationMetadata::new("cache-test", generation, identity.clone());
+    let first_key = service_key(generation, identity.clone());
+    let second_key = service_key(Generation::new(2), identity.clone());
+    let mut service =
+        MaterializationService::new(Materializer::new(config().with_providers(BTreeMap::new())))
+            .with_limits(1, None);
+    service
+        .prepare(first_key.clone(), &context, &metadata)
+        .unwrap();
+    service
+        .prepare(second_key.clone(), &context, &metadata)
+        .unwrap();
+    assert_eq!(service.len(), 1);
+    assert!(service.cached(&first_key).is_none());
+    assert!(service.cached(&second_key).is_some());
+
+    let mut expiring =
+        MaterializationService::new(Materializer::new(config().with_providers(BTreeMap::new())))
+            .with_limits(2, Some(Duration::from_millis(1)));
+    expiring
+        .prepare(first_key.clone(), &context, &metadata)
+        .unwrap();
+    sleep(Duration::from_millis(5));
+    assert!(expiring.cached(&first_key).is_none());
+    assert!(expiring.is_empty());
+}
+
+#[test]
+fn materialization_service_does_not_cache_over_budget_sensitive_values() {
+    let identity = EffectiveIdentity::root();
+    let generation = Generation::new(1);
+    let key = service_key(generation, identity.clone());
+    let metadata = MaterializationMetadata::new("cache-test", generation, identity);
+    let fake = FakeRuntime::new(BTreeMap::from([(
+        "base".to_owned(),
+        Ok(result_with_sensitivity(
+            "base",
+            None,
+            ("SECRET", "value"),
+            Sensitivity::Sensitive,
+        )),
+    )]));
+    let materializer =
+        Materializer::with_provider_supervisor(only_provider(config(), "base"), fake);
+    let mut service = MaterializationService::new(materializer).with_sensitive_byte_limit(10);
+
+    service.prepare(key, &context(), &metadata).unwrap();
+
+    assert!(service.is_empty());
 }

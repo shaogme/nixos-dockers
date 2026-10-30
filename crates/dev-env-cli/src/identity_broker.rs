@@ -2,21 +2,24 @@
 //! effective identity model.
 
 use {
-    container_init_protocol::{IdentityBrokerClient, IdentityRequest as BrokerIdentityRequest},
+    container_init_protocol::{
+        AbstractEndpoint, IdentityBrokerClient, IdentityRequest as BrokerIdentityRequest,
+        DEFAULT_CONTAINER_INIT_BACKEND_ENDPOINT,
+    },
     dev_env_model::{
         EffectiveIdentity, IdentityPeer, IdentityRequest, IdentitySource, WorkspaceStatus,
     },
+    libc::geteuid,
     std::{
         collections::BTreeMap,
-        env::var_os,
+        env,
         error::Error,
         fmt::{Display, Formatter, Result as FmtResult},
-        path::{Path, PathBuf},
+        path::Path,
         time::Duration,
     },
 };
 
-const DEFAULT_SOCKET: &str = "/run/container-init/backend.sock";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -43,6 +46,13 @@ impl BrokerError {
 }
 
 impl IdentityBroker {
+    pub fn check() -> Result<(), BrokerError> {
+        configured_client()?
+            .hello()
+            .map(|_| ())
+            .map_err(|error| BrokerError::new(error.to_string()))
+    }
+
     pub fn resolve(
         request: &IdentityRequest,
         peer: IdentityPeer,
@@ -58,10 +68,7 @@ impl IdentityBroker {
             IdentityRequest::Root => BrokerIdentityRequest::Root,
             IdentityRequest::User { name } => BrokerIdentityRequest::User { name: name.clone() },
         };
-        let socket = var_os("DEVENV_IDENTITY_BROKER_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
-        let identity = IdentityBrokerClient::new(socket, DEFAULT_TIMEOUT)
+        let identity = configured_client()?
             .resolve(requested, cwd, inputs, environment)
             .map_err(|error| BrokerError::new(error.to_string()))?;
         let source = if identity.uid == 0 {
@@ -80,4 +87,34 @@ impl IdentityBroker {
         .with_run_as_root(identity.run_as_root)
         .with_workspace(WorkspaceStatus::Unavailable))
     }
+}
+
+fn configured_client() -> Result<IdentityBrokerClient, BrokerError> {
+    let endpoint_name = match env::var("CONTAINER_INIT_BACKEND_ENDPOINT") {
+        Ok(name) => name,
+        Err(env::VarError::NotPresent) => DEFAULT_CONTAINER_INIT_BACKEND_ENDPOINT.to_owned(),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(BrokerError::new(
+                "CONTAINER_INIT_BACKEND_ENDPOINT must be valid UTF-8",
+            ));
+        }
+    };
+    let endpoint = AbstractEndpoint::new(endpoint_name)
+        .map_err(|error| BrokerError::new(error.to_string()))?;
+    let peer_uid = match env::var("CONTAINER_INIT_BACKEND_PEER_UID") {
+        Ok(value) => value.parse::<u32>().map_err(|_| {
+            BrokerError::new("CONTAINER_INIT_BACKEND_PEER_UID must be an unsigned integer")
+        })?,
+        Err(env::VarError::NotPresent) => unsafe { geteuid() },
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(BrokerError::new(
+                "CONTAINER_INIT_BACKEND_PEER_UID must be valid UTF-8",
+            ));
+        }
+    };
+    Ok(IdentityBrokerClient::new(
+        endpoint,
+        peer_uid,
+        DEFAULT_TIMEOUT,
+    ))
 }

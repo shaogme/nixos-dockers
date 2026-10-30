@@ -27,9 +27,9 @@ container-init-posix ← container-init-core ← container-init-backend ← cont
 
 - `container-init-bootstrap-model` 只包含 serde 数据模型、验证、受限条件 AST、路径模板和静态 plan；不读取文件系统、不访问进程、不依赖 POSIX；
 - `container-init-bootstrap-loader` 负责 TOML 和 profile graph，直到得到已验证的 `BootstrapConfig` 为止；不执行 action；
-- `container-init-posix` 封装 passwd/group、UID/GID、文件 owner/mode 和 `flock` 等 POSIX 原语；
-- `container-init-core` 执行 plan，处理 identity、condition、filesystem、SSH、资源锁、receipt 和 handoff；
-- `container-init-backend` 持有单实例 snapshot，提供版本化 Unix socket RPC 和 PID 1 supervisor；
+- `container-init-posix` 封装 passwd/group、UID/GID、文件 owner/mode 和可写性检查等 POSIX 原语；
+- `container-init-core` 按 plan 顺序执行 action，处理 identity、condition、filesystem、SSH、receipt 和 handoff；
+- `container-init-backend` 持有单实例 snapshot，由单线程 poll 事件循环处理 Linux abstract endpoint RPC 和 PID 1 supervisor；
 - `container-init-cli` 负责参数解析、配置路径发现和 backend 启动/客户端命令；二进制名称是 `container-init`。
 
 保持这个方向很重要：bootstrap 不应反向依赖任何 provider、shellenv 或镜像特化逻辑。
@@ -78,8 +78,8 @@ POSIX、core 和 CLI 各有一个 root Linux 容器 fixture：
 对应的 Dockerfile 会构建并运行：
 
 - `container-init-posix`：真实容器中的 root account、权限、owner 和降权；
-- `container-init-core`：真实 POSIX action、SSH fixture、资源锁和 privilege boundary；
-- `container-init-backend`：真实 Unix socket ACL、singleton flock、RPC 和 supervisor；
+- `container-init-core`：真实 POSIX action、SSH fixture、action 顺序和 privilege boundary；
+- `container-init-backend`：abstract endpoint peer credential 检查、endpoint 唯一性、RPC 和 supervisor；
 - `container-init-cli`：profile 目录读取、plan/doctor/run、runtime handoff 和 SSH capability。
 
 这几项测试要求 Docker 可用，且 fixture 默认以 root 运行。镜像名可以通过各脚本使用的环境变量覆盖：
@@ -110,17 +110,18 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 - passwd/group 原子映射和 login shell 更新；
 - root 到 target 的降权；
 - 条件跳过、失败策略和依赖跳过；
-- 资源锁冲突、FIFO、公平批量获取与 handoff argv；
+- 顺序 action 执行、条件/失败策略和 handoff argv；
 - receipt 原子写入和 content 隐藏；
 - SSH host key 生成、重入、半成品拒绝、symlink 拒绝和 authorized keys 冲突。
 
 ### Backend
 
-- v4 长度前缀消息、无 request id、能力摘要、统一字节上限、frame in-flight 预算与截断校验，Prepare/Commit/Abort/结果查询状态机，以及一个绝对 deadline 下的连接、读写、退避和 Preflight 等待；
+- v4 长度前缀消息、无 request id、能力摘要、frame 限额与截断校验，Prepare/Commit/Abort/结果查询状态机，以及非阻塞连接 frame 状态机；
 - Prepare 无 reconcile 副作用、事务 UID/GID/snapshot 绑定、重复 Commit 幂等、Abort/TTL 和提交结果不确定时的原 token 查询；
 - Linux 容器 fixture 覆盖目标凭据下的 ACL `chdir`、具名补充组授权、非 root 完整凭据匹配，以及 Preflight 失败不 Commit；单元测试覆盖 cwd 设备号/inode 替换比较和 handoff 子进程信号转发；
 - plan 分页游标与 snapshot 一致性校验；执行帧可能已发送时不重试，并报告结果未知；
-- socket/lock 的 symlink、属主、权限和类型校验；陈旧 socket 清理拒绝删除被替换的 inode。
+- endpoint bind 冲突时只查询并验证现有 backend，不清理或接管 abstract endpoint；
+- 慢速 header、超长 frame、body admission、response frame 上限、deadline 和 shutdown signal 的事件循环路径。
 
 ### CLI
 
@@ -148,7 +149,7 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 文档内容以源码行为为准，提交前可执行：
 
 ```bash
-rg -n 'kind =|\[bootstrap|CONTAINER_INIT_|--(profile|workspace|input|backend-socket)' \
+rg -n 'kind =|\[bootstrap|CONTAINER_INIT_|--(profile|workspace|input|backend-endpoint|backend-peer-uid)' \
   README.md docs crates
 
 git diff --check

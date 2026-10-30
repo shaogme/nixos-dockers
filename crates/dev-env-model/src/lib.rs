@@ -25,8 +25,8 @@ mod value;
 pub use backend::{
     BackendError, BackendProtocolError, BackendRequest, BackendRequestEnvelope,
     BackendRequestMessage, BackendResponse, BackendResponseEnvelope, BackendResponseMessage,
-    BackendState, BackendStatus, HelloInfo, PrepareResponse, PreparedResponse,
-    ProviderDiagnosticSummary, ReceiptSummary, ShellInvocation, TrustTarget,
+    BackendStatus, ControlPlaneState, HelloInfo, InitialRuntimeState, PrepareResponse,
+    PreparedResponse, ProviderDiagnosticSummary, ReceiptSummary, ShellInvocation, TrustTarget,
     BACKEND_PROTOCOL_VERSION, DEVENV_BACKEND_ERROR_VERSION, DEVENV_BACKEND_PROTOCOL_VERSION,
     MAX_BACKEND_FRAME_BYTES,
 };

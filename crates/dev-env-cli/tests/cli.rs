@@ -1,16 +1,15 @@
 use {
-    dev_env_cli::{Cli, CliCommand, CliError, ParseError},
+    dev_env_cli::{BackendTransport, Cli, CliCommand, CliError, ParseError},
     dev_env_loader::LoaderError,
     dev_env_model::ModelError,
-    fs2::FileExt,
     serde_json::{from_slice, Value as JsonValue},
     std::{
         env::temp_dir,
         error::Error,
         ffi::OsString,
-        fs::{self, OpenOptions},
+        fs,
         io::ErrorKind,
-        path::{Path, PathBuf},
+        path::PathBuf,
         process::{Command, Output},
         sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
@@ -21,6 +20,17 @@ use {
 use libc::geteuid;
 
 static BACKEND_LIFECYCLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn backend_endpoint_occupied() -> bool {
+    match BackendTransport::bind() {
+        Ok(listener) => {
+            drop(listener);
+            false
+        }
+        Err(error) if error.kind() == ErrorKind::AddrInUse => true,
+        Err(error) => panic!("could not probe backend abstract endpoint: {error}"),
+    }
+}
 
 struct Fixture {
     root: PathBuf,
@@ -166,6 +176,19 @@ fn parser_rejects_malformed_cli_values_with_typed_errors() {
         Cli::parse_strings(["dev-env", "backend", "status", "--socket", "/tmp/backend.sock"]),
         Err(ParseError::UnexpectedArgument { argument, .. }) if argument == "--socket"
     ));
+    let wait_ready = Cli::parse_strings([
+        "dev-env",
+        "backend",
+        "wait-ready",
+        "--startup-timeout",
+        "90000",
+    ])
+    .unwrap();
+    assert_eq!(wait_ready.options().startup_timeout_ms, Some(90_000));
+    assert!(matches!(
+        Cli::parse_strings(["dev-env", "--startup-timeout", "0", "exec", "true"]),
+        Err(ParseError::InvalidStartupTimeout { .. })
+    ));
 }
 
 #[test]
@@ -239,18 +262,35 @@ fn print_exec_shell_login_and_shim_share_the_same_environment() {
 }
 
 #[test]
-fn client_does_not_fallback_to_profile_when_backend_is_unavailable() {
+fn client_reports_startup_timeout_when_backend_is_unavailable() {
     let _backend_lifecycle = BACKEND_LIFECYCLE_TEST_LOCK
         .lock()
         .expect("backend lifecycle test lock poisoned");
+    if backend_endpoint_occupied() {
+        eprintln!(
+            "skipping unavailable-backend test because a runtime instance owns the fixed endpoint"
+        );
+        return;
+    }
     let fixture = Fixture::new();
-    let output = fixture.command().arg("print").output().unwrap();
-    assert!(!output.status.success());
+    let output = fixture
+        .command()
+        .env("DEVENV_STARTUP_TIMEOUT_MS", "1")
+        .arg("print")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(74), "{stderr}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("DEVENV-E-BACKEND-UNAVAILABLE"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("DEVENV-E-BACKEND-STARTUP-TIMEOUT"),
+        "{stderr}"
     );
+    assert!(stderr.contains("last_state=unavailable"), "{stderr}");
+    assert!(
+        stderr.contains("startup_phase=endpoint_not_available"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("waited_ms="), "{stderr}");
     assert!(output.stdout.is_empty());
 }
 
@@ -259,26 +299,24 @@ fn backend_startup_failure_is_not_reported_as_success() {
     let _backend_lifecycle = BACKEND_LIFECYCLE_TEST_LOCK
         .lock()
         .expect("backend lifecycle test lock poisoned");
-    let lock_path = Path::new("/run/dev-env/backend.lock");
-    if let Ok(lock) = OpenOptions::new().read(true).write(true).open(lock_path) {
-        match lock.try_lock_exclusive() {
-            Ok(()) => lock.unlock().unwrap(),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                eprintln!(
-                    "skipping backend startup test because a runtime instance owns the fixed lock"
-                );
-                return;
-            }
-            Err(error) => panic!("could not probe backend instance lock: {error}"),
-        }
+    if backend_endpoint_occupied() {
+        eprintln!(
+            "skipping backend startup test because a runtime instance owns the fixed endpoint"
+        );
+        return;
     }
     let fixture = Fixture::new();
     let output = fixture
         .command()
         .env(
-            "DEVENV_IDENTITY_BROKER_SOCKET",
-            fixture.root.join("missing-identity-broker.sock"),
+            "CONTAINER_INIT_BACKEND_ENDPOINT",
+            fixture
+                .root
+                .join("missing-identity-broker")
+                .to_string_lossy()
+                .into_owned(),
         )
+        .env("CONTAINER_INIT_BACKEND_PEER_UID", "0")
         .args(["backend", "run", "--initial-exec", "--", "/bin/true"])
         .output()
         .unwrap();

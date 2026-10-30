@@ -5,8 +5,8 @@ use dev_env_model::{
 use dev_env_provider::{
     decode_request, encode_response, CommandExecutor, CommandOutput, CommandRequest,
     ExecutableLocator, GenericProvider, ProtocolOperation, ProtocolRequest, ProtocolResponse,
-    Provider, ProviderContext, ProviderDiagnostic, ProviderRunner, ProviderRuntimeError,
-    ProviderRuntimeErrorKind, SystemExecutableLocator,
+    Provider, ProviderContext, ProviderDiagnostic, ProviderProcessSupervisor, ProviderRunner,
+    ProviderRuntimeError, ProviderRuntimeErrorKind, SystemExecutableLocator,
 };
 use serde_json::{from_slice, to_vec};
 use std::{
@@ -17,9 +17,10 @@ use std::{
     process::id,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 struct TempWorkspace {
@@ -43,6 +44,13 @@ impl Drop for TempWorkspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn process_executor() -> dev_env_provider::ProcessExecutor {
+    static SUPERVISOR: OnceLock<ProviderProcessSupervisor> = OnceLock::new();
+    SUPERVISOR
+        .get_or_init(ProviderProcessSupervisor::new)
+        .executor()
 }
 
 #[derive(Clone)]
@@ -359,7 +367,7 @@ fn real_process_executor_passes_an_argument_as_data() {
         .with_output_limits(1024, 1024);
     let output = SystemExecutableLocator;
     assert!(output.locate(program, &BTreeMap::new()).unwrap().is_some());
-    let output = dev_env_provider::ProcessExecutor.execute(&request).unwrap();
+    let output = process_executor().execute(&request).unwrap();
     assert!(output.succeeded());
     assert_eq!(output.stdout(), b"value; not shell code");
 }
@@ -482,7 +490,82 @@ fn process_executor_enforces_a_timeout() {
         .with_environment(BTreeMap::new())
         .with_timeout(Some(Duration::from_millis(20)))
         .with_output_limits(1024, 1024);
-    let output = dev_env_provider::ProcessExecutor.execute(&request).unwrap();
+    let output = process_executor().execute(&request).unwrap();
     assert!(output.timed_out());
     assert!(!output.succeeded());
+}
+
+#[test]
+fn shared_supervisor_keeps_concurrent_direct_child_statuses_separate() {
+    let executor = process_executor();
+    let program = "/bin/sh";
+    if !Path::new(program).is_file() {
+        return;
+    }
+    let first_request = CommandRequest::new(program, temp_dir())
+        .with_args(["-c".to_owned(), "sleep 0.03; exit 23".to_owned()])
+        .with_environment(BTreeMap::from([(
+            "PATH".to_owned(),
+            "/usr/bin:/bin".to_owned(),
+        )]))
+        .with_timeout(Some(Duration::from_secs(1)));
+    let second_request = CommandRequest::new(program, temp_dir())
+        .with_args(["-c".to_owned(), "sleep 0.01; exit 42".to_owned()])
+        .with_environment(BTreeMap::from([(
+            "PATH".to_owned(),
+            "/usr/bin:/bin".to_owned(),
+        )]))
+        .with_timeout(Some(Duration::from_secs(1)));
+    let first_executor = executor.clone();
+    let first = thread::spawn(move || first_executor.execute(&first_request).unwrap());
+    let second = thread::spawn(move || executor.execute(&second_request).unwrap());
+
+    assert_eq!(first.join().unwrap().status(), Some(23));
+    assert_eq!(second.join().unwrap().status(), Some(42));
+}
+
+#[test]
+fn process_timeout_reaps_a_descendant_that_leaves_the_command_group() {
+    let program = "/bin/sh";
+    let setsid = if Path::new("/usr/bin/setsid").is_file() {
+        "/usr/bin/setsid"
+    } else if Path::new("/bin/setsid").is_file() {
+        "/bin/setsid"
+    } else {
+        return;
+    };
+    if !Path::new(program).is_file() {
+        return;
+    }
+    let marker = temp_dir().join(format!(
+        "dev-env-provider-child-{}-{}",
+        id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let command = format!(
+        "{setsid} /bin/sh -c 'sleep 30' >/dev/null 2>&1 & echo $! > \"$PID_FILE\"; sleep 30"
+    );
+    let request = CommandRequest::new(program, temp_dir())
+        .with_args(["-c".to_owned(), command])
+        .with_environment(BTreeMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("PID_FILE".to_owned(), marker.display().to_string()),
+        ]))
+        .with_timeout(Some(Duration::from_millis(100)));
+    let output = process_executor().execute(&request).unwrap();
+
+    assert!(output.timed_out());
+    let child_pid = fs::read_to_string(&marker).unwrap();
+    let child_path = PathBuf::from(format!("/proc/{}", child_pid.trim()));
+    for _ in 0..100 {
+        if !child_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!child_path.exists(), "provider descendant was not reaped");
+    let _ = fs::remove_file(marker);
 }

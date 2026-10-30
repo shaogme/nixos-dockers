@@ -8,7 +8,7 @@
 
 - [配置与文件发现](docs/configuration.md)：镜像、管理员、用户、工作区和运行时配置的路径、优先级与覆盖方式。
 - [Environment DSL 参考](docs/dsl.md)：schema v1 的完整 TOML 字段、类型、条件和显式 override 语义。
-- [Provider 参考](docs/providers.md)：探测、prepare、shellenv、依赖、锁、输出解析和 provider 示例。
+- [Provider 参考](docs/providers.md)：探测、prepare、shellenv、依赖、进程监督、输出解析和 provider 示例。
 - [运行时与 CLI](docs/runtime.md)：`exec`、`shell`、`login-shell`、`shim`、`print`、`explain`、`doctor` 和 `trust`。
 - [开发与测试](docs/development.md)：crate 分层、构建、测试、Docker harness 和源码导航。
 
@@ -45,6 +45,7 @@ profile TOML / overlay / runtime input / CLI
 - 通过 argv 调用通用 provider，不拼接 shell 命令；
 - 解析受限的 shell、dotenv 或 JSON 环境输出；
 - 由单实例 backend 持有 materializer、provider jobs 和 generation cache；短命 client 只发送 Prepare。
+- 由 backend coordinator 独占 snapshot、状态、cache 和 in-flight 请求；provider 子进程由共享 actor 监督。
 
 它不负责：
 
@@ -160,7 +161,7 @@ cargo clippy --workspace --all-targets --locked
 bootstrap namespace、UID/GID 解析、账户和目录 reconcile，并把 root supervisor handoff
 给唯一的 `dev-env backend`。backend 加载一次 profile snapshot，通过 container-init
 identity broker 为每个 request/provider 解析身份，再执行 provider。后续 `dev-env` client
-通过 Linux abstract endpoint `@dev-env.backend.v4` 请求环境。
+通过 Linux abstract endpoint `@dev-env.backend.v5` 请求环境。初始 shell/service 仍在准备时，backend 控制面已经可以服务请求；client 会在启动 deadline 内自动等待 backend 可服务。可用 `dev-env backend status --json` 分别查看 `control_plane` 与 `initial_runtime` 状态。
 
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |
@@ -205,7 +206,7 @@ nixos-dockers/
     ├── dev-env-model/     # schema、值树、条件、输入、来源和静态校验
     ├── dev-env-loader/    # TOML 读取、profile graph、overlay 和严格合并
     ├── dev-env-core/      # RuntimeContext、Materializer、PATH 和 provider 编排
-    ├── dev-env-provider/  # provider 探测、argv 执行、输出解析、锁和 receipt
+    ├── dev-env-provider/  # provider 探测、argv 执行、进程监督、输出解析和 receipt
     ├── dev-env-shell/     # shell argv、环境格式化和 shim
     ├── dev-env-cli/       # CLI 参数、配置发现、进程边界和诊断命令
     ├── container-init-bootstrap-model/
@@ -226,9 +227,9 @@ nixos-dockers/
 - profile 继承、循环/缺失父 profile 检查和严格冲突诊断；
 - admin、user、workspace、runtime 和 CLI 的加载层；
 - bool、enum、integer、path、string 类型输入及 alias；
-- provider 的文件探测、依赖排序、prepare、shellenv、超时、锁和 receipt；
-- backend v2 的单实例 lock/socket、immutable startup snapshot、状态/诊断请求、reload
-  generation，以及 provider process group/subreaper 回收边界；
+- provider 的文件探测、依赖排序、prepare、shellenv、超时、进程监督和 receipt；
+- protocol v5 backend 的 abstract socket 单实例、immutable startup snapshot、状态/诊断请求、
+  reload generation、coordinator-owned cache 和 provider process supervisor actor；
 - shell、dotenv、JSON 输出解析与敏感值脱敏；
 - `exec`、`shell`、`login-shell`、`shim`、`print`、`explain`、`doctor`、`trust`；
 - model、loader、core、provider、shell、CLI 的单元测试，以及 Linux Docker 真实进程测试。
