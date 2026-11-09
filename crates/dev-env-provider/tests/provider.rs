@@ -4,9 +4,10 @@ use dev_env_model::{
 };
 use dev_env_provider::{
     decode_request, encode_response, CommandExecutor, CommandOutput, CommandRequest,
-    ExecutableLocator, GenericProvider, ProtocolOperation, ProtocolRequest, ProtocolResponse,
-    Provider, ProviderContext, ProviderDiagnostic, ProviderProcessSupervisor, ProviderRunner,
-    ProviderRuntimeError, ProviderRuntimeErrorKind, SystemExecutableLocator,
+    detect, CommandError, ExecutableLocator, GenericProvider, ProcessExecutor, ProtocolError,
+    ProtocolOperation, ProtocolRequest, ProtocolResponse, Provider, ProviderContext,
+    ProviderDiagnostic, ProviderProcessSupervisor, ProviderRunner, ProviderRuntimeError,
+    ProviderRuntimeErrorKind, SystemExecutableLocator,
 };
 use serde_json::{from_slice, to_vec};
 use std::{
@@ -46,7 +47,7 @@ impl Drop for TempWorkspace {
     }
 }
 
-fn process_executor() -> dev_env_provider::ProcessExecutor {
+fn process_executor() -> ProcessExecutor {
     static SUPERVISOR: OnceLock<ProviderProcessSupervisor> = OnceLock::new();
     SUPERVISOR
         .get_or_init(ProviderProcessSupervisor::new)
@@ -87,7 +88,7 @@ impl CommandExecutor for FakeExecutor {
     fn execute(
         &self,
         request: &CommandRequest,
-    ) -> Result<CommandOutput, dev_env_provider::CommandError> {
+    ) -> Result<CommandOutput, CommandError> {
         self.calls.lock().unwrap().push(request.clone());
         Ok(self
             .outputs
@@ -342,7 +343,7 @@ fn protocol_round_trip_keeps_typed_operation_and_response_error() {
 
     let response = ProtocolResponse {
         ok: false,
-        error: Some(dev_env_provider::ProtocolError::UnsupportedProtocol {
+        error: Some(ProtocolError::UnsupportedProtocol {
             found: 2,
             expected: 1,
         }),
@@ -431,7 +432,7 @@ fn glob_detection_supports_nested_files_without_following_a_shell() {
     fs::create_dir_all(workspace.path.join("nested/project")).unwrap();
     fs::write(workspace.path.join("nested/project/env.json"), "{}\n").unwrap();
     let config = provider(Vec::new(), None).with_detect_files(vec!["**/*.json".to_owned()]);
-    let result = dev_env_provider::detect(
+    let result = detect(
         &config,
         &workspace.path,
         &BTreeMap::new(),
@@ -458,7 +459,7 @@ fn protocol_decoder_rejects_a_wrong_version_as_a_typed_protocol_error() {
     assert!(matches!(
         decode_request(&bytes),
         Err(dev_env_provider::ProtocolCodecError::Protocol {
-            source: dev_env_provider::ProtocolError::UnsupportedProtocol {
+            source: ProtocolError::UnsupportedProtocol {
                 found: 2,
                 expected: 1
             }
@@ -470,7 +471,7 @@ fn protocol_decoder_rejects_a_wrong_version_as_a_typed_protocol_error() {
     assert!(matches!(
         decode_request(&bytes),
         Err(dev_env_provider::ProtocolCodecError::Protocol {
-            source: dev_env_provider::ProtocolError::InvalidRequest { .. }
+            source: ProtocolError::InvalidRequest { .. }
         })
     ));
 }
