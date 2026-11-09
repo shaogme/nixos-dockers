@@ -4,7 +4,7 @@ WORKDIR /workspace/nixos-dockers
 COPY . .
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends acl \
+    && apt-get install --yes --no-install-recommends acl util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 RUN cargo test --locked -p container-init-cli --features docker-tests --test docker --no-run

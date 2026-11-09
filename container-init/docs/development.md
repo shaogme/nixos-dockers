@@ -29,7 +29,7 @@ container-init-posix ← container-init-core ← container-init-backend ← cont
 - `container-init-bootstrap-loader` 负责 TOML 和 profile graph，直到得到已验证的 `BootstrapConfig` 为止；不执行 action；
 - `container-init-posix` 封装 passwd/group、UID/GID、文件 owner/mode 和可写性检查等 POSIX 原语；
 - `container-init-core` 按 plan 顺序执行 action，处理 identity、condition、filesystem、SSH、receipt 和 handoff；
-- `container-init-backend` 持有单实例 snapshot，由单线程 poll 事件循环处理 Linux abstract endpoint RPC 和 PID 1 supervisor；
+- `container-init-backend` 持有单实例 snapshot，由单线程 poll 事件循环处理 Linux abstract endpoint RPC；lease 持有者在启动 reconcile 前启用 subreaper，并由唯一 child reaper 持续回收 handoff 与重新托管的子进程；
 - `container-init-cli` 负责参数解析、配置路径发现和 backend 启动/客户端命令；二进制名称是 `container-init`。
 
 保持这个方向很重要：bootstrap 不应反向依赖任何 provider、shellenv 或镜像特化逻辑。
@@ -67,6 +67,16 @@ cargo test --locked -p container-init-cli --test cli -- --nocapture
 `Cargo.lock` 是 workspace 的锁定依赖清单；修改依赖时应保持 `--locked` 测试，避免本地隐式更新依赖版本。
 
 如果只构建或测试 container-init 的一个 crate，从 workspace 根目录使用 `-p <package>` 选择目标。
+
+child reaper 的 Nix VM fixture 从 workspace 根目录构建并运行：
+
+```bash
+nix-build tests/container-init-reaper-vm.nix -A driver
+./result/bin/nixos-test-driver
+```
+
+该 fixture 用 Nix 构建的 `container-init` 启动非 PID 1 backend，在 VM 中检查常驻期间被重新
+托管的后代；Docker CLI fixture 则验证 container-init 直接作为 PID namespace init 的情形。
 
 ## 3. Docker 集成测试
 
@@ -131,7 +141,8 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 - Linux 容器 fixture 覆盖目标凭据下的 ACL `chdir`、具名补充组授权、非 root 完整凭据匹配，以及 Preflight 失败不 Commit；单元测试覆盖 cwd 设备号/inode 替换比较和 handoff 子进程信号转发；
 - plan 分页游标与 snapshot 一致性校验；执行帧可能已发送时不重试，并报告结果未知；
 - endpoint bind 冲突时只查询并验证现有 backend，不清理或接管 abstract endpoint；
-- 慢速 header、超长 frame、body admission、response frame 上限、deadline 和 shutdown signal 的事件循环路径。
+- 慢速 header、超长 frame、body admission、response frame 上限、deadline 和 shutdown signal 的事件循环路径；
+- Linux child reaper 覆盖正常/信号退出状态、非 handoff child 状态丢弃、handoff PID 回收后被复用、有界批次让出、`EINTR` 重试、`ECHILD` 与暂时无退出状态的区分，以及 syscall 错误传播；启动测试验证信号初始化失败会释放 listener 且不会启动 action/handoff，并验证 handoff 退出与关闭信号同轮观察时优先按 handoff 退出触发清理。CLI 进程测试等待 backend 运行期间已收养的退出 PID 消失，并在孤儿退出风暴中验证关闭期限；Docker fixture 验证 `container-init` 直接作为 PID namespace init 时的持续回收。
 
 ### CLI
 

@@ -96,10 +96,21 @@ container-init --profile coding-images run -- tool --flag 'value with spaces'
 1. 立即绑定 Linux abstract endpoint `@container-init.backend.v4`；bind 成功者持有 listener 并成为唯一 backend；
 2. 若 endpoint 已占用，通过 endpoint 校验 peer UID 并查询已有 backend 状态，不运行启动 action；
 3. 加载 image/admin profile 目录并选择 profile，构建不可变 snapshot；
-4. 完成启动 reconcile，并以 root service 身份启动唯一的
-   runtime backend handoff 子进程；
-5. backend 监督初始子进程，初始子进程退出码成为容器退出码；
-6. 收到终止信号时转发给 backend，回收子进程并关闭 listener 释放 endpoint。
+4. lease 持有者在首个 action/子进程前重置 `SIGCHLD` disposition、屏蔽 `SIGCHLD` 和关闭信号、
+   创建 signalfd，并启用 Linux child subreaper；任一步失败都在启动 action 前失败并释放
+   endpoint；
+5. 完成启动 reconcile，再以 root service 身份启动唯一的 runtime backend handoff 子进程；
+6. backend 通过唯一 child reaper 持续 drain `waitpid(-1, WNOHANG)`，每轮最多尝试 64 次后
+   回到事件循环处理信号、连接和期限；初始 handoff 的退出码（或 `128 + signal`）
+   成为容器退出码，其他已重新托管的子进程状态只被消费；
+7. 收到首次关闭信号时关闭 listener 并转发给 handoff 进程组。handoff 自行退出也会启动
+   `SIGTERM` 清理；5 秒宽限期后升级到 `SIGKILL`，最迟约 6 秒结束，若 handoff 已回收且
+   `waitpid` 确认没有可等待子进程则可提前结束。
+
+child subreaper 只接收 Linux 重新托管给它的后代。仍有存活父进程的孙进程不是 backend 的
+wait 范围；当父进程退出且内核将其重新托管给最近的 subreaper 后，backend 才能等待并回收它。
+当 `container-init` 不是 PID namespace 的 PID 1 时，收养子进程的 PPID 是 backend PID，不能
+据此假设为 `1`。handoff 及 bootstrap 的 `ssh-keygen` 子进程在 exec 前解除 backend 屏蔽的信号。
 
 container-init v4 RPC 和 dev-env 的身份代理共用 `@container-init.backend.v4`。它只在当前
 network namespace 内可见；同一 namespace 中的 backend 必须使用不同 endpoint 名称。

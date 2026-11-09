@@ -3,8 +3,8 @@ use dev_env_model::{
     Sensitivity, ShellEnvConfig, ShellEnvFormat, ValueTree,
 };
 use dev_env_provider::{
-    decode_request, encode_response, CommandExecutor, CommandOutput, CommandRequest,
-    detect, CommandError, ExecutableLocator, GenericProvider, ProcessExecutor, ProtocolError,
+    decode_request, detect, encode_response, CommandError, CommandExecutor, CommandOutput,
+    CommandRequest, ExecutableLocator, GenericProvider, ProcessExecutor, ProtocolError,
     ProtocolOperation, ProtocolRequest, ProtocolResponse, Provider, ProviderContext,
     ProviderDiagnostic, ProviderProcessSupervisor, ProviderRunner, ProviderRuntimeError,
     ProviderRuntimeErrorKind, SystemExecutableLocator,
@@ -85,10 +85,7 @@ impl FakeExecutor {
 }
 
 impl CommandExecutor for FakeExecutor {
-    fn execute(
-        &self,
-        request: &CommandRequest,
-    ) -> Result<CommandOutput, CommandError> {
+    fn execute(&self, request: &CommandRequest) -> Result<CommandOutput, CommandError> {
         self.calls.lock().unwrap().push(request.clone());
         Ok(self
             .outputs

@@ -1,8 +1,8 @@
 use dev_env_model::{
     BackendError, BackendRequest, BackendRequestMessage, BackendResponse, BackendResponseMessage,
     BackendStatus, ControlPlaneState, EffectiveIdentity, Generation, IdentityRequest,
-    InitialRuntimeState, MaterializationKeyBuilder, RequestContext, RequestMode, DEVENV_BACKEND_ERROR_VERSION,
-    DEVENV_BACKEND_PROTOCOL_VERSION,
+    InitialRuntimeState, MaterializationKeyBuilder, RequestContext, RequestMode,
+    DEVENV_BACKEND_ERROR_VERSION, DEVENV_BACKEND_PROTOCOL_VERSION,
 };
 use serde_json::to_value;
 use std::collections::BTreeMap;

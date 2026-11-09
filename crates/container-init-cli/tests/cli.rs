@@ -7,16 +7,22 @@ use container_init_protocol::{
     read_message_until, AbstractEndpoint, BackendState, ExecTransactionState, ServerMessage,
     ServerResponse, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
 };
-use libc::{kill, SIGTERM};
+use libc::{
+    _exit, fork, kill, sigaction, sigemptyset, usleep, SA_NOCLDWAIT, SIGCHLD, SIGINT, SIGKILL,
+    SIGTERM, SIG_IGN,
+};
 use serde_json::{from_slice, Value};
 use std::{
     collections::BTreeMap,
-    env, fs,
-    io::Write,
+    env,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    mem,
     os::unix::fs::PermissionsExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    thread,
+    ptr, thread,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
@@ -167,6 +173,299 @@ fn wait_for_backend(child: &mut Child, socket: &Path) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("backend did not become ready");
+}
+
+struct ProcessStat {
+    state: char,
+    parent_pid: u32,
+}
+
+fn process_stat(pid: u32) -> Option<ProcessStat> {
+    let contents = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = contents
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some(ProcessStat {
+        state: fields.first()?.chars().next()?,
+        parent_pid: fields.get(1)?.parse().ok()?,
+    })
+}
+
+#[test]
+fn orphan_process_helper_when_configured() {
+    let Ok(pid_file) = env::var("CONTAINER_INIT_TEST_ORPHAN_PID_FILE") else {
+        return;
+    };
+    let child_pid = unsafe { fork() };
+    assert!(
+        child_pid >= 0,
+        "fork failed: {}",
+        io::Error::last_os_error()
+    );
+    if child_pid == 0 {
+        unsafe {
+            usleep(1_500_000);
+            _exit(0);
+        }
+    }
+    let mut pid_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(pid_file)
+        .unwrap();
+    writeln!(pid_file, "{child_pid}").unwrap();
+}
+
+#[test]
+fn orphan_process_flood_helper_when_configured() {
+    if env::var_os("CONTAINER_INIT_TEST_ORPHAN_FLOOD").is_none() {
+        return;
+    }
+    for _ in 0..80 {
+        let child_pid = unsafe { fork() };
+        assert!(
+            child_pid >= 0,
+            "fork failed: {}",
+            io::Error::last_os_error()
+        );
+        if child_pid == 0 {
+            unsafe {
+                usleep(200_000);
+                _exit(0);
+            }
+        }
+    }
+}
+
+#[test]
+fn active_subreaper_reaps_orphaned_descendants_during_service() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let pid_file = workspace.join("orphan-pids");
+    let helper = env::current_exe().unwrap();
+    let handoff = format!(
+        "trap 'exit 0' TERM; while :; do CONTAINER_INIT_TEST_ORPHAN_PID_FILE={} {} --exact orphan_process_helper_when_configured --nocapture >/dev/null 2>&1; sleep 0.02; done",
+        pid_file.display(),
+        helper.display()
+    );
+    let mut backend = start_backend(&profiles, &workspace, &socket, &handoff);
+    wait_for_backend(&mut backend, &socket);
+    let client = BackendClient::new(
+        endpoint_for_path(&socket),
+        PosixSystem::new().current_ids().0,
+        Duration::from_secs(2),
+    );
+    let backend_pid = client.status().unwrap().backend_pid;
+    let children_path = format!("/proc/{backend_pid}/task/{backend_pid}/children");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut adopted_pid = None;
+    while Instant::now() < deadline {
+        let pids = fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        for pid in pids {
+            if let Some(stat) = process_stat(pid) {
+                if stat.parent_pid == backend_pid {
+                    adopted_pid.get_or_insert(pid);
+                    assert_ne!(stat.state, 'Z', "adopted process {pid} became a zombie");
+                }
+            }
+        }
+        let children = fs::read_to_string(&children_path).unwrap_or_default();
+        for child_pid in children
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+        {
+            if let Some(stat) = process_stat(child_pid) {
+                assert_ne!(stat.state, 'Z', "backend child {child_pid} became a zombie");
+            }
+        }
+        if adopted_pid.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let adopted_pid = adopted_pid.unwrap_or_else(|| {
+        panic!("no orphaned descendant was reparented to backend PID {backend_pid}")
+    });
+
+    let reap_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        client
+            .status()
+            .expect("backend should remain available while reaping");
+        match process_stat(adopted_pid) {
+            None => break,
+            Some(stat) => assert_ne!(
+                stat.state, 'Z',
+                "adopted process {adopted_pid} exited but remained a zombie while backend was running"
+            ),
+        }
+        assert!(
+            Instant::now() < reap_deadline,
+            "adopted process {adopted_pid} did not exit while backend remained running"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn shutdown_deadline_is_checked_during_an_orphan_exit_flood() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let helper = env::current_exe().unwrap();
+    let handoff = format!(
+        "trap 'exit 0' TERM; (trap '' TERM; while :; do CONTAINER_INIT_TEST_ORPHAN_FLOOD=1 {} --exact orphan_process_flood_helper_when_configured --nocapture >/dev/null 2>&1; sleep 0.1; done) & while :; do sleep 1; done",
+        helper.display()
+    );
+    let mut backend = start_backend(&profiles, &workspace, &socket, &handoff);
+    wait_for_backend(&mut backend, &socket);
+    thread::sleep(Duration::from_millis(400));
+
+    let started = Instant::now();
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGTERM) }, 0);
+    let deadline = started + Duration::from_secs(7);
+    loop {
+        if let Some(status) = backend.try_wait().unwrap() {
+            assert!(
+                started.elapsed() < Duration::from_secs(7),
+                "shutdown took longer than its hard deadline: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(status.code(), Some(0));
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = unsafe { kill(backend.id() as i32, SIGKILL) };
+            let status = backend.wait().unwrap();
+            panic!("backend missed shutdown deadline during exit flood: {status}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn run_returns_signal_derived_handoff_status() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let output = Command::new(binary())
+        .env("CONTAINER_INIT_RUNTIME_DIR", temp.path())
+        .args(common_args(&profiles, &workspace, &socket))
+        .args(["run", "--", "kill -TERM $$"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(128 + SIGTERM));
+}
+
+#[test]
+fn shutdown_signal_is_forwarded_to_the_handoff_process_group() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let marker = workspace.join("received-int");
+    let script = format!(
+        "trap 'printf received > {}; exit 0' INT; while :; do sleep 1; done",
+        marker.display()
+    );
+    let mut backend = start_backend(&profiles, &workspace, &socket, &script);
+    wait_for_backend(&mut backend, &socket);
+
+    assert_eq!(unsafe { kill(backend.id() as i32, SIGINT) }, 0);
+    assert_eq!(backend.wait().unwrap().code(), Some(0));
+    assert_eq!(fs::read_to_string(marker).unwrap(), "received");
+}
+
+#[test]
+fn grace_expiry_kills_handoff_group_even_after_leader_exit() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let child_pid_file = workspace.join("term-ignoring-child-pid");
+    let child_ready_file = workspace.join("term-ignoring-child-ready");
+    let script = format!(
+        "/bin/sh -c 'trap \"\" TERM; : > \"$1\"; exec sleep 30' _ {} & echo $! > {}; while [ ! -f {} ]; do sleep 0.01; done; exit 23",
+        child_ready_file.display(),
+        child_pid_file.display(),
+        child_ready_file.display()
+    );
+    let started = Instant::now();
+    let output = Command::new(binary())
+        .env("CONTAINER_INIT_RUNTIME_DIR", temp.path())
+        .args(common_args(&profiles, &workspace, &socket))
+        .args(["run", "--"])
+        .arg(script)
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let child_pid = fs::read_to_string(child_pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let child_alive = process_stat(child_pid).is_some();
+    if child_alive {
+        let _ = unsafe { kill(child_pid as i32, SIGKILL) };
+    }
+
+    assert_eq!(output.status.code(), Some(23));
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "shutdown took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(6_500),
+        "shutdown took {elapsed:?}"
+    );
+    assert!(
+        !child_alive,
+        "SIGKILL did not remove the TERM-ignoring process group member"
+    );
 }
 
 #[test]
@@ -368,6 +667,47 @@ run_as = "root"
     assert!(!output.status.success());
     assert_endpoint_released(&socket);
     assert!(!handoff.exists());
+}
+
+#[test]
+fn run_resets_inherited_sigchld_ignore_and_no_cldwait_before_handoff() {
+    if PosixSystem::new().current_ids().0 != 0 {
+        return;
+    }
+    let ProfileFixture {
+        _temp: temp,
+        profiles,
+        workspace,
+        ..
+    } = profile_fixture();
+    let socket = temp.path().join("backend.sock");
+    let mut command = Command::new(binary());
+    command
+        .args(common_args(&profiles, &workspace, &socket))
+        .args(["run", "--", "exit 37"]);
+    unsafe {
+        command.pre_exec(|| {
+            let mut action: sigaction = mem::zeroed();
+            if sigemptyset(&mut action.sa_mask) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            action.sa_sigaction = SIG_IGN;
+            action.sa_flags = SA_NOCLDWAIT;
+            if sigaction(SIGCHLD, &action, ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_endpoint_released(&socket);
 }
 
 #[test]

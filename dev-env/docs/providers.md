@@ -97,6 +97,10 @@ backend。
 都会返回明确错误，不会切回 backend 内的进程扫描。backend 停止时会通过独立控制通道取消当前
 worker；backend 异常退出时 worker 的 parent-death signal 触发相同的清理流程。
 
+worker 退出后若仍有后代存活，只有当 Linux 将它们重新托管给容器级 `container-init` backend
+时，container-init 才能等待和回收它们。仍有存活父进程的进程不会因为 container-init 是
+subreaper 而自动进入它的 wait 范围。
+
 ### `shellenv`
 
 ```toml

@@ -174,6 +174,12 @@ identity broker 为每个 request/provider 解析身份，再执行 provider。�
 
 Provider command 在同目录的 `dev-env-provider-worker` helper 子进程中运行。基础 Nix runtime 会将该 helper 与 `dev-env` 一起安装；从源码运行 backend 时也需要先构建 worker binary。backend 停止时会取消当前 provider worker，并等待它清理专属进程树。
 
+容器级 `container-init run` 在启动 Bootstrap action 前启用 Linux child subreaper，并在整个
+backend 生命周期持续回收 handoff 与重新托管给它的子进程。`dev-env backend` 仍等待自己直接
+启动的 initial shell/service 和 provider worker；provider worker 在运行期间独立负责自己的
+provider 子树。某个父进程仍存活时，其后代不属于 outer reaper 的 wait 范围，只有 Linux 将
+子进程重新托管给对应的 subreaper 后，那个 subreaper 才能回收它。
+
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |
 | Docker 默认命令 | `container-init` → `dev-env backend` → `dev-env exec/shell` | backend snapshot、当前用户、cwd、provider |
