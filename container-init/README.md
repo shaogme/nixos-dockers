@@ -31,6 +31,9 @@ Compose 注入的开发环境变量会随进程环境保留到 handoff runtime�
 - [安全模型](docs/security.md)：信任边界、路径检查、权限阶段、SSH 和错误码。
 - [开发与测试](docs/development.md)：crate 分层、构建、单元测试和 Docker 测试。
 
+普通 workspace 测试默认不编译 Linux Docker fixture。需要单独运行时，使用对应 crate 的
+`docker-tests` feature；Dockerfile harness 已显式启用该 feature，命令见[开发与测试](docs/development.md)。
+
 ## 快速开始
 
 ### 1. 准备 profile

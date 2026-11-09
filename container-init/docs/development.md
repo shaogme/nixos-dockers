@@ -41,8 +41,11 @@ container-init-posix ← container-init-core ← container-init-backend ← cont
 ```bash
 cargo fmt --all -- --check
 cargo check --workspace --locked
-cargo test --workspace --locked
+cargo test --workspace --locked --no-default-features
 ```
+
+`tests/docker.rs` 集成目标由各 crate 的 `docker-tests` feature 控制，默认不编译。普通
+workspace 检查无需筛选测试目标；Docker fixture 仍通过下面的 harness 单独运行。
 
 常用的定向测试：
 
@@ -73,6 +76,13 @@ POSIX、core 和 CLI 各有一个 root Linux 容器 fixture：
 ./crates/container-init-posix/tests/docker.sh
 ./crates/container-init-core/tests/docker.sh
 ./crates/container-init-cli/tests/docker.sh
+```
+
+这些 harness 会在 Dockerfile 中以 `--features docker-tests` 编译对应的 `docker` 测试目标。
+也可以在满足 fixture 的 Linux/root 环境中直接运行 Cargo，例如：
+
+```bash
+cargo test --locked -p container-init-core --features docker-tests --test docker
 ```
 
 对应的 Dockerfile 会构建并运行：

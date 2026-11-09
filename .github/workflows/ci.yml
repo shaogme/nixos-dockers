@@ -27,7 +27,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
 
       - name: Run workspace tests
         run: bash scripts/test-workspace.sh

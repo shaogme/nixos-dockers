@@ -150,10 +150,19 @@ cargo build --locked --release -p dev-env-cli
 最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。从 `nixos-dockers` workspace 根目录快速验证 Rust workspace 本身：
 
 ```bash
-cargo test --workspace --locked
+cargo test --workspace --locked --no-default-features
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked --no-default-features
 ```
+
+工作区中的 Docker 集成测试由各 crate 的 `docker-tests` feature 控制，默认不参与编译。
+需要直接运行某个 fixture 时，可在支持的 Linux 容器环境中显式启用，例如：
+
+```bash
+cargo test --locked -p dev-env-core --features docker-tests --test docker
+```
+
+推荐使用下方 `tests/docker.sh` harness，它会准备相应的 root Linux 测试容器。
 
 ## 入口一致性
 

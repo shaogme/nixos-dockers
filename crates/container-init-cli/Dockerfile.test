@@ -7,5 +7,5 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends acl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo test --locked -p container-init-cli --test docker --no-run
-CMD ["cargo", "test", "--locked", "-p", "container-init-cli", "--test", "docker", "--", "--test-threads=1", "--nocapture"]
+RUN cargo test --locked -p container-init-cli --features docker-tests --test docker --no-run
+CMD ["cargo", "test", "--locked", "-p", "container-init-cli", "--features", "docker-tests", "--test", "docker", "--", "--test-threads=1", "--nocapture"]

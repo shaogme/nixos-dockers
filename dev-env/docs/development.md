@@ -27,11 +27,14 @@ workspace 入口见 [`Cargo.toml`](../../Cargo.toml)，源码位于 `nixos-docke
 ```bash
 cargo build --locked -p dev-env-cli
 cargo build --locked -p dev-env-provider --bin dev-env-provider-worker
-cargo test --workspace --locked
+cargo test --workspace --locked --no-default-features
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked --no-default-features
 cargo build --locked --release -p dev-env-cli
 ```
+
+各 crate 的 Docker 集成目标 `tests/docker.rs` 使用 `docker-tests` feature，默认不编译。
+普通 workspace 测试因此直接使用 `cargo test --workspace`，不再枚举并排除 Docker 目标。
 
 如果修改了 Nix 模块或镜像集成，还应从 `nixos-dockers` 目录做最小评估：
 
@@ -44,6 +47,13 @@ nix-instantiate --eval --strict images/rust/image.nix -A rust.imageVersion
 ## 3. 测试组织
 
 单元测试主要和被测模块放在同一个 crate 中。跨进程、shell 和 Docker 行为由各 crate 的 `tests/docker.sh` 驱动：脚本构建一个测试 Dockerfile，在容器内编译并执行对应测试。
+
+各 Dockerfile 使用 `--features docker-tests` 显式编译 Docker 集成目标。需要在兼容的 Linux
+环境中手动运行某个目标时，可以直接使用 Cargo：
+
+```bash
+cargo test --locked -p dev-env-core --features docker-tests --test docker
+```
 
 当前仓库提供四个 Docker harness：
 
@@ -73,7 +83,7 @@ cd nixos-dockers
 ./crates/dev-env-cli/tests/docker.sh
 ```
 
-CLI backend 从 `dev-env` 所在目录启动 `dev-env-provider-worker`；本地手动启动 backend 前，应先构建该 helper。`scripts/test-workspace.sh` 和 core/provider/CLI Docker harness 会先构建它，再运行测试。
+CLI backend 从 `dev-env` 所在目录启动 `dev-env-provider-worker`；本地手动启动 backend 前，应先构建该 helper。工作区 harness 会先构建它，然后直接运行 `cargo test --workspace`；core/provider/CLI Docker harness 也会在运行测试前构建它。
 
 这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、脱组后代清理、检测文件、真实 shell 或 backend transport 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
 
