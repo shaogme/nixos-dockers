@@ -1,10 +1,10 @@
-FROM docker.io/library/rust:1.85-bookworm
+FROM docker.io/library/rust:1.88.0-bookworm
 
 WORKDIR /workspace/nixos-dockers
 COPY . .
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends acl util-linux \
+    && apt-get install --yes --no-install-recommends acl openssh-client util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 RUN cargo test --locked -p container-init-cli --features docker-tests --test docker --no-run

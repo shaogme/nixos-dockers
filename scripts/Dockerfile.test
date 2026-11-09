@@ -1,8 +1,0 @@
-FROM docker.io/library/rust:1.85-bookworm
-
-WORKDIR /workspace/nixos-dockers
-COPY . .
-
-RUN cargo build --locked -p dev-env-provider --bin dev-env-provider-worker
-
-CMD ["cargo", "test", "--workspace", "--locked", "--no-default-features"]

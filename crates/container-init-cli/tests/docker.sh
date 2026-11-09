@@ -1,10 +1,21 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-test_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-crate_dir=$(CDPATH= cd -- "$test_dir/.." && pwd)
-image_name=${CONTAINER_INIT_CLI_TEST_IMAGE:-container-init-cli-test}
+if [[ "${NIXOS_DOCKERS_QEMU_GUEST:-}" != 1 ]] || \
+    [[ "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" != rootful-docker && "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" != rootless-podman ]]; then
+    echo "container-init-cli fixture requires the crates QEMU suite" >&2
+    exit 2
+fi
+
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+crate_dir="$(cd -- "$test_dir/.." && pwd)"
+image_name=container-init-cli-test
 
 docker build --tag "$image_name" --file "$crate_dir/Dockerfile.test" "$crate_dir/../.."
-docker run --rm --cap-add=SYS_ADMIN --device /dev/fuse "$image_name"
-
+if [[ "$NIXOS_DOCKERS_GUEST_RUNTIME" == rootful-docker ]]; then
+    runtime_args=(--privileged --cgroupns=host --device /dev/fuse)
+else
+    runtime_args=()
+fi
+docker run --rm --env "NIXOS_DOCKERS_GUEST_RUNTIME=$NIXOS_DOCKERS_GUEST_RUNTIME" \
+    "${runtime_args[@]}" "$image_name"

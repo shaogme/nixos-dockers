@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+if [[ "${NIXOS_DOCKERS_QEMU_GUEST:-}" != 1 || "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" != rootful-docker ]]; then
+    echo "image fixtures must run through scripts/qemu-test.sh in the rootful Docker guest" >&2
+    exit 2
+fi
+
 if [[ $# -ne 1 ]]; then
     echo "usage: $0 <image>" >&2
     exit 2
@@ -109,6 +114,28 @@ wait_for_backend() {
     return 1
 }
 
+wait_for_initial_runtime() {
+    local container="$1"
+    local attempt status
+
+    for attempt in {1..120}; do
+        if status="$(docker exec "$container" /usr/bin/dev-env backend status --json 2>/dev/null)"; then
+            if [[ "$status" == *'"initial_runtime":"running"'* ]]; then
+                printf '%s\n' "$status"
+                return 0
+            fi
+            if [[ "$status" == *'"control_plane":"failed"'* || "$status" == *'"initial_runtime":"exited"'* || "$status" == *'"initial_runtime":"failed"'* ]]; then
+                break
+            fi
+        fi
+        sleep 1
+    done
+
+    echo "initial runtime did not reach running state in $container" >&2
+    docker exec "$container" /usr/bin/dev-env backend status --json >&2 || true
+    return 1
+}
+
 test_loaded_image() {
     local attr="$1"
     local archive="$tmp_dir/${attr//\//_}.tar.gz"
@@ -192,7 +219,7 @@ test_loaded_image() {
     local readiness_output
     readiness_output="$(docker exec "$exec_container" /usr/bin/dev-env backend wait-ready --startup-timeout 60000)"
     assert_contains "$readiness_output" '"control_plane":"serving"'
-    assert_contains "$readiness_output" '"initial_runtime":"running"'
+    wait_for_initial_runtime "$exec_container" >/dev/null
 
     exec_output="$(docker exec --env EXPECTED_UID="$expected_uid" --env EXPECTED_GID="$expected_gid" "$exec_container" bash -lc \
         'test "$USER" = dev && test "$HOME" = /home/dev && test "$(id -u)" = "$EXPECTED_UID" && test "$(id -g)" = "$EXPECTED_GID" && test "$(stat -c %u:%g /home/dev)" = "$EXPECTED_UID:$EXPECTED_GID"')"

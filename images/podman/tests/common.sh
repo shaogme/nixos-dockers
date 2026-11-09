@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+if [[ "${NIXOS_DOCKERS_QEMU_GUEST:-}" != 1 ]]; then
+    echo "Podman image assertions must run through scripts/qemu-test.sh" >&2
+    exit 2
+fi
+
+case "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" in
+    rootful-docker)
+        [[ "$(id -u)" == 0 ]]
+        systemctl is-active --quiet docker
+        docker info >/dev/null
+        [[ "$(docker info --format '{{.CgroupVersion}}')" == 2 ]]
+        ;;
+    rootless-podman)
+        [[ "$(id -u)" == 1000 && "$(id -g)" == 1000 ]]
+        [[ "$(podman info --format '{{.Host.Security.Rootless}}')" == true ]]
+        graphroot="$(podman info --format '{{.Store.GraphRoot}}')"
+        [[ "$graphroot" == /home/podman/.local/share/containers/storage && -w "$graphroot" ]]
+        ;;
+    *)
+        echo "unsupported Podman fixture runtime: ${NIXOS_DOCKERS_GUEST_RUNTIME:-<empty>}" >&2
+        exit 2
+        ;;
+esac
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd -- "$script_dir/../../.." && pwd)"
 image_file="$root_dir/images/podman/image.nix"
@@ -122,8 +146,14 @@ wait_for_socket() {
 
 wait_for_socket_in() {
     local probe_container="$1"
-    local attempt
+    local attempt state
     for attempt in {1..60}; do
+        state="$(docker inspect --format '{{.State.Running}}' "$probe_container" 2>/dev/null || true)"
+        if [[ "$state" == false ]]; then
+            echo "engine container $probe_container exited before the Podman socket became ready" >&2
+            docker logs "$probe_container" >&2 || true
+            return 1
+        fi
         if docker exec "$probe_container" /bin/sh -c 'test -S /run/podman/podman.sock'; then
             return 0
         fi

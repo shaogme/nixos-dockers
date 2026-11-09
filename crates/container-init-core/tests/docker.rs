@@ -6,6 +6,7 @@ use container_init_core::{
 };
 use std::{
     collections::BTreeMap,
+    env::var_os,
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::PermissionsExt,
@@ -36,6 +37,10 @@ fn fixture_config(root: &Path, actions: Vec<Action>) -> BootstrapConfig {
 
 fn action(id: &str, kind: ActionKind) -> Action {
     Action::new(id, kind, Origin::image("docker-fixture"))
+}
+
+fn is_rootless_podman_guest() -> bool {
+    var_os("NIXOS_DOCKERS_GUEST_RUNTIME").is_some_and(|runtime| runtime == "rootless-podman")
 }
 
 #[test]
@@ -105,9 +110,10 @@ fn executes_real_openssh_preparation_and_is_idempotent() {
         0,
         "Docker fixture must run as root"
     );
-    if !SshCapability::default().available() {
-        return;
-    }
+    assert!(
+        SshCapability::default().available(),
+        "ssh-keygen is required for SSH bootstrap"
+    );
 
     let temp = TempDir::new().unwrap();
     let host_keys = temp.path().join("etc/ssh");
@@ -159,15 +165,24 @@ fn executes_real_cgroup_v2_init_as_root() {
     );
 
     let cgroup_base = Path::new("/sys/fs/cgroup");
-    if !cgroup_base.join("cgroup.controllers").exists() {
-        return;
-    }
-    // Skip if cgroup filesystem is mounted read-only (non-privileged container)
+    assert!(
+        cgroup_base.join("cgroup.controllers").exists(),
+        "the cgroup v2 controller file is required"
+    );
     let test_probe = cgroup_base.join("probe_cgroup_rw");
-    if fs::create_dir(&test_probe).is_err() {
-        return;
+    if let Err(error) = fs::create_dir(&test_probe) {
+        if is_rootless_podman_guest()
+            && matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::EROFS)
+            )
+        {
+            eprintln!("UNSUPPORTED: rootless Podman VM denied the cgroup v2 write probe: {error}");
+            return;
+        }
+        panic!("could not create the root cgroup v2 write probe: {error}");
     }
-    let _ = fs::remove_dir(&test_probe);
+    fs::remove_dir(&test_probe).unwrap();
 
     let temp = TempDir::new().unwrap();
     let mut resolve = action("resolve", ActionKind::IdentityResolve);
@@ -222,23 +237,19 @@ fn executes_real_cgroup_v2_init_as_root() {
         })
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if nested_controllers.is_empty() {
-        let _ = fs::remove_dir(&child_cgroup);
-        return;
-    }
-    // Some container runtimes expose controller names without delegating
-    // permission to enable them. Skip the nested-controller assertions when
-    // this cgroup cannot actually delegate the requested controllers.
+    assert_eq!(
+        nested_controllers.len(),
+        2,
+        "memory and pids controllers are required for nested delegation"
+    );
     let subtree_control = child_cgroup.join("cgroup.subtree_control");
-    let can_delegate = nested_controllers.iter().all(|controller| {
-        let Ok(mut file) = OpenOptions::new().append(true).open(&subtree_control) else {
-            return false;
-        };
-        file.write_all(format!("+{controller} ").as_bytes()).is_ok()
-    });
-    if !can_delegate {
-        let _ = fs::remove_dir(&child_cgroup);
-        return;
+    for controller in &nested_controllers {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&subtree_control)
+            .unwrap();
+        file.write_all(format!("+{controller} ").as_bytes())
+            .unwrap();
     }
 
     let mut nested_cg = action("nested-cg", ActionKind::CgroupV2Init);
@@ -271,9 +282,7 @@ fn executes_real_cgroup_v2_init_as_root() {
 #[test]
 fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
     let posix_system = PosixSystem::new();
-    if posix_system.current_ids().0 != 0 {
-        return;
-    }
+    assert_eq!(posix_system.current_ids().0, 0);
 
     let temp = TempDir::new().unwrap();
     let shadow_path = temp.path().join("shadow_cg");
@@ -295,7 +304,18 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
     let config = fixture_config(temp.path(), vec![cg, resolve]);
     let plan = config.build_plan().unwrap();
     let runner = PlanExecutor::new(config, RuntimeContext::new(temp.path()));
-    let report = runner.execute_plan(&plan).unwrap();
+    let report = match runner.execute_plan(&plan) {
+        Ok(report) => report,
+        Err(error)
+            if is_rootless_podman_guest()
+                && (error.to_string().contains("Operation not permitted")
+                    || error.to_string().contains("Permission denied")) =>
+        {
+            eprintln!("UNSUPPORTED: rootless Podman VM bind-mount attempt failed: {error}");
+            return;
+        }
+        Err(error) => panic!("required cgroup bind-mount assertion failed: {error}"),
+    };
     assert!(report.succeeded());
 
     // Verify shadow_path and target_path both reflect the initialized subgroup and subtree_control
@@ -308,9 +328,7 @@ fn executes_real_cgroup_v2_init_bind_mount_shadowing_as_root() {
 #[test]
 fn executes_real_cgroup_v2_init_bind_mount_shadowing_unprivileged_non_root() {
     let posix_system = PosixSystem::new();
-    if posix_system.current_ids().0 != 0 {
-        return;
-    }
+    assert_eq!(posix_system.current_ids().0, 0);
 
     let temp = TempDir::new().unwrap();
     let shadow_path = temp.path().join("non_existent_shadow/cg");

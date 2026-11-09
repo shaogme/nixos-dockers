@@ -22,10 +22,18 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    ptr, thread,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
+
+static SIGNAL_PROCESS_HELPER_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn record_signal_process_helper_sigint(_: i32) {
+    SIGNAL_PROCESS_HELPER_RECEIVED.store(true, Ordering::SeqCst);
+}
 
 fn binary() -> PathBuf {
     env::current_exe()
@@ -240,6 +248,28 @@ fn orphan_process_flood_helper_when_configured() {
 }
 
 #[test]
+fn signal_process_group_helper_when_configured() {
+    let Ok(marker) = env::var("CONTAINER_INIT_TEST_SIGNAL_MARKER") else {
+        return;
+    };
+    let mut signal_action: sigaction = unsafe { mem::zeroed() };
+    assert_eq!(unsafe { sigemptyset(&mut signal_action.sa_mask) }, 0);
+    signal_action.sa_sigaction = record_signal_process_helper_sigint as *const () as usize;
+    signal_action.sa_flags = 0;
+    assert_eq!(
+        unsafe { sigaction(SIGINT, &signal_action, ptr::null_mut()) },
+        0
+    );
+    let armed_marker = env::var("CONTAINER_INIT_TEST_SIGNAL_ARMED_MARKER").unwrap();
+    fs::write(armed_marker, "armed").unwrap();
+
+    while !SIGNAL_PROCESS_HELPER_RECEIVED.load(Ordering::SeqCst) {
+        unsafe { usleep(10_000) };
+    }
+    fs::write(marker, "received").unwrap();
+}
+
+#[test]
 fn active_subreaper_reaps_orphaned_descendants_during_service() {
     if PosixSystem::new().current_ids().0 != 0 {
         return;
@@ -402,12 +432,45 @@ fn shutdown_signal_is_forwarded_to_the_handoff_process_group() {
     } = profile_fixture();
     let socket = temp.path().join("backend.sock");
     let marker = workspace.join("received-int");
+    let armed_marker = workspace.join("signal-armed");
+    let helper = env::current_exe().unwrap();
     let script = format!(
-        "trap 'printf received > {}; exit 0' INT; while :; do sleep 1; done",
-        marker.display()
+        "exec {} --exact signal_process_group_helper_when_configured --nocapture",
+        helper.display()
     );
-    let mut backend = start_backend(&profiles, &workspace, &socket, &script);
+    let mut backend = Command::new(binary())
+        .args([
+            "--profiles-dir",
+            profiles.to_str().unwrap(),
+            "--profile",
+            "fixture",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--backend-endpoint",
+            socket.to_str().unwrap(),
+            "run",
+            "--",
+            &script,
+        ])
+        .env(
+            "CONTAINER_INIT_RUNTIME_DIR",
+            socket.parent().expect("endpoint fixture has a parent"),
+        )
+        .env("CONTAINER_INIT_TEST_SIGNAL_MARKER", &marker)
+        .env("CONTAINER_INIT_TEST_SIGNAL_ARMED_MARKER", &armed_marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
     wait_for_backend(&mut backend, &socket);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !armed_marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        armed_marker.exists(),
+        "signal helper did not arm its handler"
+    );
 
     assert_eq!(unsafe { kill(backend.id() as i32, SIGINT) }, 0);
     assert_eq!(backend.wait().unwrap().code(), Some(0));

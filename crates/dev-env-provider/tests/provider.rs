@@ -54,6 +54,26 @@ fn process_executor() -> ProcessExecutor {
         .executor()
 }
 
+fn test_path() -> String {
+    let mut entries = Vec::new();
+    if Path::new("/run/current-system/sw/bin").is_dir() {
+        entries.push("/run/current-system/sw/bin");
+    }
+    entries.push("/usr/bin:/bin");
+    entries.join(":")
+}
+
+fn system_binary(name: &str) -> PathBuf {
+    [
+        PathBuf::from(format!("/usr/bin/{name}")),
+        PathBuf::from(format!("/bin/{name}")),
+        PathBuf::from(format!("/run/current-system/sw/bin/{name}")),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| panic!("required test executable is unavailable: {name}"))
+}
+
 #[derive(Clone)]
 struct FakeLocator {
     executable: Option<PathBuf>,
@@ -353,18 +373,17 @@ fn protocol_round_trip_keeps_typed_operation_and_response_error() {
 
 #[test]
 fn real_process_executor_passes_an_argument_as_data() {
-    let program = if Path::new("/usr/bin/printf").is_file() {
-        "/usr/bin/printf"
-    } else {
-        "/bin/printf"
-    };
-    let request = CommandRequest::new(program, temp_dir())
+    let program = system_binary("printf");
+    let request = CommandRequest::new(program.to_string_lossy(), temp_dir())
         .with_args(["%s".to_owned(), "value; not shell code".to_owned()])
         .with_environment(BTreeMap::new())
         .with_timeout(Some(Duration::from_secs(1)))
         .with_output_limits(1024, 1024);
     let output = SystemExecutableLocator;
-    assert!(output.locate(program, &BTreeMap::new()).unwrap().is_some());
+    assert!(output
+        .locate(program.to_str().unwrap(), &BTreeMap::new())
+        .unwrap()
+        .is_some());
     let output = process_executor().execute(&request).unwrap();
     assert!(output.succeeded());
     assert_eq!(output.stdout(), b"value; not shell code");
@@ -475,15 +494,8 @@ fn protocol_decoder_rejects_a_wrong_version_as_a_typed_protocol_error() {
 
 #[test]
 fn process_executor_enforces_a_timeout() {
-    let program = if Path::new("/usr/bin/sleep").is_file() {
-        "/usr/bin/sleep"
-    } else {
-        "/bin/sleep"
-    };
-    if !Path::new(program).is_file() {
-        return;
-    }
-    let request = CommandRequest::new(program, temp_dir())
+    let program = system_binary("sleep");
+    let request = CommandRequest::new(program.to_string_lossy(), temp_dir())
         .with_args(["1".to_owned()])
         .with_environment(BTreeMap::new())
         .with_timeout(Some(Duration::from_millis(20)))
@@ -502,17 +514,11 @@ fn shared_supervisor_keeps_concurrent_direct_child_statuses_separate() {
     }
     let first_request = CommandRequest::new(program, temp_dir())
         .with_args(["-c".to_owned(), "sleep 0.03; exit 23".to_owned()])
-        .with_environment(BTreeMap::from([(
-            "PATH".to_owned(),
-            "/usr/bin:/bin".to_owned(),
-        )]))
+        .with_environment(BTreeMap::from([("PATH".to_owned(), test_path())]))
         .with_timeout(Some(Duration::from_secs(1)));
     let second_request = CommandRequest::new(program, temp_dir())
         .with_args(["-c".to_owned(), "sleep 0.01; exit 42".to_owned()])
-        .with_environment(BTreeMap::from([(
-            "PATH".to_owned(),
-            "/usr/bin:/bin".to_owned(),
-        )]))
+        .with_environment(BTreeMap::from([("PATH".to_owned(), test_path())]))
         .with_timeout(Some(Duration::from_secs(1)));
     let first_executor = executor.clone();
     let first = thread::spawn(move || first_executor.execute(&first_request).unwrap());
@@ -530,10 +536,7 @@ fn provider_cleanup_does_not_kill_or_reap_an_unrelated_parent_child() {
         .unwrap();
     let request = CommandRequest::new("/bin/sh", temp_dir())
         .with_args(["-c".to_owned(), "sleep 0.15".to_owned()])
-        .with_environment(BTreeMap::from([(
-            "PATH".to_owned(),
-            "/usr/bin:/bin".to_owned(),
-        )]))
+        .with_environment(BTreeMap::from([("PATH".to_owned(), test_path())]))
         .with_timeout(Some(Duration::from_secs(2)));
 
     let output = process_executor().execute(&request).unwrap();
@@ -560,7 +563,7 @@ fn stopping_the_supervisor_cancels_and_reaps_the_active_provider_worker() {
             "echo $$ > \"$PID_FILE\"; sleep 30".to_owned(),
         ])
         .with_environment(BTreeMap::from([
-            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("PATH".to_owned(), test_path()),
             ("PID_FILE".to_owned(), marker.display().to_string()),
         ]));
     let supervisor = ProviderProcessSupervisor::try_new(PathBuf::from(env!(
@@ -590,13 +593,7 @@ fn stopping_the_supervisor_cancels_and_reaps_the_active_provider_worker() {
 #[test]
 fn process_timeout_reaps_a_descendant_that_leaves_the_command_group() {
     let program = "/bin/sh";
-    let setsid = if Path::new("/usr/bin/setsid").is_file() {
-        "/usr/bin/setsid"
-    } else if Path::new("/bin/setsid").is_file() {
-        "/bin/setsid"
-    } else {
-        return;
-    };
+    let setsid = system_binary("setsid");
     if !Path::new(program).is_file() {
         return;
     }
@@ -609,12 +606,13 @@ fn process_timeout_reaps_a_descendant_that_leaves_the_command_group() {
             .as_nanos()
     ));
     let command = format!(
-        "{setsid} /bin/sh -c 'sleep 30' >/dev/null 2>&1 & echo $! > \"$PID_FILE\"; sleep 30"
+        "{} /bin/sh -c 'sleep 30' >/dev/null 2>&1 & echo $! > \"$PID_FILE\"; sleep 30",
+        setsid.display()
     );
     let request = CommandRequest::new(program, temp_dir())
         .with_args(["-c".to_owned(), command])
         .with_environment(BTreeMap::from([
-            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("PATH".to_owned(), test_path()),
             ("PID_FILE".to_owned(), marker.display().to_string()),
         ]))
         .with_timeout(Some(Duration::from_millis(100)));

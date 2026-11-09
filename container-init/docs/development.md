@@ -36,16 +36,17 @@ container-init-posix ← container-init-core ← container-init-backend ← cont
 
 ## 2. 本地构建和测试
 
-在 `nixos-dockers` workspace 根目录执行：
+完整验证入口从仓库根目录运行。launcher 构建固定 Nix pin 的 rootful Docker VM，复制当前
+checkout，并在 guest 中执行 Clippy、worker 构建、workspace tests 与
+`cargo cop --all-targets --all-features --workspace`：
 
 ```bash
-cargo fmt --all -- --check
-cargo check --workspace --locked
-cargo test --workspace --locked --no-default-features
+bash scripts/qemu-test.sh workspace
 ```
 
-`tests/docker.rs` 集成目标由各 crate 的 `docker-tests` feature 控制，默认不编译。普通
-workspace 检查无需筛选测试目标；Docker fixture 仍通过下面的 harness 单独运行。
+`tests/docker.rs` 集成目标由各 crate 的 `docker-tests` feature 控制，默认 workspace suite
+不编译这些 Linux Docker fixture；Cargo test harness 单线程运行，避免共享 backend endpoint
+的 startup fixtures 互相竞争。直接 Cargo 命令可用于快速迭代，但不替代 guest 验证。
 
 常用的定向测试：
 
@@ -68,46 +69,43 @@ cargo test --locked -p container-init-cli --test cli -- --nocapture
 
 如果只构建或测试 container-init 的一个 crate，从 workspace 根目录使用 `-p <package>` 选择目标。
 
-child reaper 的 Nix VM fixture 从 workspace 根目录构建并运行：
+child reaper 的 `nixosTest` 保持独立，由 NixOS 测试 driver 自己启动 QEMU。标准运行命令是：
 
 ```bash
-nix-build tests/container-init-reaper-vm.nix -A driver
-./result/bin/nixos-test-driver
+bash scripts/qemu-test.sh nixos-reaper
 ```
 
 该 fixture 用 Nix 构建的 `container-init` 启动非 PID 1 backend，在 VM 中检查常驻期间被重新
 托管的后代；Docker CLI fixture 则验证 container-init 直接作为 PID namespace init 的情形。
+交互调试时可用 pinned nixpkgs 构建 driver，然后执行 `start_all()` 和 `machine.shell()`：
+
+```bash
+export NIX_PATH="nixpkgs=$(nix-instantiate --eval --raw -E 'let sources = import ./images/rust/npins; in sources.nixpkgs.outPath')"
+nix-build tests/container-init-reaper-vm.nix -A driver -o result-reaper
+./result-reaper/bin/nixos-test-driver
+```
 
 ## 3. Docker 集成测试
 
-POSIX、core 和 CLI 各有一个 root Linux 容器 fixture：
+container-init 的 POSIX、core 和 CLI Docker fixtures 与 dev-env 四个 crate fixture 一起在
+每种 engine VM 中顺序运行，标准命令为：
 
 ```bash
-./crates/container-init-posix/tests/docker.sh
-./crates/container-init-core/tests/docker.sh
-./crates/container-init-cli/tests/docker.sh
+bash scripts/qemu-test.sh crates --runtime rootful-docker
+bash scripts/qemu-test.sh crates --runtime rootless-podman
 ```
 
-这些 harness 会在 Dockerfile 中以 `--features docker-tests` 编译对应的 `docker` 测试目标。
-也可以在满足 fixture 的 Linux/root 环境中直接运行 Cargo，例如：
-
-```bash
-cargo test --locked -p container-init-core --features docker-tests --test docker
-```
-
-对应的 Dockerfile 会构建并运行：
+dispatcher 进入 guest 后按固定顺序调用全部 crate 的 `tests/docker.sh`；直接运行单个 harness
+不受支持。每个 Dockerfile 会在 Rust 1.88.0 容器中以 `--features docker-tests` 编译并运行：
 
 - `container-init-posix`：真实容器中的 root account、权限、owner 和降权；
 - `container-init-core`：真实 POSIX action、SSH fixture、action 顺序和 privilege boundary；
 - `container-init-backend`：abstract endpoint peer credential 检查、endpoint 唯一性、RPC 和 supervisor；
 - `container-init-cli`：profile 目录读取、plan/doctor/run、runtime handoff 和 SSH capability。
 
-这几项测试要求 Docker 可用，且 fixture 默认以 root 运行。镜像名可以通过各脚本使用的环境变量覆盖：
-
-```bash
-CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
-  ./crates/container-init-posix/tests/docker.sh
-```
+rootful Docker lane 会预检 cgroup v2、可写根层级、FUSE 和 `CAP_SYS_ADMIN`。core 与 CLI 的
+必需 cgroup、控制器委托、SSH 和 bind-mount 断言遇到能力缺失会失败。rootless lane 也运行全部
+crate test binaries。cgroup 写入、挂载和 PID namespace 测试会实际尝试对应操作；只有 rootless Podman 容器返回明确的权限错误时，才将该断言标记为 `UNSUPPORTED`。
 
 ## 4. 测试覆盖的行为
 

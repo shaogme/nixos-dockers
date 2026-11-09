@@ -211,6 +211,7 @@ fn spawn_handoff(
                     return Err(io::Error::last_os_error());
                 }
             }
+            reset_handoff_signal_dispositions()?;
             let mask = shutdown_signal_mask()?;
             if sigprocmask(SIG_UNBLOCK, &mask, ptr::null_mut()) != 0 {
                 return Err(io::Error::last_os_error());
@@ -664,13 +665,24 @@ fn shutdown_signal_mask() -> io::Result<sigset_t> {
 }
 
 fn set_sigchld_default() -> io::Result<()> {
+    set_signal_default(SIGCHLD)
+}
+
+fn reset_handoff_signal_dispositions() -> io::Result<()> {
+    for signal in [SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
+        set_signal_default(signal)?;
+    }
+    Ok(())
+}
+
+fn set_signal_default(signal: c_int) -> io::Result<()> {
     let mut action: sigaction = unsafe { mem::zeroed() };
     if unsafe { sigemptyset(&mut action.sa_mask) } != 0 {
         return Err(io::Error::last_os_error());
     }
     action.sa_sigaction = SIG_DFL;
     action.sa_flags = 0;
-    if unsafe { sigaction(SIGCHLD, &action, ptr::null_mut()) } != 0 {
+    if unsafe { sigaction(signal, &action, ptr::null_mut()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

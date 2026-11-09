@@ -400,7 +400,7 @@ impl BootstrapPaths {
 
         validate_bootstrap_executable(CONTAINER_INIT_ENV, &container_init)?;
         validate_bootstrap_executable(BOOTSTRAP_REAL_SHELL_ENV, &real_shell)?;
-        if real_shell == Path::new("/bin/bash") || real_shell == Path::new("/usr/bin/bash") {
+        if is_recursive_bash_path(&real_shell) {
             return Err(BootstrapError::RecursiveShell { path: real_shell }.into());
         }
 
@@ -419,6 +419,10 @@ impl BootstrapPaths {
         CommandLine::try_new(self.container_init.clone(), bootstrap_args)
             .map_err(CliError::CommandLine)
     }
+}
+
+fn is_recursive_bash_path(path: &Path) -> bool {
+    path == Path::new("/bin/bash") || path == Path::new("/usr/bin/bash")
 }
 
 fn validate_bootstrap_executable(variable: &'static str, path: &Path) -> Result<(), CliError> {
@@ -480,4 +484,14 @@ fn contains_nul(path: &Path) -> bool {
     {
         path.as_os_str().to_string_lossy().contains('\0')
     }
+}
+
+#[cfg(test)]
+#[test]
+fn only_public_fhs_bash_paths_are_recursive_shims() {
+    assert!(is_recursive_bash_path(Path::new("/bin/bash")));
+    assert!(is_recursive_bash_path(Path::new("/usr/bin/bash")));
+    assert!(!is_recursive_bash_path(Path::new(
+        "/run/current-system/sw/bin/bash"
+    )));
 }

@@ -4,7 +4,7 @@ use container_init_protocol::AbstractEndpoint;
 use libc::{_exit, fork, kill, usleep, SIGKILL, SIGTERM};
 use serde_json::{from_slice, Value};
 use std::{
-    env::{consts::OS, current_exe, var},
+    env::{consts::OS, current_exe, var, var_os},
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -168,9 +168,10 @@ fn cli_runs_a_real_ssh_bootstrap_action_before_handoff() {
         0,
         "Docker fixture must run as root"
     );
-    if !SshCapability::default().available() {
-        return;
-    }
+    assert!(
+        SshCapability::default().available(),
+        "ssh-keygen is required for SSH bootstrap"
+    );
 
     let temp = TempDir::new().unwrap();
     let profiles = temp.path().join("profiles");
@@ -289,14 +290,24 @@ fn cli_runs_a_real_cgroup_v2_init_bootstrap_action_before_handoff() {
     );
 
     let cgroup_base = Path::new("/sys/fs/cgroup");
-    if !cgroup_base.join("cgroup.controllers").exists() {
-        return;
-    }
+    assert!(
+        cgroup_base.join("cgroup.controllers").exists(),
+        "the cgroup v2 controller file is required"
+    );
     let test_probe = cgroup_base.join("probe_cgroup_cli_rw");
-    if fs::create_dir(&test_probe).is_err() {
-        return;
+    if let Err(error) = fs::create_dir(&test_probe) {
+        if var_os("NIXOS_DOCKERS_GUEST_RUNTIME").is_some_and(|runtime| runtime == "rootless-podman")
+            && matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::EROFS)
+            )
+        {
+            eprintln!("UNSUPPORTED: rootless Podman VM denied the cgroup v2 write probe: {error}");
+            return;
+        }
+        panic!("could not create the root cgroup v2 write probe: {error}");
     }
-    let _ = fs::remove_dir(&test_probe);
+    fs::remove_dir(&test_probe).unwrap();
 
     let temp = TempDir::new().unwrap();
     let profiles = temp.path().join("profiles");
@@ -1120,6 +1131,23 @@ fn orphan_process_helper_when_configured() {
 #[test]
 fn container_init_as_pid_namespace_init_reaps_orphans_while_running() {
     assert_eq!(OS, "linux");
+    let namespace_probe = Command::new("unshare")
+        .args(["--pid", "--fork", "--mount-proc", "true"])
+        .output()
+        .unwrap();
+    if !namespace_probe.status.success() {
+        let error = String::from_utf8_lossy(&namespace_probe.stderr);
+        if var_os("NIXOS_DOCKERS_GUEST_RUNTIME").is_some_and(|runtime| runtime == "rootless-podman")
+            && (error.contains("Operation not permitted") || error.contains("Permission denied"))
+        {
+            eprintln!(
+                "UNSUPPORTED: rootless Podman VM nested PID namespace attempt failed: {}",
+                error.trim()
+            );
+            return;
+        }
+        panic!("nested PID namespace probe failed: {}", error.trim());
+    }
     assert_eq!(
         PosixSystem::new().current_ids().0,
         0,

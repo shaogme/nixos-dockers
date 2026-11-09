@@ -29,7 +29,7 @@
 | :--- | :--- | :--- | :--- |
 | `npins` | 基础开发镜像 | Nix, npins, direnv, coreutils, nix-ld | `latest`, `0.5.0-2026.8.24` |
 | `rust` | Rust 专用开发镜像 | Rust 工具链 (cargo, rustc), rust-analyzer, clippy, gdb | `latest`, `1.97.1-2026.8.24` |
-| [`mise`](docs/mise-builder-image.md) | Mise 多语言环境开发镜像 | Nix, mise (跟踪 main 分支), direnv, coreutils | `latest`, `2026.8.12-2026.8.24` |
+| `mise` | Mise 多语言环境开发镜像 | Nix, mise (跟踪 main 分支), direnv, coreutils | `latest`, `2026.8.12-2026.8.24` |
 
 ### 2. VS Code Remote 专用镜像（内置 SSH 服务与公钥自动注入）
 
@@ -37,7 +37,7 @@
 | :--- | :--- | :--- | :--- |
 | `vscode-npins` | 基础开发镜像 (SSH) | Nix, npins, direnv, coreutils, SSH | `latest`, `0.5.0-2026.8.24` |
 | `vscode-rust` | Rust 专用镜像 (SSH) | Rust 工具链, rust-analyzer, clippy, gdb, SSH | `latest`, `1.97.1-2026.8.24` |
-| [`vscode-mise`](docs/mise-builder-image.md) | Mise 开发镜像 (SSH) | Nix, mise, direnv, coreutils, SSH | `latest`, `2026.8.12-2026.8.24` |
+| `vscode-mise` | Mise 开发镜像 (SSH) | Nix, mise, direnv, coreutils, SSH | `latest`, `2026.8.12-2026.8.24` |
 
 ### 3. Podman 引擎镜像（单一 engine 产物）
 
@@ -192,7 +192,7 @@ manifest。
 自定义运行时初始化也应使用 Bootstrap DSL action；不要复制或链式调用旧 entrypoint。需要让新 profile 成为默认 profile 时，显式写入 `/etc/dev-env/default-profile`，并保持其 `extends` 链包含基础 profile。
 
 > [!TIP]
-> 完整的派生开发容器最佳实践（包含 BuildKit 缓存加速、构建期多语言工具预装与 Docker Compose 配置），请参考 [Mise 镜像与 Example 详细文档](docs/mise-builder-image.md)。
+> 派生镜像的测试 Dockerfile 与示例位于 [`images/mise/tests`](images/mise/tests)。
 
 ## 技术细节
 
@@ -233,18 +233,28 @@ nix-build images/podman/image.nix -A podman
 
 构建完成后，使用 `docker load < result` 即可将镜像导入本地 Docker。
 
-### 本地 Docker 集成测试
+### QEMU 集成测试
 
-每个 image 都提供一套 Docker 测试脚本。脚本会构建 CLI 与 VS Code Remote 两个变体，加载镜像，并验证 `container-init` 计划、`dev-env` 环境物化、运行时 handoff、登录 shell shim、root `docker exec` Bash 身份 Bootstrap；VS Code 变体还会验证默认 SSH 服务能够部署并保持运行：
+CI 等价验证统一由 QEMU launcher 启动 NixOS guest。host 需要 Nix、QEMU 和 SSH client；
+launcher 会把当前 checkout（包括未提交改动）传入 guest，再在 guest 中运行 Cargo、Docker、
+Podman 或 Nix 镜像测试。Workspace 与普通 Docker fixture 使用 rootful Docker guest：
 
 ```bash
-bash images/rust/tests/docker.sh
-bash images/npins/tests/docker.sh
-bash images/mise/tests/docker.sh
-bash images/podman/tests/docker.sh
+bash scripts/qemu-test.sh workspace
+bash scripts/qemu-test.sh crates --runtime rootful-docker
+bash scripts/qemu-test.sh crates --runtime rootless-podman
+bash scripts/qemu-test.sh mise
+bash scripts/qemu-test.sh npins
+bash scripts/qemu-test.sh rust
+bash scripts/qemu-test.sh podman --runtime rootful-docker
+bash scripts/qemu-test.sh podman --runtime rootless-podman
+bash scripts/qemu-test.sh nixos-reaper
 ```
 
-CI 对开发镜像运行 container-init/dev-env 测试，对 `podman` 单独运行 socket、远程 API
+七个 crate Docker suites 在每个 crates guest 中顺序运行一次，不会为每个 crate 单独启动 VM。
+`podman` image fixture 在两种外层 runtime 各执行一次；其他 image fixtures 只在 rootful Docker
+guest 执行。`tests/docker.sh` 脚本只接受 guest dispatcher 设置的标识，不能作为宿主机测试入口。
+`QEMU_TEST_ARTIFACTS=/path/to/logs` 可指定 QEMU 与 guest 日志目录。
 
 ## 项目结构
 
@@ -254,7 +264,7 @@ CI 对开发镜像运行 container-init/dev-env 测试，对 `podman` 单独运�
 │   ├── npins/             # 基础通用镜像 (npins, vscode-npins)
 │   ├── rust/              # Rust 专用镜像 (rust, vscode-rust)
 │   ├── podman/            # 独立 Podman engine 镜像 (仅 podman)
-│   └── mise/              # Mise 专用镜像 (mise, vscode-mise, mise-builder) -> 详见 [Mise 文档](docs/mise-builder-image.md)
+│   └── mise/              # Mise 专用镜像 (mise, vscode-mise, mise-builder) -> 详见 [镜像测试](images/mise/tests)
 │       └── example/       # 生产级派生开发容器示例 (Dockerfile, compose, entrypoint)
 ├── modules/               # 统一 NixOS 模块系统
 │   ├── core/              # 核心构建器、系统配置与 container-init/dev-env runtime

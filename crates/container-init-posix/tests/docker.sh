@@ -1,9 +1,15 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-test_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-crate_dir=$(CDPATH= cd -- "$test_dir/.." && pwd)
-image_name=${CONTAINER_INIT_POSIX_TEST_IMAGE:-container-init-posix-test}
+if [[ "${NIXOS_DOCKERS_QEMU_GUEST:-}" != 1 ]] || \
+    [[ "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" != rootful-docker && "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" != rootless-podman ]]; then
+    echo "container-init-posix fixture requires the crates QEMU suite" >&2
+    exit 2
+fi
+
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+crate_dir="$(cd -- "$test_dir/.." && pwd)"
+image_name=container-init-posix-test
 
 docker build --tag "$image_name" --file "$crate_dir/Dockerfile.test" "$crate_dir/../.."
-docker run --rm "$image_name"
+docker run --rm --env "NIXOS_DOCKERS_GUEST_RUNTIME=$NIXOS_DOCKERS_GUEST_RUNTIME" "$image_name"

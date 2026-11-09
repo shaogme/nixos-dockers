@@ -12,6 +12,7 @@ use libc::{
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, to_vec};
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::BTreeMap,
     env,
     ffi::CString,
@@ -277,22 +278,26 @@ fn poll_until(fd: RawFd, events: c_short, deadline: Instant) -> io::Result<()> {
             revents: 0,
         };
         let result = unsafe { poll(&mut descriptor, 1, millis) };
-        if result > 0 {
-            if descriptor.revents & POLLNVAL != 0 {
-                return Err(io::Error::from_raw_os_error(EBADF));
+        match result.cmp(&0) {
+            CmpOrdering::Greater => {
+                if descriptor.revents & POLLNVAL != 0 {
+                    return Err(io::Error::from_raw_os_error(EBADF));
+                }
+                if descriptor.revents & (events | POLLHUP | POLLERR) != 0 {
+                    return Ok(());
+                }
             }
-            if descriptor.revents & (events | POLLHUP | POLLERR) != 0 {
-                return Ok(());
+            CmpOrdering::Equal => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request deadline expired",
+                ));
             }
-        } else if result == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "request deadline expired",
-            ));
-        } else {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+            CmpOrdering::Less => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
         }
     }

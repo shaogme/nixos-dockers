@@ -22,19 +22,17 @@ workspace 入口见 [`Cargo.toml`](../../Cargo.toml)，源码位于 `nixos-docke
 
 ## 2. 本地构建和静态检查
 
-从仓库根目录进入 `nixos-dockers` 后执行：
+CI 等价验证从仓库根目录由共享 QEMU launcher 发起：
 
 ```bash
-cargo build --locked -p dev-env-cli
-cargo build --locked -p dev-env-provider --bin dev-env-provider-worker
-cargo test --workspace --locked --no-default-features
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked --no-default-features
-cargo build --locked --release -p dev-env-cli
+bash scripts/qemu-test.sh workspace
 ```
 
+guest 使用 Rust 1.88.0，执行 Clippy、worker build、workspace tests 和
+`cargo cop --all-targets --all-features --workspace`。
+workspace test harness 单线程运行，因为 backend startup fixtures 共用固定 abstract endpoint。
 各 crate 的 Docker 集成目标 `tests/docker.rs` 使用 `docker-tests` feature，默认不编译。
-普通 workspace 测试因此直接使用 `cargo test --workspace`，不再枚举并排除 Docker 目标。
+直接 Cargo 命令适合快速迭代，但不能替代 QEMU guest 验证。
 
 如果修改了 Nix 模块或镜像集成，还应从 `nixos-dockers` 目录做最小评估：
 
@@ -46,16 +44,19 @@ nix-instantiate --eval --strict images/rust/image.nix -A rust.imageVersion
 
 ## 3. 测试组织
 
-单元测试主要和被测模块放在同一个 crate 中。跨进程、shell 和 Docker 行为由各 crate 的 `tests/docker.sh` 驱动：脚本构建一个测试 Dockerfile，在容器内编译并执行对应测试。
+单元测试主要和被测模块放在同一个 crate 中。跨进程、shell 和 Docker 行为由 guest 中的
+各 crate `tests/docker.sh` harness 驱动：脚本构建测试 Dockerfile，在容器内编译并执行对应测试。
 
-各 Dockerfile 使用 `--features docker-tests` 显式编译 Docker 集成目标。需要在兼容的 Linux
-环境中手动运行某个目标时，可以直接使用 Cargo：
+各 Dockerfile 使用 `--features docker-tests` 显式编译 Docker 集成目标。通过 target launcher
+运行对应 rootful fixture：
 
 ```bash
-cargo test --locked -p dev-env-core --features docker-tests --test docker
+bash scripts/qemu-test.sh crates --runtime rootful-docker
+bash scripts/qemu-test.sh crates --runtime rootless-podman
 ```
 
-当前仓库提供四个 Docker harness：
+每种 runtime 都在一台 guest 中顺序执行 container-init 与 dev-env 的全部七个 crate Docker
+suites。仓库提供四个 guest-only dev-env Docker harness：
 
 ```text
 crates/dev-env-core/tests/docker.sh
@@ -64,28 +65,13 @@ crates/dev-env-shell/tests/docker.sh
 crates/dev-env-cli/tests/docker.sh
 ```
 
-默认测试镜像分别为 `dev-env-core-test`、`dev-env-provider-test`、`dev-env-shell-test` 和 `dev-env-cli-test`。如果本地环境已有同等基础镜像，可通过以下变量替换：
+这些 harness 只由固定 suite/runtime allowlist 的 guest dispatcher 调用；宿主机直接运行会拒绝执行。
 
-```bash
-DEV_ENV_CORE_TEST_IMAGE=... ./crates/dev-env-core/tests/docker.sh
-DEV_ENV_PROVIDER_TEST_IMAGE=... ./crates/dev-env-provider/tests/docker.sh
-DEV_ENV_SHELL_TEST_IMAGE=... ./crates/dev-env-shell/tests/docker.sh
-DEV_ENV_CLI_TEST_IMAGE=... ./crates/dev-env-cli/tests/docker.sh
-```
+CLI backend 从 `dev-env` 所在目录启动 `dev-env-provider-worker`；workspace suite 和 core/provider/CLI
+Docker harness 会先构建该 helper。
 
-运行单个 harness 的完整示例：
-
-```bash
-cd nixos-dockers
-./crates/dev-env-core/tests/docker.sh
-./crates/dev-env-provider/tests/docker.sh
-./crates/dev-env-shell/tests/docker.sh
-./crates/dev-env-cli/tests/docker.sh
-```
-
-CLI backend 从 `dev-env` 所在目录启动 `dev-env-provider-worker`；本地手动启动 backend 前，应先构建该 helper。工作区 harness 会先构建它，然后直接运行 `cargo test --workspace`；core/provider/CLI Docker harness 也会在运行测试前构建它。
-
-这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider 超时、脱组后代清理、检测文件、真实 shell 或 backend transport 时，应优先运行对应的 Docker harness，而不仅仅是宿主机上的单元测试。
+这类测试覆盖配置物化、provider 输出传递、shell 环境格式化和 CLI 进程边界。涉及 provider
+超时、脱组后代清理、检测文件、真实 shell 或 backend transport 时，应运行对应的 QEMU target。
 
 ## 4. 修改 DSL 的检查清单
 
@@ -96,7 +82,7 @@ CLI backend 从 `dev-env` 所在目录启动 `dev-env-provider-worker`；本地�
 3. 更新 `docs/dsl.md` 中的字段表、示例和当前限制。
 4. 为合法值、非法值、冲突和来源追踪补充单元测试。
 5. 如果字段会影响 provider 或 shell，补充相应 Docker harness 测试。
-6. 执行 `cargo fmt`、`cargo test --workspace --locked` 和 `cargo clippy`。
+6. 运行 rootful Docker 与 rootless Podman 两个 crates guest suite；workspace 级 Clippy 和 Cargo tests 由 `scripts/qemu-test.sh workspace` 执行。
 
 需要注意：配置文件中的 `bootstrap` 当前不是 dev-env 环境 DSL 的一部分；它属于容器启动流程，文档和代码不应把两套 namespace 混为一谈。
 
@@ -158,8 +144,10 @@ docker run --rm --entrypoint /usr/bin/dev-env-login-shell image:tag -c 'printf "
 
 ```bash
 git diff --check
-cargo fmt --all -- --check
-cargo test --workspace --locked
+bash scripts/qemu-test.sh crates --runtime rootful-docker
+bash scripts/qemu-test.sh crates --runtime rootless-podman
+bash scripts/qemu-test.sh workspace
+cargo cop --all-targets --all-features --workspace
 ```
 
 若改动涉及 Nix 模块、磁盘、内核参数、服务状态或镜像运行时逻辑，再按仓库测试指南执行 `evalConfig`、相关 `nixosTest` 和 toplevel 构建。纯文档改动不需要伪造 VM 测试结果，但应检查 Markdown 链接和代码示例的路径。

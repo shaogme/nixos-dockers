@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1.85-bookworm
+FROM docker.io/library/rust:1.88.0-bookworm
 
 WORKDIR /workspace/nixos-dockers
 COPY . .

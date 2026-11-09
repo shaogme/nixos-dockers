@@ -335,19 +335,17 @@ impl Cgroup {
                 enabled_controllers.join(" ")
             )
             }
+        } else if is_bind_mount {
+            format!(
+            "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}; shadowed to {}",
+            target_names.join(" "),
+            target_root.display()
+        )
         } else {
-            if is_bind_mount {
-                format!(
-                "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}; shadowed to {}",
-                target_names.join(" "),
-                target_root.display()
-            )
-            } else {
-                format!(
-                "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}",
-                target_names.join(" ")
-            )
-            }
+            format!(
+            "cgroup v2 controllers ({}) already enabled in subtree_control; {moved_pids} procs in {subgroup_name}",
+            target_names.join(" ")
+        )
         };
 
         if !skipped_controllers.is_empty() {

@@ -147,22 +147,18 @@ cargo build --locked --release -p dev-env-cli
 只做本地文件诊断或离线测试时可以显式使用 `--offline`；该路径不会被生产 handoff
 调用。
 
-最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。从 `nixos-dockers` workspace 根目录快速验证 Rust workspace 本身：
+最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。CI 等价验证由 NixOS QEMU guest 执行；
+在仓库根目录运行完整 workspace suite：
 
 ```bash
-cargo test --workspace --locked --no-default-features
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked --no-default-features
+bash scripts/qemu-test.sh workspace
+bash scripts/qemu-test.sh crates --runtime rootful-docker
+bash scripts/qemu-test.sh crates --runtime rootless-podman
 ```
 
-工作区中的 Docker 集成测试由各 crate 的 `docker-tests` feature 控制，默认不参与编译。
-需要直接运行某个 fixture 时，可在支持的 Linux 容器环境中显式启用，例如：
-
-```bash
-cargo test --locked -p dev-env-core --features docker-tests --test docker
-```
-
-推荐使用下方 `tests/docker.sh` harness，它会准备相应的 root Linux 测试容器。
+两个 crates lane 都在单台 guest 内顺序运行全部七个 crate Docker suites。各 `tests/docker.sh`
+是 guest-only harness，必须由 dispatcher 调用。宿主机直接运行会失败；
+容器测试使用固定 Rust 1.88.0 toolchain，与 workspace guest 保持一致。
 
 ## 入口一致性
 
