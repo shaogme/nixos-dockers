@@ -29,20 +29,24 @@ container-init-posix ← container-init-core ← container-init-backend ← cont
 - `container-init-bootstrap-loader` 负责 TOML 和 profile graph，直到得到已验证的 `BootstrapConfig` 为止；不执行 action；
 - `container-init-posix` 封装 passwd/group、UID/GID、文件 owner/mode 和可写性检查等 POSIX 原语；
 - `container-init-core` 按 plan 顺序执行 action，处理 identity、condition、filesystem、SSH、receipt 和 handoff；
-- `container-init-backend` 持有单实例 snapshot，由单线程 poll 事件循环处理 Linux abstract endpoint RPC 和 PID 1 supervisor；
+- `container-init-backend` 持有单实例 snapshot，由单线程 poll 事件循环处理 Linux abstract endpoint RPC；lease 持有者在启动 reconcile 前启用 subreaper，并由唯一 child reaper 持续回收 handoff 与重新托管的子进程；
 - `container-init-cli` 负责参数解析、配置路径发现和 backend 启动/客户端命令；二进制名称是 `container-init`。
 
 保持这个方向很重要：bootstrap 不应反向依赖任何 provider、shellenv 或镜像特化逻辑。
 
 ## 2. 本地构建和测试
 
-在 `nixos-dockers` workspace 根目录执行：
+完整验证入口从仓库根目录运行。launcher 构建固定 Nix pin 的 rootful Docker VM，复制当前
+checkout，并在 guest 中执行 Clippy、worker 构建、workspace tests 与
+`cargo cop --all-targets --all-features --workspace`：
 
 ```bash
-cargo fmt --all -- --check
-cargo check --workspace --locked
-cargo test --workspace --locked
+bash scripts/qemu-test.sh workspace
 ```
+
+`tests/docker.rs` 集成目标由各 crate 的 `docker-tests` feature 控制，默认 workspace suite
+不编译这些 Linux Docker fixture；Cargo test harness 单线程运行，避免共享 backend endpoint
+的 startup fixtures 互相竞争。直接 Cargo 命令可用于快速迭代，但不替代 guest 验证。
 
 常用的定向测试：
 
@@ -65,29 +69,43 @@ cargo test --locked -p container-init-cli --test cli -- --nocapture
 
 如果只构建或测试 container-init 的一个 crate，从 workspace 根目录使用 `-p <package>` 选择目标。
 
-## 3. Docker 集成测试
-
-POSIX、core 和 CLI 各有一个 root Linux 容器 fixture：
+child reaper 的 `nixosTest` 保持独立，由 NixOS 测试 driver 自己启动 QEMU。标准运行命令是：
 
 ```bash
-./crates/container-init-posix/tests/docker.sh
-./crates/container-init-core/tests/docker.sh
-./crates/container-init-cli/tests/docker.sh
+bash scripts/qemu-test.sh nixos-reaper
 ```
 
-对应的 Dockerfile 会构建并运行：
+该 fixture 用 Nix 构建的 `container-init` 启动非 PID 1 backend，在 VM 中检查常驻期间被重新
+托管的后代；Docker CLI fixture 则验证 container-init 直接作为 PID namespace init 的情形。
+交互调试时可用 pinned nixpkgs 构建 driver，然后执行 `start_all()` 和 `machine.shell()`：
+
+```bash
+export NIX_PATH="nixpkgs=$(nix-instantiate --eval --raw -E 'let sources = import ./images/rust/npins; in sources.nixpkgs.outPath')"
+nix-build tests/container-init-reaper-vm.nix -A driver -o result-reaper
+./result-reaper/bin/nixos-test-driver
+```
+
+## 3. Docker 集成测试
+
+container-init 的 POSIX、core 和 CLI Docker fixtures 与 dev-env 四个 crate fixture 一起在
+每种 engine VM 中顺序运行，标准命令为：
+
+```bash
+bash scripts/qemu-test.sh crates --runtime rootful-docker
+bash scripts/qemu-test.sh crates --runtime rootless-podman
+```
+
+dispatcher 进入 guest 后按固定顺序调用全部 crate 的 `tests/docker.sh`；直接运行单个 harness
+不受支持。每个 Dockerfile 会在 Rust 1.88.0 容器中以 `--features docker-tests` 编译并运行：
 
 - `container-init-posix`：真实容器中的 root account、权限、owner 和降权；
 - `container-init-core`：真实 POSIX action、SSH fixture、action 顺序和 privilege boundary；
 - `container-init-backend`：abstract endpoint peer credential 检查、endpoint 唯一性、RPC 和 supervisor；
 - `container-init-cli`：profile 目录读取、plan/doctor/run、runtime handoff 和 SSH capability。
 
-这几项测试要求 Docker 可用，且 fixture 默认以 root 运行。镜像名可以通过各脚本使用的环境变量覆盖：
-
-```bash
-CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
-  ./crates/container-init-posix/tests/docker.sh
-```
+rootful Docker lane 会预检 cgroup v2、可写根层级、FUSE 和 `CAP_SYS_ADMIN`。core 与 CLI 的
+必需 cgroup、控制器委托、SSH 和 bind-mount 断言遇到能力缺失会失败。rootless lane 也运行全部
+crate test binaries。cgroup 写入、挂载和 PID namespace 测试会实际尝试对应操作；只有 rootless Podman 容器返回明确的权限错误时，才将该断言标记为 `UNSUPPORTED`。
 
 ## 4. 测试覆盖的行为
 
@@ -121,7 +139,8 @@ CONTAINER_INIT_POSIX_TEST_IMAGE=my-posix-test \
 - Linux 容器 fixture 覆盖目标凭据下的 ACL `chdir`、具名补充组授权、非 root 完整凭据匹配，以及 Preflight 失败不 Commit；单元测试覆盖 cwd 设备号/inode 替换比较和 handoff 子进程信号转发；
 - plan 分页游标与 snapshot 一致性校验；执行帧可能已发送时不重试，并报告结果未知；
 - endpoint bind 冲突时只查询并验证现有 backend，不清理或接管 abstract endpoint；
-- 慢速 header、超长 frame、body admission、response frame 上限、deadline 和 shutdown signal 的事件循环路径。
+- 慢速 header、超长 frame、body admission、response frame 上限、deadline 和 shutdown signal 的事件循环路径；
+- Linux child reaper 覆盖正常/信号退出状态、非 handoff child 状态丢弃、handoff PID 回收后被复用、有界批次让出、`EINTR` 重试、`ECHILD` 与暂时无退出状态的区分，以及 syscall 错误传播；启动测试验证信号初始化失败会释放 listener 且不会启动 action/handoff，并验证 handoff 退出与关闭信号同轮观察时优先按 handoff 退出触发清理。CLI 进程测试等待 backend 运行期间已收养的退出 PID 消失，并在孤儿退出风暴中验证关闭期限；Docker fixture 验证 `container-init` 直接作为 PID namespace init 时的持续回收。
 
 ### CLI
 

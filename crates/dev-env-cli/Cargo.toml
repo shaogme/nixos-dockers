@@ -14,6 +14,15 @@ path = "src/lib.rs"
 name = "dev-env"
 path = "src/main.rs"
 
+[features]
+default = []
+docker-tests = []
+
+[[test]]
+name = "docker"
+path = "tests/docker.rs"
+required-features = ["docker-tests"]
+
 [dependencies]
 dev-env-core = { workspace = true }
 dev-env-loader = { workspace = true }

@@ -12,6 +12,11 @@ profile、snapshot、materializer、identity broker 检查和 endpoint 初始化
 `login-shell`、shim 和 `print` 都是短命 client，只发送请求上下文，不读取 profile，也不
 直接启动 provider：
 
+initial shell/service 是 `dev-env backend` 直接启动并等待的子进程。容器级 `container-init`
+只等待 handoff 及 Linux 重新托管给它的子进程；仍有存活父进程的 shell/service 后代不属于它的
+wait 范围。父进程退出后，内核才会按最近的 child subreaper 规则重新托管后代，届时 outer
+backend 才能回收这些状态。
+
 ```text
 client 采集 cwd、shell、identity、runtime inputs 和允许的 ambient env
   ↓
@@ -57,6 +62,11 @@ cache/in-flight 表的唯一所有者。connection reader 只认证 peer、解�
 发送及 `waitpid(-1)` 回收；backend 只管理自己直接创建的 worker，因此 initial shell/service 与
 provider 后代具有不同的回收边界。停止 backend 时，actor 通过 out-of-band 控制通道取消当前
 worker，并等待其清理完成；worker 路径固定为真实 `dev-env` 可执行文件旁的 helper。
+
+因此 `dev-env backend` 负责等待自己的 initial shell/service 和直接创建的 worker；provider
+worker 负责运行期间的 provider 进程组、超时/取消清理及自己收养的后代。若 worker 退出时仍有
+后代存活，这些进程只有在 Linux 将它们重新托管给 `container-init` 后才由容器级 reaper 等待；
+任何一层都不能 `wait` 仍有其他存活父进程的进程。
 
 ## 2. 命令总览
 

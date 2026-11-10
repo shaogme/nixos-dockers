@@ -1,14 +1,15 @@
 use container_init_backend::BackendClient;
 use container_init_core::{PosixSystem, SshCapability};
 use container_init_protocol::AbstractEndpoint;
-use libc::{kill, SIGTERM};
+use libc::{_exit, fork, kill, usleep, SIGKILL, SIGTERM};
 use serde_json::{from_slice, Value};
 use std::{
-    env::{consts::OS, current_exe},
-    fs,
-    io::Write,
+    env::{consts::OS, current_exe, var, var_os},
+    fs::{self, OpenOptions},
+    io::{self, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
     process::{id, Command, Stdio},
     thread::{scope, sleep},
     time::{Duration, Instant},
@@ -167,9 +168,10 @@ fn cli_runs_a_real_ssh_bootstrap_action_before_handoff() {
         0,
         "Docker fixture must run as root"
     );
-    if !SshCapability::default().available() {
-        return;
-    }
+    assert!(
+        SshCapability::default().available(),
+        "ssh-keygen is required for SSH bootstrap"
+    );
 
     let temp = TempDir::new().unwrap();
     let profiles = temp.path().join("profiles");
@@ -288,14 +290,24 @@ fn cli_runs_a_real_cgroup_v2_init_bootstrap_action_before_handoff() {
     );
 
     let cgroup_base = Path::new("/sys/fs/cgroup");
-    if !cgroup_base.join("cgroup.controllers").exists() {
-        return;
-    }
+    assert!(
+        cgroup_base.join("cgroup.controllers").exists(),
+        "the cgroup v2 controller file is required"
+    );
     let test_probe = cgroup_base.join("probe_cgroup_cli_rw");
-    if fs::create_dir(&test_probe).is_err() {
-        return;
+    if let Err(error) = fs::create_dir(&test_probe) {
+        if var_os("NIXOS_DOCKERS_GUEST_RUNTIME").is_some_and(|runtime| runtime == "rootless-podman")
+            && matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::EROFS)
+            )
+        {
+            eprintln!("UNSUPPORTED: rootless Podman VM denied the cgroup v2 write probe: {error}");
+            return;
+        }
+        panic!("could not create the root cgroup v2 write probe: {error}");
     }
-    let _ = fs::remove_dir(&test_probe);
+    fs::remove_dir(&test_probe).unwrap();
 
     let temp = TempDir::new().unwrap();
     let profiles = temp.path().join("profiles");
@@ -1089,4 +1101,191 @@ depends_on = ["resolve"]
     let _ = fs::remove_file(denied_marker);
     let _ = fs::remove_file(peer_marker);
     let _ = fs::remove_file(parent_denied_marker);
+}
+
+#[test]
+fn orphan_process_helper_when_configured() {
+    let Ok(pid_file) = var("CONTAINER_INIT_TEST_ORPHAN_PID_FILE") else {
+        return;
+    };
+    let child_pid = unsafe { fork() };
+    assert!(
+        child_pid >= 0,
+        "fork failed: {}",
+        io::Error::last_os_error()
+    );
+    if child_pid == 0 {
+        unsafe {
+            usleep(1_500_000);
+            _exit(0);
+        }
+    }
+    let mut pid_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(pid_file)
+        .unwrap();
+    writeln!(pid_file, "{child_pid}").unwrap();
+}
+
+#[test]
+fn container_init_as_pid_namespace_init_reaps_orphans_while_running() {
+    assert_eq!(OS, "linux");
+    let namespace_probe = Command::new("unshare")
+        .args(["--pid", "--fork", "--mount-proc", "true"])
+        .output()
+        .unwrap();
+    if !namespace_probe.status.success() {
+        let error = String::from_utf8_lossy(&namespace_probe.stderr);
+        if var_os("NIXOS_DOCKERS_GUEST_RUNTIME").is_some_and(|runtime| runtime == "rootless-podman")
+            && (error.contains("Operation not permitted") || error.contains("Permission denied"))
+        {
+            eprintln!(
+                "UNSUPPORTED: rootless Podman VM nested PID namespace attempt failed: {}",
+                error.trim()
+            );
+            return;
+        }
+        panic!("nested PID namespace probe failed: {}", error.trim());
+    }
+    assert_eq!(
+        PosixSystem::new().current_ids().0,
+        0,
+        "Docker fixture must run as root"
+    );
+    let temp = TempDir::new().unwrap();
+    let profiles = temp.path().join("profiles");
+    let workspace = temp.path().join("workspace");
+    let socket = temp.path().join("backend.sock");
+    let pid_file = workspace.join("orphan-pids");
+    let pass_file = workspace.join("observer-passed");
+    let fail_file = workspace.join("observer-failed");
+    let stop_file = workspace.join("stop-handoff");
+    fs::create_dir(&profiles).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    fs::write(&pid_file, "").unwrap();
+    fs::write(
+        profiles.join("pid1.toml"),
+        format!(
+            "schema = 1\nid = \"pid1\"\n\n[bootstrap]\nworkspace_root = \"{}\"\n\n[bootstrap.identity]\ndefault_user = \"root\"\ndefault_uid = 0\ndefault_gid = 0\nauto_mapping = false\n\n[bootstrap.handoff]\nruntime = \"/bin/sh\"\nexec_prefix = [\"-c\"]\ninitial_exec_prefix = [\"-c\"]\nshell_prefix = [\"-c\", \"true\"]\n",
+            workspace.display()
+        ),
+    )
+    .unwrap();
+
+    let observer = format!(
+        r#"
+set +eu
+IFS= read -r init_name < /proc/1/comm
+if [ "$init_name" != container-init ] || [ "$$" -eq 1 ]; then
+  echo "container-init must be PID 1 and observer must not be PID 1" > "{}"
+  exit 44
+fi
+loops=0
+adopted=0
+while [ "$loops" -lt 120 ]; do
+  while IFS= read -r pid; do
+    if IFS= read -r stat_line 2>/dev/null < "/proc/$pid/stat"; then
+      fields=${{stat_line##*) }}
+      set -- $fields
+      if [ "$1" = Z ]; then echo "orphan $pid stayed zombie" > "{}"; exit 41; fi
+      if [ "$2" = 1 ]; then adopted=1; fi
+    fi
+  done < "{}"
+  IFS= read -r children < /proc/1/task/1/children || children=
+  for pid in $children; do
+    if IFS= read -r stat_line 2>/dev/null < "/proc/$pid/stat"; then
+      fields=${{stat_line##*) }}
+      set -- $fields
+      if [ "$1" = Z ]; then echo "PID 1 child $pid stayed zombie" > "{}"; exit 42; fi
+    fi
+  done
+  loops=$((loops + 1))
+  if [ "$loops" -ge 115 ] && [ "$adopted" -eq 1 ]; then
+    echo pass > "{}"
+    exit 0
+  fi
+  sleep 0.02
+done
+echo "no live orphan was reparented to PID 1" > "{}"
+exit 43
+"#,
+        fail_file.display(),
+        fail_file.display(),
+        pid_file.display(),
+        fail_file.display(),
+        pass_file.display(),
+        fail_file.display()
+    );
+    let handoff = format!(
+        "set -eu; ( {} ) & observer=$!; count=0; while [ \"$count\" -lt 80 ] && [ ! -f '{}' ]; do CONTAINER_INIT_TEST_ORPHAN_PID_FILE='{}' '{}' --exact orphan_process_helper_when_configured --nocapture >/dev/null 2>&1; sleep 0.02; count=$((count + 1)); done; while [ ! -f '{}' ]; do sleep 0.05; done; wait \"$observer\"",
+        observer,
+        stop_file.display(),
+        pid_file.display(),
+        current_exe().unwrap().display(),
+        stop_file.display()
+    );
+    let mut command = Command::new("unshare");
+    command
+        .args(["--pid", "--fork", "--mount-proc"])
+        .arg(binary())
+        .args([
+            "--profiles-dir",
+            profiles.to_str().unwrap(),
+            "--profile",
+            "pid1",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--backend-endpoint",
+            socket.to_str().unwrap(),
+            "run",
+            "--",
+        ])
+        .arg(handoff)
+        .env("CONTAINER_INIT_RUNTIME_DIR", temp.path())
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let mut init_namespace = command.spawn().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if pass_file.exists() || fail_file.exists() {
+            break;
+        }
+        if let Some(status) = init_namespace.try_wait().unwrap() {
+            panic!("PID namespace fixture exited before observer result: {status}");
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "PID namespace timeout: lines={}, pass={}, fail={:?}",
+                fs::read_to_string(&pid_file)
+                    .unwrap_or_default()
+                    .lines()
+                    .count(),
+                pass_file.exists(),
+                fs::read_to_string(&fail_file)
+            );
+            let _ = unsafe { kill(-(init_namespace.id() as i32), SIGKILL) };
+            panic!("PID namespace observer did not finish");
+        }
+        sleep(Duration::from_millis(20));
+    }
+    let result = fs::read_to_string(&pass_file)
+        .or_else(|_| fs::read_to_string(&fail_file))
+        .expect("observer result should be available");
+    fs::write(&stop_file, "stop\n").unwrap();
+    let status = init_namespace.wait().unwrap();
+    assert!(result.trim() == "pass", "{result}");
+    assert!(status.success(), "PID namespace init exited with {status}");
+}
+
+fn binary() -> PathBuf {
+    current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("container-init")
 }

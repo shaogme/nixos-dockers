@@ -1,3 +1,4 @@
+mod child_reaper;
 mod connection;
 mod identity;
 mod inspection;
@@ -84,8 +85,19 @@ impl BackendLease {
         }
     }
 
-    pub fn start(mut self, mut options: BackendStartOptions) -> Result<i32, BackendRunError> {
-        let _signal_mask = BackendSupervisor::block_shutdown_signals()?;
+    pub fn start(self, options: BackendStartOptions) -> Result<i32, BackendRunError> {
+        initialize_then_start(
+            self,
+            BackendSupervisor::initialize,
+            |lease, signal_setup| lease.start_initialized(options, signal_setup),
+        )
+    }
+
+    fn start_initialized(
+        mut self,
+        mut options: BackendStartOptions,
+        signal_setup: lifecycle::BackendSignalSetup,
+    ) -> Result<i32, BackendRunError> {
         let snapshot_id = BackendRuntime::calculate_snapshot_id(
             &options.profile,
             &options.config,
@@ -132,7 +144,7 @@ impl BackendLease {
                 "backend listener is unavailable",
             )
         })?;
-        let child = BackendSupervisor::spawn_handoff(
+        let handoff_pid = BackendSupervisor::spawn_handoff(
             &handoff,
             &identity,
             root_service,
@@ -143,7 +155,7 @@ impl BackendLease {
             profile: options.profile.clone(),
             snapshot_id: snapshot_id.clone(),
             backend_pid: process::id(),
-            initial_child_pid: Some(child.id()),
+            initial_child_pid: Some(handoff_pid),
             started_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -162,8 +174,18 @@ impl BackendLease {
             execution_options: options.execution_options,
             status,
         });
-        BackendSupervisor::supervise(listener, child, &mut runtime).map_err(BackendRunError::Io)
+        BackendSupervisor::supervise(listener, handoff_pid, signal_setup, &mut runtime)
+            .map_err(BackendRunError::Io)
     }
+}
+
+fn initialize_then_start<T>(
+    lease: BackendLease,
+    initialize: impl FnOnce() -> io::Result<T>,
+    start: impl FnOnce(BackendLease, T) -> Result<i32, BackendRunError>,
+) -> Result<i32, BackendRunError> {
+    let setup = initialize()?;
+    start(lease, setup)
 }
 
 impl fmt::Display for BackendRunError {
@@ -225,6 +247,52 @@ fn request_existing_status(
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn signal_setup_failure_releases_listener_before_starting_actions_or_handoff() {
+    use libc::EMFILE;
+    use lifecycle::BackendSupervisor;
+
+    let endpoint =
+        AbstractEndpoint::new(format!("container-init-setup-test.{}", process::id())).unwrap();
+    let lease = match BackendLease::claim(
+        BackendPaths {
+            endpoint: endpoint.clone(),
+            owner_uid: unsafe { geteuid() },
+            peer_uid: unsafe { geteuid() },
+        },
+        Duration::from_millis(100),
+    )
+    .unwrap()
+    {
+        BackendClaim::Acquired(lease) => lease,
+        BackendClaim::AlreadyRunning(_) => panic!("unexpected existing backend"),
+    };
+    let mut actions_or_handoff_started = false;
+
+    let result = initialize_then_start(
+        lease,
+        || {
+            BackendSupervisor::initialize_with_signal_fd(|_| {
+                Err(io::Error::from_raw_os_error(EMFILE))
+            })
+        },
+        |_, _| {
+            actions_or_handoff_started = true;
+            Ok(0)
+        },
+    );
+
+    assert!(
+        matches!(result, Err(BackendRunError::Io(error)) if error.raw_os_error() == Some(EMFILE))
+    );
+    assert!(!actions_or_handoff_started);
+    let rebound = endpoint
+        .bind(4)
+        .expect("failed startup should release its listener");
+    drop(rebound);
 }
 
 #[cfg(test)]

@@ -4,12 +4,18 @@ use crate::{
 };
 use container_init_bootstrap_model::Action;
 use container_init_posix::{set_mode, ActionChange, PosixSystem};
+use libc::{
+    sigaddset, sigemptyset, sigprocmask, sigset_t, SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM,
+    SIG_UNBLOCK,
+};
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs, io, mem,
     os::unix::fs::PermissionsExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{id, Command, Stdio},
+    ptr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -252,20 +258,23 @@ fn generate_key(
     capability: &SshCapability,
     posix_system: &PosixSystem,
 ) -> Result<(), CoreError> {
-    let output = Command::new(capability.keygen())
+    let mut command = Command::new(capability.keygen());
+    command
         .args(["-q", "-t", key_type, "-N", "", "-f"])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|source| {
-            CoreError::io(
-                Some(action),
-                Some(capability.keygen().to_path_buf()),
-                source,
-            )
-        })?;
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(unblock_supervisor_signals);
+    }
+    let output = command.status().map_err(|source| {
+        CoreError::io(
+            Some(action),
+            Some(capability.keygen().to_path_buf()),
+            source,
+        )
+    })?;
     if !output.success() {
         return Err(CoreError::action(
             action,
@@ -283,6 +292,22 @@ fn generate_key(
     }
     reconcile_key_file(action, path, 0o600, posix_system)?;
     reconcile_key_file(action, &public, 0o644, posix_system)?;
+    Ok(())
+}
+
+fn unblock_supervisor_signals() -> io::Result<()> {
+    let mut mask: sigset_t = unsafe { mem::zeroed() };
+    if unsafe { sigemptyset(&mut mask) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for signal in [SIGCHLD, SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
+        if unsafe { sigaddset(&mut mask, signal) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if unsafe { sigprocmask(SIG_UNBLOCK, &mask, ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 

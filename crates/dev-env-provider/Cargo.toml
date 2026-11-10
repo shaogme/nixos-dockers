@@ -10,6 +10,15 @@ license.workspace = true
 name = "dev-env-provider-worker"
 path = "src/bin/dev-env-provider-worker.rs"
 
+[features]
+default = []
+docker-tests = []
+
+[[test]]
+name = "docker"
+path = "tests/docker.rs"
+required-features = ["docker-tests"]
+
 [dependencies]
 dev-env-model = { workspace = true }
 libc = { workspace = true }

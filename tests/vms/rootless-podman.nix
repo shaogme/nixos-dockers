@@ -23,11 +23,14 @@ let
       boot.kernelParams = [
         "console=ttyS0,115200n8"
         "console=tty0"
+        "systemd.unified_cgroup_hierarchy=1"
       ];
       boot.kernelModules = [
         "br_netfilter"
         "fuse"
         "overlay"
+        "9p"
+        "9pnet_virtio"
         "tun"
       ];
       boot.kernel.sysctl = {
@@ -80,7 +83,34 @@ let
         "root"
         "podman"
       ];
+      nix.settings.experimental-features = [ "nix-command" ];
       environment.etc."nixpkgs".source = pkgs.path;
+      virtualisation.fileSystems."/mnt/qemu-share" = {
+        device = "qemu-share";
+        fsType = "9p";
+        options = [
+          "trans=virtio"
+          "version=9p2000.L"
+          "msize=16384"
+          "x-systemd.requires=modprobe@9pnet_virtio.service"
+          "ro"
+        ];
+      };
+      users.allowNoPasswordLogin = true;
+      systemd.services.qemu-authorized-key = {
+        description = "Install the temporary QEMU launcher SSH key";
+        wantedBy = [ "sshd.service" ];
+        before = [ "sshd.service" ];
+        after = [ "local-fs.target" ];
+        serviceConfig.Type = "oneshot";
+        path = [ pkgs.coreutils ];
+        script = ''
+          install -d -m 0700 /root/.ssh
+          install -m 0600 /mnt/qemu-share/ssh.pub /root/.ssh/authorized_keys
+        '';
+      };
+      systemd.services.sshd.requires = [ "qemu-authorized-key.service" ];
+      systemd.services.sshd.after = [ "qemu-authorized-key.service" ];
       # The test user runs nix-build directly. Give it access to the daemon
       # socket while retaining the normal non-root build permissions.
       systemd.sockets.nix-daemon.socketConfig = {
@@ -99,8 +129,8 @@ let
         openssh
         podman
         qemu-utils
+        util-linux
         slirp4netns
-        sshpass
       ];
 
       users.groups.podman.gid = 1000;
@@ -113,7 +143,6 @@ let
         createHome = true;
         shell = pkgs.bashInteractive;
         linger = true;
-        initialHashedPassword = "$6$tEI3gQs0Btzt1Chd$se4yg0TbtA7DeNXG.H19YOVHTkc.4INnG5xpn4QX/EmH536zpQBbrR/Wp.BkzgnQdDF3OUvNl.rg7bMO.faLq1";
         subUidRanges = [
           {
             startUid = 100000;
@@ -131,14 +160,14 @@ let
       services.openssh = {
         enable = true;
         settings = {
-          PermitRootLogin = "yes";
-          PasswordAuthentication = true;
+          PermitRootLogin = "prohibit-password";
+          PasswordAuthentication = false;
+          KbdInteractiveAuthentication = false;
+          PubkeyAuthentication = true;
         };
       };
 
       users.mutableUsers = false;
-      users.users.root.initialHashedPassword = "$6$tEI3gQs0Btzt1Chd$se4yg0TbtA7DeNXG.H19YOVHTkc.4INnG5xpn4QX/EmH536zpQBbrR/Wp.BkzgnQdDF3OUvNl.rg7bMO.faLq1";
-
       # Rootless Podman needs to pass these devices to the nested engine. The
       # VM has no other users, so making them readable is sufficient here.
       services.udev.extraRules = ''

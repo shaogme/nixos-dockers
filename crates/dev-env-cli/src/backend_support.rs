@@ -179,10 +179,7 @@ impl BackendSupport {
             BackendResponse::Error(BackendError::new(
                 "BACKEND-PROTOCOL-MISMATCH",
                 false,
-                format!(
-                    "received dev-env backend protocol v{version}; this backend requires v{}",
-                    DEVENV_BACKEND_PROTOCOL_VERSION
-                ),
+                format!("received dev-env backend protocol v{version}; this backend requires v{DEVENV_BACKEND_PROTOCOL_VERSION}"),
             )),
         )
     }
@@ -350,8 +347,7 @@ impl BackendSupport {
             .map_err(|error| CliError::Backend(error.to_string()))?;
         BackendResponseMessage::read_from(&mut stream).map_err(|error| match error {
             BackendProtocolError::UnsupportedVersion(version) => CliError::Backend(format!(
-                "BACKEND-PROTOCOL-MISMATCH: backend response uses protocol v{version}; expected v{}",
-                    DEVENV_BACKEND_PROTOCOL_VERSION
+                "BACKEND-PROTOCOL-MISMATCH: backend response uses protocol v{version}; expected v{DEVENV_BACKEND_PROTOCOL_VERSION}"
             )),
             error => CliError::Backend(error.to_string()),
         })
@@ -533,7 +529,13 @@ impl BackendSupport {
     }
 
     pub fn hex(bytes: &[u8; 32]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        encoded
     }
 
     #[cfg(unix)]
@@ -650,7 +652,7 @@ fn readiness_waits_only_for_transient_states_and_fails_fast_on_terminal_states()
         assert!(matches!(
             startup_readiness(&status(state)),
             StartupReadiness::Pending(observation)
-                if observation.state == format!("{:?}", state).to_lowercase()
+                if observation.state == format!("{state:?}").to_lowercase()
                     && observation.phase == "profile_loading"
                     && observation.transport_error.is_none()
         ));

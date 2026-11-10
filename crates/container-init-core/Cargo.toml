@@ -6,6 +6,15 @@ rust-version.workspace = true
 description = "POSIX bootstrap action executor for container-init"
 license.workspace = true
 
+[features]
+default = []
+docker-tests = []
+
+[[test]]
+name = "docker"
+path = "tests/docker.rs"
+required-features = ["docker-tests"]
+
 [dependencies]
 container-init-bootstrap-model = { workspace = true }
 container-init-posix = { workspace = true }

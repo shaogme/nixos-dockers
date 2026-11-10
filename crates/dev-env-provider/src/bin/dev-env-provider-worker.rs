@@ -1,5 +1,6 @@
+use dev_env_provider::ProviderWorker;
 use std::process::exit;
 
 fn main() {
-    exit(dev_env_provider::ProviderWorker::run());
+    exit(ProviderWorker::run());
 }

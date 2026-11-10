@@ -34,10 +34,26 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn test_path() -> String {
+        let mut entries = Vec::new();
+        if Path::new("/run/current-system/sw/bin").is_dir() {
+            entries.push("/run/current-system/sw/bin");
+        }
+        entries.push("/usr/bin:/bin");
+        entries.join(":")
+    }
+
     fn real_bash() -> PathBuf {
         var_os("DEVENV_BOOTSTRAP_REAL_SHELL")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/bin/bash"))
+            .unwrap_or_else(|| {
+                let nixos_bash = Path::new("/run/current-system/sw/bin/bash");
+                if nixos_bash.exists() {
+                    nixos_bash.to_path_buf()
+                } else {
+                    PathBuf::from("/bin/bash")
+                }
+            })
     }
 
     fn new() -> Self {
@@ -88,7 +104,7 @@ command_arg = "-c"
 inherit_process = false
 
 [config.environment.variables]
-PATH = "/usr/bin:/bin"
+PATH = "{}"
 PROVIDER_LOG = "{}"
 {}
 
@@ -109,6 +125,7 @@ timeout_ms = 1000
 "#,
             self.workspace.display(),
             real_bash.display(),
+            Self::test_path(),
             self.root.join("provider.log").display(),
             extra_variables,
             provider.display(),
@@ -123,7 +140,7 @@ timeout_ms = 1000
         let mut command = Command::new(env!("CARGO_BIN_EXE_dev-env"));
         command
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", Self::test_path())
             .env("HOME", self.root.join("home"))
             .env("XDG_RUNTIME_DIR", runtime)
             .env("DEVENV_PROFILES_DIR", &self.profiles)
@@ -562,7 +579,7 @@ esac
             fixture.nested.to_str().unwrap(),
             "exec",
             "--",
-            "/bin/true",
+            "true",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${NIXOS_DOCKERS_QEMU_GUEST:-}" != 1 ]]; then
+    echo "Podman image tests must run through scripts/qemu-test.sh" >&2
+    exit 2
+fi
 
-for script in podman-rootless-test.sh podman-docker-test.sh; do
-    [[ -f "$script_dir/$script" ]] || {
-        echo "test script not found: $script_dir/$script" >&2
-        exit 1
-    }
-done
+case "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" in
+    rootful-docker)
+        [[ "$(id -u)" == 0 ]]
+        docker info >/dev/null
+        ;;
+    rootless-podman)
+        [[ "$(id -u)" == 1000 && "$(id -g)" == 1000 ]]
+        [[ "$(podman info --format '{{.Host.Security.Rootless}}')" == true ]]
+        graphroot="$(podman info --format '{{.Store.GraphRoot}}')"
+        [[ "$graphroot" == /home/podman/.local/share/containers/storage && -w "$graphroot" ]]
+        ;;
+    *)
+        echo "unsupported Podman test runtime: ${NIXOS_DOCKERS_GUEST_RUNTIME:-<empty>}" >&2
+        exit 2
+        ;;
+esac
 
-echo "==> running rootless Podman runtime test"
-bash "$script_dir/podman-rootless-test.sh"
-
-echo "==> running Podman Docker runtime test"
-bash "$script_dir/podman-docker-test.sh"
-
-echo "Podman runtime tests passed"
+exec bash "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"

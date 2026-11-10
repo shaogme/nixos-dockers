@@ -31,6 +31,11 @@ Compose 注入的开发环境变量会随进程环境保留到 handoff runtime�
 - [安全模型](docs/security.md)：信任边界、路径检查、权限阶段、SSH 和错误码。
 - [开发与测试](docs/development.md)：crate 分层、构建、单元测试和 Docker 测试。
 
+workspace 测试默认不编译 Linux Docker fixture。完整 workspace 验证，以及在 rootful Docker
+和 rootless Podman guest 中聚合运行全部 crate fixture 的 CI 等价验证，都由仓库根目录
+`scripts/qemu-test.sh` 发起；各 crate 的 Dockerfile 会显式启用 `docker-tests` feature。target
+命令见[开发与测试](docs/development.md)。
+
 ## 快速开始
 
 ### 1. 准备 profile
@@ -138,6 +143,19 @@ Bootstrap。`docker exec` 的自动身份行为来自 shim 委托，不是 Docke
 backend endpoint 尚未出现或控制面尚未 `serving` 时自动等待，超时由 dev-env startup
 deadline 报告。`container-init` 仍负责监督初始 handoff 子进程并传播退出码。
 
+取得 backend lease 的 `container-init run` 会在第一个 bootstrap action 或子进程启动前屏蔽
+`SIGCHLD` 和关闭信号、重置 `SIGCHLD` 的自动回收设置、创建 signalfd，并启用 Linux child
+subreaper。handoff 运行期间，backend 通过唯一的 child reaper 持续等待退出子进程；每轮最多尝试
+64 次 `waitpid`，再处理信号、连接和关闭期限后继续 drain；主 handoff
+的状态用于最终退出码，其他已重新托管给 backend 的子进程只被回收。`waitpid` 只能等待当前
+进程的直接子进程，因此仍有存活父进程的后代不会被容器级 backend 越权等待；只有 Linux 将其
+重新托管给 backend 后，它才进入回收范围。
+
+关闭时 backend 先关闭 listener 并向 handoff 进程组转发首次观察到的关闭信号。handoff 自行退出
+也会触发进程组 `SIGTERM` 清理；5 秒宽限期后仍未升级时发送 `SIGKILL`，最迟约 6 秒退出。若
+handoff 状态已保存、连接已清空且 reaper 确认没有任何可等待子进程，则可以提前结束。`plan`、
+`doctor`、`status` 和短命 `container-init exec` helper 不启用这套容器级回收职责。
+
 ### 3. 用运行时输入映射宿主身份
 
 profile 先声明输入，CLI 或环境变量才可以设置它：
@@ -208,10 +226,12 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 绑定 Linux abstract endpoint，取得 backend 唯一所有权
     ↓
 选择 profile、构建 plan 并解析目标身份
-    ↓
-按静态 plan 顺序执行启动 action
-    ↓
-由单线程 poll 事件循环处理 RPC 并监督 handoff child
+   ↓
+取得 backend lease 后启用 subreaper、屏蔽受管信号并创建 signalfd
+   ↓
+按静态 plan 顺序执行启动 action，再 spawn handoff runtime
+   ↓
+由单线程 poll 事件循环和唯一 child reaper 处理 RPC、持续回收并监督 handoff PID
 ```
 
 计划由 `container-init-bootstrap-model` 生成。它会为显式 `depends_on` 加上必要的身份依赖，检查缺失依赖、循环和阶段倒置，并以稳定的拓扑顺序输出。离线 `plan` 只生成这个静态计划，不探测运行时输入，也不访问宿主文件系统；backend 在线时，`plan` 从不可变快照分页读取并合并结果。
@@ -253,7 +273,7 @@ rootless 容器中宿主 UID 1000 可能已映射，但宿主 GID 1000 未必映
 | 加载与合并 | [`crates/container-init-bootstrap-loader`](../crates/container-init-bootstrap-loader) | TOML 解析、action kind 归一化、继承、来源和信任、冲突处理 |
 | POSIX 边界 | [`crates/container-init-posix`](../crates/container-init-posix) | passwd/group、UID/GID、`chown`、权限和可写性检查 |
 | 执行核心 | [`crates/container-init-core`](../crates/container-init-core) | 身份解析、条件求值、按 plan 顺序执行文件 action、SSH capability、receipt 和 handoff |
-| Backend | [`crates/container-init-backend`](../crates/container-init-backend) | 单实例 snapshot、abstract endpoint 单所有者 RPC 事件循环和 PID 1 supervisor |
+| Backend | [`crates/container-init-backend`](../crates/container-init-backend) | 单实例 snapshot、abstract endpoint 单所有者 RPC 事件循环、subreaper 和持续 child reaper |
 | CLI | [`crates/container-init-cli`](../crates/container-init-cli) | 参数解析、profile 路径发现、backend `run/exec/plan/doctor/status/version` |
 
 几个关键入口：

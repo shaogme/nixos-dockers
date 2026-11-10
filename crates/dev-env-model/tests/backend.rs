@@ -1,8 +1,8 @@
 use dev_env_model::{
     BackendError, BackendRequest, BackendRequestMessage, BackendResponse, BackendResponseMessage,
     BackendStatus, ControlPlaneState, EffectiveIdentity, Generation, IdentityRequest,
-    InitialRuntimeState, RequestContext, RequestMode, DEVENV_BACKEND_ERROR_VERSION,
-    DEVENV_BACKEND_PROTOCOL_VERSION,
+    InitialRuntimeState, MaterializationKeyBuilder, RequestContext, RequestMode,
+    DEVENV_BACKEND_ERROR_VERSION, DEVENV_BACKEND_PROTOCOL_VERSION,
 };
 use serde_json::to_value;
 use std::collections::BTreeMap;
@@ -73,7 +73,7 @@ fn backend_rejects_old_error_payload_versions() {
 #[test]
 fn materialization_key_digest_is_stable_and_context_sensitive() {
     let identity = EffectiveIdentity::root();
-    let key = dev_env_model::MaterializationKeyBuilder::new(
+    let key = MaterializationKeyBuilder::new(
         Generation::INITIAL,
         "/workspace",
         "/workspace/src",
@@ -88,7 +88,7 @@ fn materialization_key_digest_is_stable_and_context_sensitive() {
     .unwrap();
     assert_eq!(key.fingerprint().unwrap(), key.digest().unwrap());
 
-    let normalized = dev_env_model::MaterializationKeyBuilder::new(
+    let normalized = MaterializationKeyBuilder::new(
         Generation::INITIAL,
         "/workspace/./src/..",
         "/workspace/src/../src",
@@ -106,7 +106,7 @@ fn materialization_key_digest_is_stable_and_context_sensitive() {
         normalized.fingerprint().unwrap()
     );
 
-    let changed = dev_env_model::MaterializationKeyBuilder::new(
+    let changed = MaterializationKeyBuilder::new(
         Generation::INITIAL,
         "/workspace",
         "/workspace/src",

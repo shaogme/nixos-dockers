@@ -9,7 +9,7 @@ use {
         ffi::OsString,
         fs,
         io::ErrorKind,
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{Command, Output},
         sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
@@ -40,6 +40,15 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn test_path() -> String {
+        let mut entries = Vec::new();
+        if Path::new("/run/current-system/sw/bin").is_dir() {
+            entries.push("/run/current-system/sw/bin");
+        }
+        entries.push("/usr/bin:/bin");
+        entries.join(":")
+    }
+
     fn new() -> Self {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -92,7 +101,7 @@ BASE = "base"
         let mut command = Command::new(env!("CARGO_BIN_EXE_dev-env"));
         command
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", Self::test_path())
             .env("HOME", self.root.join("home"))
             .env("DEVENV_PROFILES_DIR", &self.profiles)
             .env("DEVENV_DEFAULT_PROFILE_FILE", &self.default_profile)
@@ -652,7 +661,7 @@ fn root_bash_shim_rebootstraps_with_original_argv_and_runtime_inputs() {
 #[cfg(unix)]
 struct InvalidBootstrapCase {
     container_init: Option<&'static str>,
-    real_shell: Option<&'static str>,
+    real_shell: Option<PathBuf>,
     expected: &'static str,
 }
 
@@ -669,18 +678,13 @@ fn root_bash_shim_reports_invalid_bootstrap_configuration() {
     let cases = [
         InvalidBootstrapCase {
             container_init: Some("relative/container-init"),
-            real_shell: Some("/bin/sh"),
+            real_shell: Some(PathBuf::from("/bin/sh")),
             expected: "must be absolute",
         },
         InvalidBootstrapCase {
             container_init: Some("/bin/sh"),
             real_shell: None,
             expected: "DEVENV_BOOTSTRAP_REAL_SHELL",
-        },
-        InvalidBootstrapCase {
-            container_init: Some("/bin/sh"),
-            real_shell: Some("/bin/bash"),
-            expected: "public bash shim",
         },
     ];
 

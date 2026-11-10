@@ -1,11 +1,11 @@
 use dev_env_model::{
     Condition, ConditionalEnvironmentVariable, ConfiguredValuePrecedence, EnvValue,
     EnvironmentConfig, EnvironmentPath, FailurePolicy, InputError, InputSpec, InputType,
-    InputValue, Layer, MaterializedEnv, MergePolicy, ModelError, Origin, OverrideOperation,
-    OverrideSpec, PathMode, PathRenderError, PathTemplate, PolicyConfig, PrepareStep,
-    ProfileDocument, ProfileSet, ProviderConfig, ResolvedConfig, Sensitivity, ShellConfig,
-    ShellEnvEntry, ShellEnvFormat, ShellKind, ShellSelection, UntrustedWorkspacePolicy, ValueTree,
-    WorkspaceConfig,
+    InputValue, Layer, MaterializedEnv, MergePolicy, MissingProviderPolicy, ModelError, Origin,
+    OverrideOperation, OverrideSpec, PathMode, PathRenderError, PathTemplate, PolicyConfig,
+    PrepareStep, ProfileDocument, ProfileSet, ProviderConfig, ResolvedConfig, Sensitivity,
+    ShellConfig, ShellEnvConfig, ShellEnvEntry, ShellEnvFormat, ShellKind, ShellSelection,
+    UntrustedWorkspacePolicy, ValueTree, WorkspaceConfig,
 };
 use serde_json::to_value;
 use std::collections::BTreeMap;
@@ -25,7 +25,7 @@ fn provider(depends_on: Vec<String>) -> ProviderConfig {
     ProviderConfig::new(
         "fake-provider",
         vec!["devbox.json".to_owned()],
-        dev_env_model::MissingProviderPolicy::Ignore,
+        MissingProviderPolicy::Ignore,
         depends_on,
         vec![PrepareStep::new(
             vec!["install".to_owned()],
@@ -35,7 +35,7 @@ fn provider(depends_on: Vec<String>) -> ProviderConfig {
             Sensitivity::Public,
         )],
     )
-    .with_shellenv(dev_env_model::ShellEnvConfig::new(
+    .with_shellenv(ShellEnvConfig::new(
         vec!["shellenv".to_owned(), "{shell}".to_owned()],
         ShellEnvFormat::Shell,
         FailurePolicy::Error,

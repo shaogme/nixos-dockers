@@ -6,7 +6,7 @@
 let
   nixos = import <nixpkgs/nixos> {
     inherit system;
-    configuration = {
+    configuration = { config, lib, ... }: {
       nixpkgs.pkgs = pkgs;
 
       imports = [
@@ -22,19 +22,14 @@ let
       boot.kernelParams = [
         "console=ttyS0,115200n8"
         "console=tty0"
+        "systemd.unified_cgroup_hierarchy=1"
       ];
-      boot.kernelModules = [
-        "br_netfilter"
-        "fuse"
-        "overlay"
-      ];
+      boot.kernelModules = [ "9p" "9pnet_virtio" "br_netfilter" "fuse" "overlay" ];
       boot.kernel.sysctl = {
         "net.ipv4.ip_forward" = 1;
         "net.ipv6.conf.all.forwarding" = 1;
       };
 
-      # The guest Docker daemon is the outer engine. The Podman engine image
-      # under test is started by this daemon, matching the CI test topology.
       virtualisation.docker = {
         enable = true;
         enableOnBoot = true;
@@ -43,11 +38,39 @@ let
       virtualisation.mountHostNixStore = false;
       virtualisation.useNixStoreImage = false;
 
-      # The Podman test builds its image from the checkout inside the guest.
-      # Keep the Nix client and a local nixpkgs path available there so the
-      # test does not depend on the host's NIX_PATH.
+      nix.enable = true;
       nix.nixPath = [ "nixpkgs=/etc/nixpkgs" ];
+      nix.settings.allowed-users = [ "root" ];
+      nix.settings.experimental-features = [ "nix-command" ];
       environment.etc."nixpkgs".source = pkgs.path;
+
+      virtualisation.fileSystems."/mnt/qemu-share" = {
+        device = "qemu-share";
+        fsType = "9p";
+        options = [
+          "trans=virtio"
+          "version=9p2000.L"
+          "msize=16384"
+          "x-systemd.requires=modprobe@9pnet_virtio.service"
+          "ro"
+        ];
+      };
+      users.allowNoPasswordLogin = true;
+      systemd.services.qemu-authorized-key = {
+        description = "Install the temporary QEMU launcher SSH key";
+        wantedBy = [ "sshd.service" ];
+        before = [ "sshd.service" ];
+        after = [ "local-fs.target" ];
+        serviceConfig.Type = "oneshot";
+        path = [ pkgs.coreutils ];
+        script = ''
+          install -d -m 0700 /root/.ssh
+          install -m 0600 /mnt/qemu-share/ssh.pub /root/.ssh/authorized_keys
+        '';
+      };
+      systemd.services.sshd.requires = [ "qemu-authorized-key.service" ];
+      systemd.services.sshd.after = [ "qemu-authorized-key.service" ];
+
       environment.systemPackages = with pkgs; [
         bash
         coreutils
@@ -56,24 +79,25 @@ let
         git
         nix
         openssh
+        python3
         qemu-utils
-        sshpass
+        rustup
+        stdenv.cc
       ];
 
       services.openssh = {
         enable = true;
         settings = {
-          PermitRootLogin = "yes";
-          PasswordAuthentication = true;
+          PermitRootLogin = "prohibit-password";
+          PasswordAuthentication = false;
+          KbdInteractiveAuthentication = false;
+          PubkeyAuthentication = true;
         };
       };
 
       users.mutableUsers = false;
-      users.users.root.initialHashedPassword =
-        "$6$tEI3gQs0Btzt1Chd$se4yg0TbtA7DeNXG.H19YOVHTkc.4INnG5xpn4QX/EmH536zpQBbrR/Wp.BkzgnQdDF3OUvNl.rg7bMO.faLq1";
-
       networking.firewall.enable = false;
-      virtualisation.sharedDirectories = pkgs.lib.mkForce { };
+      virtualisation.sharedDirectories = lib.mkForce { };
       virtualisation.graphics = false;
       virtualisation.memorySize = 4096;
       virtualisation.cores = 4;

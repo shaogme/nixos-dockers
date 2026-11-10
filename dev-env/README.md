@@ -147,13 +147,18 @@ cargo build --locked --release -p dev-env-cli
 只做本地文件诊断或离线测试时可以显式使用 `--offline`；该路径不会被生产 handoff
 调用。
 
-最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。从 `nixos-dockers` workspace 根目录快速验证 Rust workspace 本身：
+最小 profile 和字段说明见 [DSL 参考](docs/dsl.md)。CI 等价验证由 NixOS QEMU guest 执行；
+在仓库根目录运行完整 workspace suite：
 
 ```bash
-cargo test --workspace --locked
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked
+bash scripts/qemu-test.sh workspace
+bash scripts/qemu-test.sh crates --runtime rootful-docker
+bash scripts/qemu-test.sh crates --runtime rootless-podman
 ```
+
+两个 crates lane 都在单台 guest 内顺序运行全部七个 crate Docker suites。各 `tests/docker.sh`
+是 guest-only harness，必须由 dispatcher 调用。宿主机直接运行会失败；
+容器测试使用固定 Rust 1.88.0 toolchain，与 workspace guest 保持一致。
 
 ## 入口一致性
 
@@ -164,6 +169,12 @@ identity broker 为每个 request/provider 解析身份，再执行 provider。�
 通过 Linux abstract endpoint `@dev-env.backend.v5` 请求环境。初始 shell/service 仍在准备时，backend 控制面已经可以服务请求；client 会在启动 deadline 内自动等待 backend 可服务。可用 `dev-env backend status --json` 分别查看 `control_plane` 与 `initial_runtime` 状态。
 
 Provider command 在同目录的 `dev-env-provider-worker` helper 子进程中运行。基础 Nix runtime 会将该 helper 与 `dev-env` 一起安装；从源码运行 backend 时也需要先构建 worker binary。backend 停止时会取消当前 provider worker，并等待它清理专属进程树。
+
+容器级 `container-init run` 在启动 Bootstrap action 前启用 Linux child subreaper，并在整个
+backend 生命周期持续回收 handoff 与重新托管给它的子进程。`dev-env backend` 仍等待自己直接
+启动的 initial shell/service 和 provider worker；provider worker 在运行期间独立负责自己的
+provider 子树。某个父进程仍存活时，其后代不属于 outer reaper 的 wait 范围，只有 Linux 将
+子进程重新托管给对应的 subreaper 后，那个 subreaper 才能回收它。
 
 | 使用场景 | 推荐入口 | 环境来源 |
 | --- | --- | --- |

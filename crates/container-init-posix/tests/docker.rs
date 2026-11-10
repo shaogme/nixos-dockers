@@ -1,4 +1,4 @@
-use container_init_posix::{PosixIdentity, PosixSystem};
+use container_init_posix::{set_mode, PosixIdentity, PosixSystem};
 use libc::{_exit, fork, waitpid};
 use std::{fs, os::unix::fs::PermissionsExt};
 use tempfile::TempDir;
@@ -16,7 +16,7 @@ fn exercises_the_live_container_account_and_filesystem() {
     let file = temp.path().join("container-init-posix");
     fs::write(&file, "docker\n").unwrap();
     system.chown(&file, 0, 0, true).unwrap();
-    container_init_posix::set_mode(&file, 0o640).unwrap();
+    set_mode(&file, 0o640).unwrap();
     assert_eq!(
         fs::metadata(&file).unwrap().permissions().mode() & 0o777,
         0o640

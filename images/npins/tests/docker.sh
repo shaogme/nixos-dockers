@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec "$script_dir/../../../tests/docker-image.sh" npins
+[[ "${NIXOS_DOCKERS_QEMU_GUEST:-}" == 1 && "${NIXOS_DOCKERS_GUEST_RUNTIME:-}" == rootful-docker ]] || {
+    echo "npins image fixture requires scripts/qemu-test.sh with rootful-docker" >&2
+    exit 2
+}
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+exec bash "$root_dir/tests/docker-image.sh" npins

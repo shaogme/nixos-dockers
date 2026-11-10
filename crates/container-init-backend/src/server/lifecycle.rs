@@ -1,4 +1,5 @@
 use super::{
+    child_reaper::{ChildReaper, DrainOutcome},
     connection::ConnectionService,
     identity::BackendIdentity,
     runtime::{BackendRuntime, RuntimeErrors},
@@ -10,10 +11,11 @@ use container_init_protocol::{
     MAX_REQUEST_FRAME_BYTES,
 };
 use libc::{
-    c_int, c_void, getegid, geteuid, kill, nfds_t, poll, pollfd, read as libc_read, setgid,
-    setgroups, setuid, sigaddset, sigemptyset, signalfd, signalfd_siginfo, sigprocmask, sigset_t,
-    waitpid, ECHILD, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, SFD_CLOEXEC, SFD_NONBLOCK,
-    SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGTERM, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, WNOHANG,
+    c_int, c_void, getegid, geteuid, kill, nfds_t, pid_t, poll, pollfd, prctl, read as libc_read,
+    setgid, setgroups, setuid, sigaction, sigaddset, sigemptyset, signalfd, signalfd_siginfo,
+    sigprocmask, sigset_t, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, PR_SET_CHILD_SUBREAPER,
+    SFD_CLOEXEC, SFD_NONBLOCK, SIGCHLD, SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGTERM, SIG_BLOCK,
+    SIG_DFL, SIG_SETMASK, SIG_UNBLOCK,
 };
 use std::{
     collections::HashMap,
@@ -26,7 +28,7 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     path::Path,
-    process::{Child, Command, ExitStatus},
+    process::Command,
     ptr,
     time::{Duration, Instant},
 };
@@ -35,7 +37,9 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_BODY_READERS: usize = 4;
 const MAX_ACCEPTS_PER_TICK: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const SHUTDOWN_HARD_LIMIT: Duration = Duration::from_secs(6);
 const POLL_INTERVAL_MS: c_int = 50;
+const SIGNAL_RECORD_BATCH: usize = 16;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(FRAME_TIMEOUT_MS);
 
 struct Connection {
@@ -64,6 +68,11 @@ pub(super) struct ShutdownSignalMask {
     previous: sigset_t,
 }
 
+pub(super) struct BackendSignalSetup {
+    signal_fd: File,
+    _mask: ShutdownSignalMask,
+}
+
 pub(super) struct BackendSupervisor;
 
 impl BackendSupervisor {
@@ -81,26 +90,41 @@ impl BackendSupervisor {
         identity: &ResolvedIdentity,
         root_service: bool,
         cwd: &Path,
-    ) -> io::Result<Child> {
+    ) -> io::Result<u32> {
         spawn_handoff(handoff, identity, root_service, cwd)
     }
 
     pub(super) fn supervise(
         listener: UnixListener,
-        child: Child,
+        handoff_pid: u32,
+        signal_setup: BackendSignalSetup,
         runtime: &mut BackendRuntime,
     ) -> io::Result<i32> {
-        supervise(listener, child, runtime)
+        supervise(listener, handoff_pid, signal_setup, runtime)
     }
 
-    pub(super) fn block_shutdown_signals() -> io::Result<ShutdownSignalMask> {
+    pub(super) fn initialize() -> io::Result<BackendSignalSetup> {
+        Self::initialize_with_signal_fd(create_signal_fd)
+    }
+
+    pub(super) fn initialize_with_signal_fd(
+        create_fd: impl FnOnce(&sigset_t) -> io::Result<File>,
+    ) -> io::Result<BackendSignalSetup> {
         let mask = shutdown_signal_mask()?;
         let mut previous: sigset_t = unsafe { mem::zeroed() };
-        if unsafe { sigprocmask(SIG_BLOCK, &mask, &mut previous) } == 0 {
-            Ok(ShutdownSignalMask { previous })
-        } else {
-            Err(io::Error::last_os_error())
+        if unsafe { sigprocmask(SIG_BLOCK, &mask, &mut previous) } != 0 {
+            return Err(io::Error::last_os_error());
         }
+        let mask_guard = ShutdownSignalMask { previous };
+        set_sigchld_default()?;
+        let signal_fd = create_fd(&mask)?;
+        if unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(BackendSignalSetup {
+            signal_fd,
+            _mask: mask_guard,
+        })
     }
 }
 
@@ -133,7 +157,7 @@ fn spawn_handoff(
     identity: &ResolvedIdentity,
     root_service: bool,
     cwd: &Path,
-) -> io::Result<Child> {
+) -> io::Result<u32> {
     let mut command = Command::new(handoff.program());
     command
         .args(handoff.args())
@@ -187,6 +211,7 @@ fn spawn_handoff(
                     return Err(io::Error::last_os_error());
                 }
             }
+            reset_handoff_signal_dispositions()?;
             let mask = shutdown_signal_mask()?;
             if sigprocmask(SIG_UNBLOCK, &mask, ptr::null_mut()) != 0 {
                 return Err(io::Error::last_os_error());
@@ -194,31 +219,43 @@ fn spawn_handoff(
             Ok(())
         });
     }
-    command.spawn()
+    let child = command.spawn()?;
+    Ok(child.id())
 }
 
 fn supervise(
     listener: UnixListener,
-    mut child: Child,
+    handoff_pid: u32,
+    signal_setup: BackendSignalSetup,
     runtime: &mut BackendRuntime,
 ) -> io::Result<i32> {
-    let child_pid = child.id();
+    let child_pid = handoff_pid as pid_t;
     let mut listener = Some(listener);
-    let signal_fd = create_signal_fd()?;
+    let signal_fd = signal_setup.signal_fd.as_raw_fd();
     let mut connections = HashMap::<RawFd, Connection>::new();
-    let mut child_status = None;
+    let mut reaper = ChildReaper::new(child_pid);
     let mut stopping_since = None;
     let mut sent_kill = false;
 
     loop {
-        reap_main_child(&mut child, &mut child_status)?;
-        if child_status.is_some() && stopping_since.is_none() {
-            begin_stopping(runtime, &mut listener, &mut connections);
-            let _ = unsafe { kill(-(child_pid as i32), SIGTERM) };
-            stopping_since = Some(Instant::now());
+        let drain_outcome = reaper.drain()?;
+        if drain_outcome == DrainOutcome::NoChildren && !reaper.handoff_exited() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "initial handoff status is unavailable after all children were reaped",
+            ));
         }
 
-        if let Some(signal) = read_shutdown_signal(signal_fd.as_raw_fd())? {
+        if let Some(signal) = shutdown_signal_for_iteration(reaper.handoff_exited(), None) {
+            if stopping_since.is_none() {
+                begin_stopping(runtime, &mut listener, &mut connections);
+                let _ = unsafe { kill(-(child_pid as i32), signal) };
+                stopping_since = Some(Instant::now());
+            }
+        }
+        let shutdown_signal =
+            shutdown_signal_for_iteration(false, read_shutdown_signals(signal_fd)?);
+        if let Some(signal) = shutdown_signal {
             if stopping_since.is_none() {
                 begin_stopping(runtime, &mut listener, &mut connections);
                 let _ = unsafe { kill(-(child_pid as i32), signal) };
@@ -227,14 +264,17 @@ fn supervise(
         }
 
         if let Some(started) = stopping_since {
-            if child_status.is_none() && !sent_kill && started.elapsed() >= SHUTDOWN_GRACE {
+            if !sent_kill && started.elapsed() >= SHUTDOWN_GRACE {
                 let _ = unsafe { kill(-(child_pid as i32), SIGKILL) };
                 sent_kill = true;
             }
-            if child_status.is_some() && connections.is_empty() && reap_adopted_children()? {
+            if reaper.handoff_exited()
+                && connections.is_empty()
+                && drain_outcome == DrainOutcome::NoChildren
+            {
                 break;
             }
-            if started.elapsed() >= SHUTDOWN_GRACE + Duration::from_secs(1) {
+            if started.elapsed() >= SHUTDOWN_HARD_LIMIT {
                 break;
             }
         }
@@ -242,11 +282,18 @@ fn supervise(
         runtime.set_active_connections(connections.len());
         let (descriptors, targets) =
             poll_descriptors(listener.as_ref(), signal_fd.as_raw_fd(), &connections);
+        let timeout = if drain_outcome == DrainOutcome::BudgetExhausted {
+            0
+        } else {
+            stopping_since
+                .map(|started| poll_timeout(started.elapsed(), sent_kill))
+                .unwrap_or(POLL_INTERVAL_MS)
+        };
         let result = unsafe {
             poll(
                 descriptors.as_ptr() as *mut pollfd,
                 descriptors.len() as nfds_t,
-                POLL_INTERVAL_MS,
+                timeout,
             )
         };
         if result < 0 {
@@ -286,11 +333,32 @@ fn supervise(
 
     drop(listener.take());
     runtime.mark_stopping();
-    let status = child_status
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "initial handoff did not exit"))?;
+    let status = reaper.take_handoff_status()?;
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(SIGTERM)))
+}
+
+fn poll_timeout(elapsed: Duration, sent_kill: bool) -> c_int {
+    let hard_remaining = SHUTDOWN_HARD_LIMIT.saturating_sub(elapsed);
+    let remaining = if sent_kill {
+        hard_remaining
+    } else {
+        hard_remaining.min(SHUTDOWN_GRACE.saturating_sub(elapsed))
+    };
+    let millis = remaining.as_millis().clamp(1, POLL_INTERVAL_MS as u128);
+    millis as c_int
+}
+
+fn shutdown_signal_for_iteration(
+    handoff_exited: bool,
+    observed_shutdown_signal: Option<c_int>,
+) -> Option<c_int> {
+    if handoff_exited {
+        Some(SIGTERM)
+    } else {
+        observed_shutdown_signal
+    }
 }
 
 fn poll_descriptors(
@@ -583,36 +651,12 @@ fn begin_stopping(
     connections.clear();
 }
 
-fn reap_main_child(child: &mut Child, main_status: &mut Option<ExitStatus>) -> io::Result<()> {
-    if main_status.is_none() {
-        *main_status = child.try_wait()?;
-    }
-    Ok(())
-}
-
-fn reap_adopted_children() -> io::Result<bool> {
-    loop {
-        let mut status = 0_i32;
-        let pid = unsafe { waitpid(-1, &mut status, WNOHANG) };
-        if pid == 0 {
-            return Ok(false);
-        }
-        if pid < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(ECHILD) {
-                return Ok(true);
-            }
-            return Err(error);
-        }
-    }
-}
-
 fn shutdown_signal_mask() -> io::Result<sigset_t> {
     let mut mask: sigset_t = unsafe { mem::zeroed() };
     if unsafe { sigemptyset(&mut mask) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    for signal in [SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
+    for signal in [SIGCHLD, SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
         if unsafe { sigaddset(&mut mask, signal) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -620,36 +664,93 @@ fn shutdown_signal_mask() -> io::Result<sigset_t> {
     Ok(mask)
 }
 
-fn create_signal_fd() -> io::Result<File> {
-    let mask = shutdown_signal_mask()?;
-    let fd = unsafe { signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK) };
+fn set_sigchld_default() -> io::Result<()> {
+    set_signal_default(SIGCHLD)
+}
+
+fn reset_handoff_signal_dispositions() -> io::Result<()> {
+    for signal in [SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
+        set_signal_default(signal)?;
+    }
+    Ok(())
+}
+
+fn set_signal_default(signal: c_int) -> io::Result<()> {
+    let mut action: sigaction = unsafe { mem::zeroed() };
+    if unsafe { sigemptyset(&mut action.sa_mask) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    action.sa_sigaction = SIG_DFL;
+    action.sa_flags = 0;
+    if unsafe { sigaction(signal, &action, ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn create_signal_fd(mask: &sigset_t) -> io::Result<File> {
+    let fd = unsafe { signalfd(-1, mask, SFD_CLOEXEC | SFD_NONBLOCK) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn read_shutdown_signal(fd: RawFd) -> io::Result<Option<c_int>> {
-    let mut info: signalfd_siginfo = unsafe { mem::zeroed() };
-    let bytes_read = unsafe {
-        libc_read(
-            fd,
-            &mut info as *mut signalfd_siginfo as *mut c_void,
-            mem::size_of::<signalfd_siginfo>(),
-        )
-    };
-    if bytes_read == mem::size_of::<signalfd_siginfo>() as isize {
-        return Ok(Some(info.ssi_signo as c_int));
-    }
-    if bytes_read < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::Interrupted {
-            return Ok(None);
+fn read_shutdown_signals(fd: RawFd) -> io::Result<Option<c_int>> {
+    let mut first_shutdown_signal = None;
+    loop {
+        let mut records: [signalfd_siginfo; SIGNAL_RECORD_BATCH] = unsafe { mem::zeroed() };
+        let bytes_read = unsafe {
+            libc_read(
+                fd,
+                records.as_mut_ptr() as *mut c_void,
+                mem::size_of_val(&records),
+            )
+        };
+        if bytes_read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(first_shutdown_signal);
+            }
+            return Err(error);
         }
-        return Err(error);
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "signal descriptor closed while backend was running",
+            ));
+        }
+        let record_size = mem::size_of::<signalfd_siginfo>();
+        if bytes_read as usize % record_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "signal descriptor returned a truncated record",
+            ));
+        }
+        for record in records.iter().take(bytes_read as usize / record_size) {
+            let signal = record.ssi_signo as c_int;
+            if signal != SIGCHLD && first_shutdown_signal.is_none() {
+                first_shutdown_signal = Some(signal);
+            }
+        }
     }
-    Err(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "shutdown signal descriptor returned a truncated record",
-    ))
+}
+
+#[cfg(test)]
+#[test]
+fn handoff_exit_wins_over_shutdown_signal_observed_in_the_same_iteration() {
+    use libc::{SIGHUP, SIGINT, SIGTERM};
+
+    assert_eq!(
+        shutdown_signal_for_iteration(true, Some(SIGINT)),
+        Some(SIGTERM)
+    );
+    assert_eq!(
+        shutdown_signal_for_iteration(false, Some(SIGHUP)),
+        Some(SIGHUP)
+    );
+    assert_eq!(shutdown_signal_for_iteration(false, None), None);
 }

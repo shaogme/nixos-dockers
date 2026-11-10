@@ -6,6 +6,15 @@ rust-version.workspace = true
 description = "Runtime materializer for the dev-env environment DSL"
 license.workspace = true
 
+[features]
+default = []
+docker-tests = []
+
+[[test]]
+name = "docker"
+path = "tests/docker.rs"
+required-features = ["docker-tests"]
+
 [dependencies]
 dev-env-model = { workspace = true }
 dev-env-provider = { workspace = true }
